@@ -6,6 +6,16 @@
 
 ---
 
+## 0. WORKING AGREEMENT (read first, every session)
+**Rule:** after doing *anything* in this project, update this `HANDOFF.md` and/or the
+relevant `README.md` before ending the session. We work across different computers with
+fresh Claude sessions, so the repo files are the *only* shared memory — a new chat gets its
+full context by reading these. Keep the "current state" and "progress/todo" sections honest
+and up to date (mark what's done, note what's untested, record any decisions). If you change
+code, reflect it here in the same turn.
+
+---
+
 ## 1. Project goal (big picture)
 Build a real-hardware motor-control + feedback stack for a robot ("dodo") whose final
 purpose is **sim-to-real**: a trained policy (currently in an Isaac Lab simulation repo)
@@ -111,13 +121,19 @@ unified `MotorController`, and expose the `step(action)`/`get_observation()` ske
 4. Build `MotorController`, call `get_observation()` → positions read for both, no cross-talk.
 5. `python3 demo.py` → both motors move, `get_position()` tracks; watch ODrive heartbeat error field.
 
-### Progress / todo state at handoff
-A task list exists (TaskCreate) with these items, **all still `pending` (no code written yet)**:
-1. Create `odrive_can_setup.py` (USB config tool)
-2. Create `odrive_can_joint.py` (CAN Simple driver)
-3. Create `motor_controller.py` (unified MotorController)
-4. Update `demo.py` to use MotorController over CAN
-5. Syntax-check all new CAN files
+### Progress / todo state — UPDATED 2026-06-18
+CAN migration is **implemented** (in the `dodo_rl_hardware_S26/` repo; py_compile-clean,
+**not yet hardware-tested**):
+1. ✅ `odrive_can_setup.py` (USB config tool) — created.
+2. ✅ `odrive_can_joint.py` (CAN Simple driver) — created.
+3. ✅ `motor_controller.py` (unified MotorController) — created, incl. `step()`/`get_observation()`.
+4. ✅ `demo_combined.py` — rebuilt on MotorController over CAN.
+5. ✅ Syntax-checked all files.
+6. ✅ `damiao_joint.py` — **recreated from this spec** (the uni original was never committed;
+   replace it when available and verify the `damiao_motor` calls / `get_states()` keys).
+7. ✅ Hardware README section written (motors, CAN architecture, setup, sim-to-real hook).
+
+**Still pending:** bench hardware-in-the-loop verification (user-run), then the safety layer (§4).
 
 ### Decisions captured from the user (don't re-ask)
 - ODrive transport → **move to CAN** (same `can0` bus as DM). Same interface, different ids.
@@ -147,9 +163,18 @@ These are the user's next steps in order. NOT part of the current approved plan;
    feedback** (feedback comprehends both motor feedback AND IMU sensor feedback).
 5. **Isaac Lab substitution (final step):** in the simulation repo, replace the Isaac Lab
    env/classes so they match this real-hardware env + classes — i.e. point the trained
-   policy at `MotorController.step()` / `FeedbackAggregator.get_observation()`. Will need the
-   sim's exact observation/action layout (order + units) — match it from the start so this
-   step is a swap, not a rewrite. **Open item:** which Isaac Lab repo/env, and its obs/action spec.
+   policy at `MotorController.step()` / `FeedbackAggregator.get_observation()`.
+   - Sim repo: `dodo_rl/` (sibling folder), IsaacLab manager-based, rsl_rl PPO.
+   - **DEPLOYMENT CONSTRAINT (professor, 2026-06-18):** the policy must NOT observe
+     `base_lin_vel` (unreliable from IMU without heavier state estimation), and the first
+     target is a **stand-and-balance** policy (no velocity, no commands; resist mild pushes).
+   - Target obs layout (sim AND real must match):
+     `[ base_ang_vel(3), projected_gravity(3), joint_pos_rel(n), joint_vel(n), last_action(n) ]`
+     — produced on hardware by `MotorController.to_policy_vector(base_ang_vel, projected_gravity)`.
+   - **Done in `dodo_rl`:** `tasks/locomotion/stand_env_cfg.py` (`DodoStandEnvCfg` from the flat
+     env, drops `base_lin_vel` + `velocity_commands`, balance rewards, push events) +
+     `DodoStandPPORunnerCfg` + registered `Dodo-Stand-v0` / `Dodo-Stand-Play-v0`. Syntax-checked
+     only — needs a real Isaac Sim run; confirm `mdp.is_alive` / `mdp.push_by_setting_velocity`.
 
 ---
 
