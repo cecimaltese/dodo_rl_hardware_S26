@@ -1,270 +1,417 @@
 """
-motor_controller.py — unified, config-driven controller for the whole Dodo motor
-fleet on ONE CAN bus (can0), behind a single object.
+motor_controller.py — unified ROS2 motor-control node for the dodo robot.
 
-Design principle (load-bearing): every motor — Damiao or ODrive — exposes the
-*identical* joint interface (enable/disable, set_zero, get_position/get_state,
-send_position, goto, start_move/is_moving/update). MotorController owns them all
-and adds the sim-to-real hook: step(action) / get_observation().
+Owns the WHOLE motor fleet (Damiao + ODrive) behind one motor-type-agnostic
+interface and exposes it purely over ROS topics:
+
+        subscribe  /motor_commands  (sensor_msgs/JointState)  -> target positions [rad]
+        publish    /motor_states    (sensor_msgs/JointState)  <- pos / vel / effort [rad, rad/s, Nm]
+
+This is a *pure* control node: it has no knowledge of the policy. The sim-to-real
+policy contract (joint order, default pose, action scaling, observation assembly)
+lives in the Env layer (rl_env.py / real_env.py); RealEnv publishes resolved
+position targets here and subscribes to /motor_states, so SimEnv and RealEnv apply
+actions identically. (ODrive integration merged from dodo_rl_hardware_S26/.)
+
+Fleet (8 DOF):
+  * Damiao DM4340P  -> hips   (left/right hip_roll + hip_pitch), native units = radians
+  * ODrive (CAN Simple) -> knees + ankles, native units = turns (1 turn = 2*pi rad)
 
 CAN topology
 ------------
-Both motor types live on the same physical bus (can0 @ 1 Mbit/s) but get their
-OWN filtered SocketCAN socket, so they never mis-ingest each other's frames
-(SocketCAN delivers a private copy of every frame to each open socket):
-
-  * Damiao  -> DaMiaoController(..., can_filters=<DM feedback ids + 0x7FF>)
-               (DaMiaoController forwards **kwargs to can.interface.Bus)
-  * ODrive  -> a second can.Bus(..., can_filters=[per-node masks]) plus a daemon
-               reader thread that drains bus.recv() into OdriveCanJoint.process_frame.
+Both motor types can share ONE bus (can0 @ 1 Mbit/s): SocketCAN gives each open
+socket its own copy of every frame, so each motor type gets its own *filtered*
+socket and never mis-ingests the other's frames. The installed `damiao_motor`
+1.0.6 `DaMiaoController.__init__` does NOT accept `can_filters`, so the Damiao
+filter is applied to its bus afterwards via `bus.set_filters(...)` (only needed
+when Damiao and ODrive share a channel). If you have two USB-CAN adapters, set
+`od_channel` to the second bus (e.g. can1) and no Damiao filter is applied.
 
 Bring the bus up first (OS level, not python-can):
     sudo ip link set can0 up type can bitrate 1000000
 
-Sim-to-real (IsaacLab) alignment
---------------------------------
-DEPLOYMENT CONSTRAINT (from the professor): do NOT use base_lin_vel in the policy
-observation. Base *linear* velocity can't be estimated reliably from the IMU
-without sophisticated state estimation, so the policy must not depend on it. The
-first deployment target is a STAND-AND-BALANCE policy (hold two-leg balance, resist
-mild pushes) — that needs neither linear velocity nor velocity commands.
+Safety: every position command is clamped, and measured feedback is monitored,
+against SAFETY_FACTOR (= 0.9) of each motor's rated position / velocity / torque
+limits. A breach (or a motor fault flag) triggers an e-stop: all motors are
+disabled and commands are ignored until the node is restarted.
 
-So the observation we target is:
-
-  action      = per-joint position target, applied as
-                target = default_joint_pos + action_scale * action   (radians, sim)
-  observation = concat[ base_ang_vel(3), projected_gravity(3),
-                        joint_pos_rel(n), joint_vel(n), last_action(n) ]
-
-  EXCLUDED on purpose: base_lin_vel (unreliable from IMU) and velocity_commands
-  (no command for a pure balance policy). The IsaacLab env must drop these terms
-  too (observations.policy.base_lin_vel = None, .velocity_commands = None) so the
-  trained obs layout matches this exactly.
-
-This file owns everything MOTOR-derived: joint_pos_rel, joint_vel, last_action,
-and it applies actions to the right motor in that motor's native units (Damiao =
-radians, ODrive = turns). The IMU terms that ARE used (base_ang_vel from the gyro,
-projected_gravity from accel/orientation) come from the FeedbackAggregator / IMU
-module (colleague "Jim") and are stitched in via to_policy_vector(). Keep
-POLICY_JOINTS in the SAME order as the sim's articulation joint order so the final
-Isaac Lab swap is a one-liner, not a rewrite.
+Run with:
+    python3 motor_controller.py
 """
 
 import math
 import threading
 import time
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Union
 
 import can
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
+
+from damiao_motor import DaMiaoController
 
 from damiao_joint import DamiaoJoint, DamiaoJointConfig
 from odrive_can_joint import OdriveCanJoint, OdriveCanJointConfig
 
-try:
-    from damiao_motor import DaMiaoController
-except Exception:  # allow import / syntax-check without the lib present
-    DaMiaoController = None  # type: ignore
 
 TWO_PI = 2.0 * math.pi
-DM_REGISTER_ID = 0x7FF  # Damiao register read/write responses
+SAFETY_FACTOR = 0.9
+DM_REGISTER_ID = 0x7FF  # Damiao register read/write reply arbitration id
+
+# Damiao fault status names (anything other than DISABLED/ENABLED) -> e-stop.
+DM_FAULT_STATUS = {
+    "OVER_VOLTAGE", "UNDER_VOLTAGE", "OVER_CURRENT",
+    "MOS_OVER_TEMP", "ROTOR_OVER_TEMP", "LOST_COMM", "OVERLOAD",
+}
 
 AnyJoint = Union[DamiaoJoint, OdriveCanJoint]
 
 
-@dataclass
-class PolicyJoint:
-    """One entry in the policy's joint vector: which physical joint, and its
-    default (home) position in RADIANS (sim convention)."""
-    name: str                  # must match a DamiaoJointConfig / OdriveCanJointConfig name
-    default_pos: float = 0.0   # radians
+# ---------------------------------------------------------------------------
+# Fleet configuration (real robot)
+# ---------------------------------------------------------------------------
+# Joint NAMES match the URDF / IsaacLab articulation (hip_*=hip roll,
+# upper_leg_*=hip pitch, lower_leg_*=knee, foot_*=ankle) so the whole stack
+# (sim, policy, ROS topics, motors) shares ONE naming scheme — no remapping.
+#
+# Damiao hips (roll + pitch) — ids already set on the physical motors (DM4340P).
+DM_JOINTS = [
+    DamiaoJointConfig(name="hip_left",        motor_id=0x01, feedback_id=0x11,
+                      motor_type="4340P", kp=30.0, kd=0.5),  # left hip roll
+    DamiaoJointConfig(name="upper_leg_left",  motor_id=0x02, feedback_id=0x12,
+                      motor_type="4340P", kp=30.0, kd=0.5),  # left hip pitch
+    DamiaoJointConfig(name="hip_right",       motor_id=0x05, feedback_id=0x15,
+                      motor_type="4340P", kp=30.0, kd=0.5),  # right hip roll
+    DamiaoJointConfig(name="upper_leg_right", motor_id=0x06, feedback_id=0x16,
+                      motor_type="4340P", kp=30.0, kd=0.5),  # right hip pitch
+]
+
+# ODrive knees (lower_leg_*) + ankles (foot_*) — T-Motor via ODrive, CAN Simple.
+# TODO(user): set the real CAN node ids (as configured with odrive_can_setup.py)
+# and, ideally, soft pos_min/pos_max (turns) for each joint's mechanical range.
+# rated_torque = the sim effort-limit for the knee/ankle group (9 Nm), used to
+# normalize the torque safety check; vel_limit (turns/s) bounds the velocity check.
+OD_JOINTS = [
+    OdriveCanJointConfig(name="lower_leg_left",  node_id=7,  vel_limit=10.0, rated_torque=9.0),
+    OdriveCanJointConfig(name="foot_left",       node_id=8,  vel_limit=10.0, rated_torque=9.0),
+    OdriveCanJointConfig(name="lower_leg_right", node_id=9,  vel_limit=10.0, rated_torque=9.0),
+    OdriveCanJointConfig(name="foot_right",      node_id=10, vel_limit=10.0, rated_torque=9.0),
+]
 
 
-@dataclass
-class MotorControllerConfig:
-    dm_configs: List[DamiaoJointConfig] = field(default_factory=list)
-    od_configs: List[OdriveCanJointConfig] = field(default_factory=list)
-    channel: str = "can0"
-    bustype: str = "socketcan"
-    # Policy joint order + home pose (radians). Order MUST match the sim.
-    policy_joints: List[PolicyJoint] = field(default_factory=list)
-    action_scale: float = 0.5  # matches IsaacLab JointPositionAction default scale
+# ---------------------------------------------------------------------------
+# Per-joint adapter: unifies units (rad <-> native) + safety limits + state.
+# ---------------------------------------------------------------------------
+class _JointAdapter:
+    """Wraps any joint so the node treats Damiao (rad) and ODrive (turns)
+    uniformly: positions/velocities are exposed to ROS and the policy in
+    radians, while clamping and feedback monitoring happen in the joint's
+    native units."""
+
+    def __init__(self, joint: AnyJoint, logger=None):
+        self.joint = joint
+        self.name = joint.cfg.name
+        self.is_odrive = isinstance(joint, OdriveCanJoint)
+
+        if self.is_odrive:
+            cfg: OdriveCanJointConfig = joint.cfg
+            self.pos_lo = cfg.pos_min  # turns; None -> unclamped
+            self.pos_hi = cfg.pos_max
+            self.vel_limit = SAFETY_FACTOR * cfg.vel_limit if cfg.vel_limit else None  # turns/s
+            self.torque_limit = SAFETY_FACTOR * cfg.rated_torque if cfg.rated_torque else None
+            if logger and (self.pos_lo is None or self.pos_hi is None):
+                logger.warn(f"{self.name}: ODrive position is UNCLAMPED "
+                            f"(set pos_min/pos_max in OD_JOINTS for safety).")
+        else:
+            motor = joint.motor  # damiao_motor.DaMiaoMotor with resolved limits
+            p_max = abs(getattr(motor, "_p_max", 12.5))
+            v_max = abs(getattr(motor, "_v_max", 10.0))
+            t_max = abs(getattr(motor, "_t_max", 28.0))
+            cfg = joint.cfg
+            lo, hi = -SAFETY_FACTOR * p_max, SAFETY_FACTOR * p_max
+            if cfg.pos_min is not None:
+                lo = max(lo, cfg.pos_min)
+            if cfg.pos_max is not None:
+                hi = min(hi, cfg.pos_max)
+            self.pos_lo, self.pos_hi = lo, hi          # rad
+            self.vel_limit = SAFETY_FACTOR * v_max     # rad/s
+            self.torque_limit = SAFETY_FACTOR * t_max  # Nm
+
+    # ── unit conversion (native is turns for ODrive, rad for Damiao) ──
+    def to_native(self, rad: float) -> float:
+        return rad / TWO_PI if self.is_odrive else rad
+
+    def to_rad(self, native: float) -> float:
+        return native * TWO_PI if self.is_odrive else native
+
+    def clamp_native(self, q: float) -> float:
+        if self.pos_lo is not None:
+            q = max(q, self.pos_lo)
+        if self.pos_hi is not None:
+            q = min(q, self.pos_hi)
+        return q
+
+    # ── normalized state read ─────────────────────────────────────
+    def read_state(self) -> dict:
+        st = self.joint.get_state() or {}
+        pos_native = float(st.get("pos", 0.0))
+        vel_native = float(st.get("vel", 0.0))
+        # Damiao reports torque under "torq"; ODrive under "torque".
+        torque = float(st.get("torque", st.get("torq", 0.0)))
+
+        fault = None
+        if self.is_odrive:
+            if st.get("axis_error"):
+                fault = f"ODrive axis_error=0x{int(st['axis_error']):X}"
+        else:
+            if st.get("status") in DM_FAULT_STATUS:
+                fault = f"status '{st.get('status')}'"
+
+        return {
+            "pos_rad": self.to_rad(pos_native),
+            "vel_rad": self.to_rad(vel_native),
+            "pos_native": pos_native,
+            "vel_native": vel_native,
+            "torque": torque,
+            "fault": fault,
+            "has_feedback": bool(st),
+        }
 
 
-class MotorController:
-    def __init__(self, cfg: MotorControllerConfig):
-        self.cfg = cfg
-        self._by_name: Dict[str, AnyJoint] = {}
+class MotorController(Node):
+    """Pure ROS2 control node owning the whole motor fleet."""
 
-        # ── Damiao: one controller/socket, filtered to DM feedback ids ──
-        self.dm_joints: List[DamiaoJoint] = []
-        self.dm_controller = None
-        if cfg.dm_configs:
-            if DaMiaoController is None:
-                raise RuntimeError("damiao_motor not installed but dm_configs given.")
-            dm_filters = [{"can_id": c.feedback_id, "can_mask": 0x7FF} for c in cfg.dm_configs]
-            dm_filters.append({"can_id": DM_REGISTER_ID, "can_mask": 0x7FF})
-            self.dm_controller = DaMiaoController(
-                channel=cfg.channel, bustype=cfg.bustype, can_filters=dm_filters,
-            )
-            for c in cfg.dm_configs:
-                j = DamiaoJoint(self.dm_controller, c)
-                self.dm_joints.append(j)
-                self._by_name[c.name] = j
+    def __init__(self):
+        super().__init__("motor_controller")
 
-        # ── ODrive: a second filtered socket + reader thread ──
-        self.od_joints: List[OdriveCanJoint] = []
+        # ----- Parameters -----
+        self.declare_parameter("dm_channel", "can0")
+        self.declare_parameter("od_channel", "can0")  # set to e.g. can1 with a 2nd adapter
+        self.declare_parameter("bustype", "socketcan")
+        self.declare_parameter("command_topic", "/motor_commands")
+        self.declare_parameter("state_topic", "/motor_states")
+        self.declare_parameter("update_rate", 200.0)   # Hz
+        self.declare_parameter("move_duration", 1.0)    # s, ramp time for topic commands
+
+        dm_channel = self.get_parameter("dm_channel").value
+        od_channel = self.get_parameter("od_channel").value
+        bustype = self.get_parameter("bustype").value
+        cmd_topic = self.get_parameter("command_topic").value
+        state_topic = self.get_parameter("state_topic").value
+        self.update_rate = float(self.get_parameter("update_rate").value)
+        self.move_duration = float(self.get_parameter("move_duration").value)
+
+        self._estopped = False
+        self._stop = threading.Event()
+        self._start_time = time.time()
+
+        # ── Damiao: one controller/socket ─────────────────────────
+        self.dm_controller = DaMiaoController(channel=dm_channel, bustype=bustype)
+        self.dm_joints = [DamiaoJoint(self.dm_controller, c) for c in DM_JOINTS]
+
+        # ── ODrive: a second (filtered) socket + reader thread ─────
         self.od_bus: Optional[can.BusABC] = None
+        self.od_joints: List[OdriveCanJoint] = []
         self._od_by_node: Dict[int, OdriveCanJoint] = {}
         self._reader_thread: Optional[threading.Thread] = None
-        self._stop = threading.Event()
-        if cfg.od_configs:
-            od_filters = [{"can_id": c.node_id << 5, "can_mask": 0x7E0} for c in cfg.od_configs]
-            self.od_bus = can.Bus(channel=cfg.channel, interface=cfg.bustype,
+        if OD_JOINTS:
+            od_filters = [{"can_id": c.node_id << 5, "can_mask": 0x7E0} for c in OD_JOINTS]
+            self.od_bus = can.Bus(channel=od_channel, interface=bustype,
                                   can_filters=od_filters)
-            for c in cfg.od_configs:
+            for c in OD_JOINTS:
                 j = OdriveCanJoint(self.od_bus, c)
                 self.od_joints.append(j)
                 self._od_by_node[c.node_id] = j
-                self._by_name[c.name] = j
+            # When DM and ODrive share a bus, filter the DM socket so it doesn't
+            # mis-ingest ODrive frames (installed lib can't take can_filters in
+            # __init__, so apply to the bus directly — see module docstring).
+            if od_channel == dm_channel:
+                dm_filters = [{"can_id": c.feedback_id, "can_mask": 0x7FF} for c in DM_JOINTS]
+                dm_filters.append({"can_id": DM_REGISTER_ID, "can_mask": 0x7FF})
+                self.dm_controller.bus.set_filters(dm_filters)
             self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
             self._reader_thread.start()
 
-        # Resolve the policy joint order to live joint objects (if provided).
-        self.policy_joints: List[PolicyJoint] = list(cfg.policy_joints)
-        self._policy_objs: List[AnyJoint] = []
-        for pj in self.policy_joints:
-            if pj.name not in self._by_name:
-                raise KeyError(f"policy_joint '{pj.name}' has no matching motor config")
-            self._policy_objs.append(self._by_name[pj.name])
+        # Unified joint list + name lookup + adapters (Damiao first, then ODrive).
+        self.joints: List[AnyJoint] = [*self.dm_joints, *self.od_joints]
+        self.adapters = {j.cfg.name: _JointAdapter(j, self.get_logger()) for j in self.joints}
 
-        self._last_action: List[float] = [0.0] * len(self.policy_joints)
+        self.enable_all()
+
+        # ----- ROS interfaces -----
+        self.cmd_sub = self.create_subscription(
+            JointState, cmd_topic, self.command_callback, 10)
+        self.state_pub = self.create_publisher(JointState, state_topic, 10)
+        self.timer = self.create_timer(1.0 / self.update_rate, self.control_loop)
+
+        self.get_logger().info(
+            f"motor_controller up: {len(self.dm_joints)} Damiao (on {dm_channel}) + "
+            f"{len(self.od_joints)} ODrive (on {od_channel}), loop {self.update_rate:.0f} Hz. "
+            f"Listening on {cmd_topic}.")
+        for name, a in self.adapters.items():
+            lo = f"{a.pos_lo:+.2f}" if a.pos_lo is not None else "-inf"
+            hi = f"{a.pos_hi:+.2f}" if a.pos_hi is not None else "+inf"
+            vl = f"{a.vel_limit:.1f}" if a.vel_limit is not None else "n/a"
+            tl = f"{a.torque_limit:.1f}" if a.torque_limit is not None else "n/a"
+            unit = "turns" if a.is_odrive else "rad"
+            self.get_logger().info(
+                f"  {name}: pos[{lo},{hi}] {unit}, |vel|<={vl}, |torque|<={tl} Nm")
 
     # ── ODrive reader thread ──────────────────────────────────────
-    def _reader_loop(self) -> None:
-        assert self.od_bus is not None
+    def _reader_loop(self):
         while not self._stop.is_set():
             msg = self.od_bus.recv(timeout=0.1)
             if msg is None:
                 continue
-            node = msg.arbitration_id >> 5
-            j = self._od_by_node.get(node)
+            j = self._od_by_node.get(msg.arbitration_id >> 5)
             if j is not None:
                 j.process_frame(msg)
 
     # ── fleet management ──────────────────────────────────────────
-    @property
-    def joints(self) -> List[AnyJoint]:
-        return [*self.dm_joints, *self.od_joints]
-
-    def enable_all(self) -> None:
-        if self.dm_controller is not None:
-            self.dm_controller.enable_all()
+    def enable_all(self):
+        self.dm_controller.enable_all()
         for j in self.od_joints:
             j.enable()
         time.sleep(0.1)
 
-    def disable_all(self) -> None:
-        for j in self.joints:
+    def disable_all(self):
+        try:
+            self.dm_controller.disable_all()
+        except Exception as e:
+            self.get_logger().error(f"Damiao disable_all failed: {e}")
+        for j in self.od_joints:
             try:
                 j.disable()
             except Exception:
                 pass
 
-    def set_zero_all(self) -> None:
-        """Software-zero every joint at its current shaft position."""
+    def set_zero_all(self):
         for j in self.joints:
             j.set_zero()
 
-    def update_all(self) -> None:
-        """Tick every joint's non-blocking move (call at the control rate)."""
-        for j in self.joints:
-            j.update()
+    # ------------------------------------------------------------------ #
+    # ROS path: command handling
+    # ------------------------------------------------------------------ #
+    def command_callback(self, msg: JointState):
+        """Move joints to commanded target positions [radians] (smooth ramp)."""
+        if self._estopped:
+            self.get_logger().warn("Ignoring command: controller is e-stopped.")
+            return
+        if not msg.position:
+            self.get_logger().warn("Command had no positions; ignored.")
+            return
 
-    def shutdown(self) -> None:
+        # Match by name when names are given, else by joint order.
+        if msg.name:
+            pairs = []
+            for i, name in enumerate(msg.name):
+                if i >= len(msg.position):
+                    break
+                a = self.adapters.get(name)
+                if a is None:
+                    self.get_logger().warn(f"Unknown joint '{name}' in command; skipped.")
+                    continue
+                pairs.append((a, msg.position[i]))
+        else:
+            pairs = list(zip(self.adapters.values(), msg.position))
+
+        for a, target_rad in pairs:
+            native = a.clamp_native(a.to_native(float(target_rad)))
+            if abs(a.to_rad(native) - float(target_rad)) > 1e-6:
+                self.get_logger().warn(
+                    f"{a.name}: target {float(target_rad):+.3f} rad clamped to "
+                    f"{a.to_rad(native):+.3f} rad (safety limit).")
+            a.joint.start_move(native, duration=self.move_duration)
+
+    # ------------------------------------------------------------------ #
+    # Control + safety loop
+    # ------------------------------------------------------------------ #
+    def control_loop(self):
+        if self._estopped:
+            return
+
+        for joint in self.joints:
+            try:
+                joint.update()  # drive ramp / hold last target
+            except Exception as e:
+                self.get_logger().error(f"{joint.cfg.name}: update failed: {e}")
+
+        states = {name: a.read_state() for name, a in self.adapters.items()}
+        self._publish_states(states)
+        self._safety_check(states)
+
+    def _publish_states(self, states: dict):
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        for name, st in states.items():
+            msg.name.append(name)
+            msg.position.append(st["pos_rad"])   # radians
+            msg.velocity.append(st["vel_rad"])   # rad/s
+            msg.effort.append(st["torque"])      # Nm
+        self.state_pub.publish(msg)
+
+    def _safety_check(self, states: dict):
+        """E-stop if any joint faults or exceeds its safe velocity/torque."""
+        # Small startup grace so transient feedback doesn't nuisance-trip.
+        if time.time() - self._start_time < 1.0:
+            return
+        for name, st in states.items():
+            if not st["has_feedback"]:
+                continue
+            a = self.adapters[name]
+            if st["fault"]:
+                self._estop(f"{name} reported fault: {st['fault']}")
+                return
+            if a.vel_limit is not None and abs(st["vel_native"]) > a.vel_limit:
+                self._estop(f"{name} velocity {abs(st['vel_native']):.2f} > "
+                            f"{a.vel_limit:.2f} ({'turns/s' if a.is_odrive else 'rad/s'})")
+                return
+            if a.torque_limit is not None and abs(st["torque"]) > a.torque_limit:
+                self._estop(f"{name} torque {abs(st['torque']):.2f} > "
+                            f"{a.torque_limit:.2f} Nm")
+                return
+
+    def _estop(self, reason: str):
+        if self._estopped:
+            return
+        self._estopped = True
+        self.get_logger().error(f"E-STOP: {reason}. Disabling all motors.")
+        self.disable_all()
+
+    # ------------------------------------------------------------------ #
+    # Shutdown
+    # ------------------------------------------------------------------ #
+    def shutdown(self):
+        self.get_logger().info("Shutting down: disabling motors.")
         self._stop.set()
         if self._reader_thread is not None:
             self._reader_thread.join(timeout=1.0)
         self.disable_all()
-        if self.dm_controller is not None:
-            try:
-                self.dm_controller.shutdown()
-            except Exception:
-                pass
+        try:
+            self.dm_controller.shutdown()
+        except Exception as e:
+            self.get_logger().error(f"Damiao shutdown failed: {e}")
         if self.od_bus is not None:
             try:
                 self.od_bus.shutdown()
             except Exception:
                 pass
 
-    # ── unit helpers ──────────────────────────────────────────────
-    @staticmethod
-    def _is_odrive(j: AnyJoint) -> bool:
-        return isinstance(j, OdriveCanJoint)
 
-    def _rad_to_native(self, j: AnyJoint, rad: float) -> float:
-        return rad / TWO_PI if self._is_odrive(j) else rad
+def main(args=None):
+    rclpy.init(args=args)
+    node = MotorController()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.shutdown()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
-    def _native_to_rad(self, j: AnyJoint, native: float) -> float:
-        return native * TWO_PI if self._is_odrive(j) else native
 
-    # ── sim-to-real hook: step / observe ──────────────────────────
-    def step(self, action: Sequence[float]) -> None:
-        """Apply one policy action.
-
-        action[i] corresponds to policy_joints[i]; target (rad) =
-        default_pos + action_scale * action[i], converted to the joint's native
-        units and sent. Mirrors IsaacLab JointPositionAction(use_default_offset).
-        """
-        if len(action) != len(self.policy_joints):
-            raise ValueError(
-                f"action len {len(action)} != n joints {len(self.policy_joints)}")
-        for i, (pj, j) in enumerate(zip(self.policy_joints, self._policy_objs)):
-            target_rad = pj.default_pos + self.cfg.action_scale * float(action[i])
-            j.send_position(self._rad_to_native(j, target_rad))
-        self._last_action = [float(a) for a in action]
-
-    def get_observation(self) -> dict:
-        """Return the MOTOR-derived part of the observation, in policy order.
-
-        joint_pos_rel and joint_vel are in RADIANS / rad·s (sim convention),
-        regardless of each motor's native units. The used IMU term (base_ang_vel)
-        is left None for the FeedbackAggregator (Jim) to fill; projected_gravity
-        likewise. base_lin_vel is intentionally absent (see module docstring).
-        Use to_policy_vector() to assemble the full balance-policy observation.
-        """
-        joint_pos_rel, joint_vel = [], []
-        for pj, j in zip(self.policy_joints, self._policy_objs):
-            joint_pos_rel.append(self._native_to_rad(j, j.get_position()) - pj.default_pos)
-            vel_native = j.get_state().get("vel", 0.0)
-            joint_vel.append(self._native_to_rad(j, vel_native))
-        return {
-            # motor-derived (filled here)
-            "joint_pos_rel": joint_pos_rel,
-            "joint_vel": joint_vel,
-            "last_action": list(self._last_action),
-            # IMU terms used by the balance policy — filled by FeedbackAggregator
-            "base_ang_vel": None,
-            "projected_gravity": None,
-            # NOTE: base_lin_vel and velocity_commands are intentionally excluded.
-        }
-
-    def to_policy_vector(self,
-                         base_ang_vel: Sequence[float],
-                         projected_gravity: Sequence[float]) -> List[float]:
-        """Assemble the stand-and-balance policy observation in canonical order:
-        [base_ang_vel(3), projected_gravity(3),
-         joint_pos_rel(n), joint_vel(n), last_action(n)].
-
-        Caller supplies the two IMU terms (from Jim's module). base_lin_vel and
-        velocity_commands are deliberately NOT part of this vector — the trained
-        IsaacLab policy must be configured to match (no base_lin_vel, no commands).
-        """
-        obs = self.get_observation()
-        return [
-            *base_ang_vel,
-            *projected_gravity,
-            *obs["joint_pos_rel"],
-            *obs["joint_vel"],
-            *obs["last_action"],
-        ]
+if __name__ == "__main__":
+    main()

@@ -1,145 +1,139 @@
 """
-odrive_can_setup.py — one-time USB configuration tool to prepare an ODrive for
-runtime control over CAN ("CAN Simple" protocol).
+odrive_can_setup.py — one-time USB tool to inspect and configure an ODrive for
+CAN ("CAN Simple") operation.
 
-WHY THIS EXISTS
----------------
-ODrive gains and modes can NOT be set over CAN Simple — they live in the drive's
-persistent config and must be written over USB and saved. So:
-  * odrive_can_setup.py      (this file, USB)  -> configure + save, run once.
-  * odrive_position_control.py (USB)           -> interactive gain tuning tool.
-  * odrive_can_joint.py      (CAN, runtime)    -> the actual control path.
+ODrive CAN config (node id, bus baud rate, cyclic feedback message rates) and
+the controller gains/modes cannot be set over CAN Simple — they are USB config
+persisted on the drive. Run this once over USB so the drive is ready for the
+CAN-runtime path (odrive_can.py + odrive_joint.py).
 
-WHAT IT DOES
-------------
-  * prints the current CAN config so you can see what's there;
-  * sets node_id (default 7), CAN baud rate (1 Mbit/s);
-  * enables cyclic feedback messages (heartbeat / encoder estimates / torques)
-    at ~10 ms so the runtime reader thread always has fresh state;
-  * ensures POSITION_CONTROL + PASSTHROUGH input mode and (optional) gains;
-  * save_configuration() — this REBOOTS the drive and drops USB, which is normal.
+What it does:
+  1. Connect over USB and PRINT the current `config.can` tree + gains so you can
+     see the actual attribute names/values on this firmware (0.6.11).
+  2. Set node_id and bus baud_rate.
+  3. Enable cyclic feedback: heartbeat / encoder / torques message rates (ms) —
+     required so the CAN driver can read pos/vel/torque without polling.
+  4. Ensure POSITION_CONTROL + PASSTHROUGH and apply controller gains.
+  5. save_configuration() — reboot-tolerant (saving drops the USB link).
 
-ATTRIBUTE-PATH NOTE
--------------------
-Paths below target odrive 0.6.11 firmware. If an attribute is missing, your
-firmware names it slightly differently — print `odrv0.axis0.config.can` and
-`odrv0.can.config` to find the right one. The script guards each write so a
-missing attribute warns instead of crashing.
-
-Usage:
-    python3 odrive_can_setup.py            # configure first ODrive, node_id 7
-    python3 odrive_can_setup.py --node-id 8 --axis 0
+Attribute paths are guarded with hasattr() because the exact names depend on the
+firmware build; the printed tree in step 1 is the ground truth.
 """
 
-import argparse
-import sys
+import time
 
 import odrive
-from odrive.enums import ControlMode, InputMode
+from odrive.enums import AxisState, ControlMode, InputMode, Protocol
+
+# ── desired CAN config ────────────────────────────────────────────
+NODE_ID = 7
+BAUD_RATE = 1_000_000
+# Cyclic feedback rates (ms)
+HEARTBEAT_RATE_MS = 10
+ENCODER_RATE_MS = 10
+TORQUES_RATE_MS = 10
+
+# Gains tuned earlier over USB (see HANDOFF.md); applied so the drive is ready.
+POS_GAIN = 15.0
+VEL_GAIN = 0.05
+VEL_INTEGRATOR_GAIN = 0.1
 
 
-def _try_set(obj, attr_path, value):
-    """Set a (possibly nested) attribute; warn if the path doesn't exist."""
-    parts = attr_path.split(".")
-    target = obj
-    try:
-        for p in parts[:-1]:
-            target = getattr(target, p)
-        getattr(target, parts[-1])  # probe existence
-        setattr(target, parts[-1], value)
-        print(f"  set {attr_path} = {value}")
-        return True
-    except AttributeError:
-        print(f"  [skip] {attr_path} not found on this firmware")
-        return False
+def _trysetattr(obj, name, value) -> bool:
+    """Set obj.name = value if the attribute exists; report what happened."""
+    if obj is not None and hasattr(obj, name):
+        try:
+            setattr(obj, name, value)
+            print(f"    set {name} = {value}")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            print(f"    FAILED to set {name}: {exc}")
+            return False
+    print(f"    (skip) attribute {name!r} not present on this firmware")
+    return False
 
 
-def _try_get(obj, attr_path):
-    parts = attr_path.split(".")
-    target = obj
-    try:
-        for p in parts:
-            target = getattr(target, p)
-        return target
-    except AttributeError:
-        return "<n/a>"
+def _print_can_config(can_cfg) -> None:
+    """Print every scalar attribute under a config.can object."""
+    if can_cfg is None:
+        print("  (no config.can object found)")
+        return
+    for name in sorted(dir(can_cfg)):
+        if name.startswith("_"):
+            continue
+        try:
+            val = getattr(can_cfg, name)
+        except Exception:
+            continue
+        # Skip nested remote objects / callables; we want scalar settings.
+        if callable(val):
+            continue
+        print(f"    can.{name} = {val}")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Configure an ODrive for CAN Simple.")
-    ap.add_argument("--node-id", type=int, default=7,
-                    help="CAN node id (keep 7/8 to avoid arb-id collisions, see HANDOFF).")
-    ap.add_argument("--axis", type=int, default=0, help="Axis index (0 or 1).")
-    ap.add_argument("--baud", type=int, default=1_000_000, help="CAN baud rate (Hz).")
-    ap.add_argument("--fb-rate-ms", type=int, default=10,
-                    help="Cyclic feedback period for heartbeat/encoder/torque (ms).")
-    ap.add_argument("--serial", type=str, default=None, help="Connect to a specific ODrive serial.")
-    ap.add_argument("--pos-gain", type=float, default=None)
-    ap.add_argument("--vel-gain", type=float, default=None)
-    ap.add_argument("--vel-integrator-gain", type=float, default=None)
-    ap.add_argument("--no-save", action="store_true",
-                    help="Configure but do NOT save (won't reboot / won't persist).")
-    args = ap.parse_args()
-
-    print("Waiting for ODrive over USB...")
-    odrv = odrive.find_sync(serial_number=args.serial) if args.serial else odrive.find_sync()
+    print("Waiting for ODrive over USB ...")
+    odrv = odrive.find_sync()
     print(f"Found ODrive {odrv._dev.serial_number}")
 
-    axis = getattr(odrv, f"axis{args.axis}")
-    axis_can = f"axis{args.axis}.config.can"
+    axis = odrv.axis0
+    can_cfg = getattr(axis.config, "can", None)
 
-    # ── current config ────────────────────────────────────────────
-    print("\nCurrent CAN config:")
-    print(f"  node_id          = {_try_get(odrv, axis_can + '.node_id')}")
-    print(f"  baud_rate        = {_try_get(odrv, 'can.config.baud_rate')}")
-    print(f"  heartbeat_rate   = {_try_get(odrv, axis_can + '.heartbeat_msg_rate_ms')}")
-    print(f"  encoder_rate     = {_try_get(odrv, axis_can + '.encoder_msg_rate_ms')}")
-    print(f"  torque_rate      = {_try_get(odrv, axis_can + '.torque_msg_rate_ms')}")
+    # 1) Inspect current state
+    print("\n[1] Current per-axis CAN config (axis0.config.can):")
+    _print_can_config(can_cfg)
+    if hasattr(odrv, "can") and hasattr(odrv.can, "config"):
+        print(f"    odrv.can.config.baud_rate = {getattr(odrv.can.config, 'baud_rate', '?')}")
 
-    # ── apply CAN config ──────────────────────────────────────────
-    print("\nApplying CAN config:")
-    _try_set(odrv, "can.config.baud_rate", args.baud)
-    _try_set(odrv, axis_can + ".node_id", args.node_id)
-    # Cyclic feedback so the runtime reader always has fresh pos/vel/torque.
-    _try_set(odrv, axis_can + ".heartbeat_msg_rate_ms", args.fb_rate_ms)
-    _try_set(odrv, axis_can + ".encoder_msg_rate_ms", args.fb_rate_ms)
-    _try_set(odrv, axis_can + ".torque_msg_rate_ms", args.fb_rate_ms)
+    # 2) Node id + baud rate + enable the CAN Simple protocol.
+    # NOTE: protocol defaults to Protocol.NONE (0) on a fresh drive — with it the
+    # ODrive ignores CAN entirely (no cyclic frames, no command response) even
+    # though node_id/baud/rates are set. It MUST be Protocol.SIMPLE (1).
+    print("\n[2] Setting node id + baud rate + protocol:")
+    _trysetattr(can_cfg, "node_id", NODE_ID)
+    if hasattr(odrv, "can") and hasattr(odrv.can, "config"):
+        _trysetattr(odrv.can.config, "baud_rate", BAUD_RATE)
+        _trysetattr(odrv.can.config, "protocol", Protocol.SIMPLE)
 
-    # ── ensure position control + passthrough ─────────────────────
-    print("\nEnsuring control mode:")
-    _try_set(axis, "controller.config.control_mode", ControlMode.POSITION_CONTROL)
-    _try_set(axis, "controller.config.input_mode", InputMode.PASSTHROUGH)
-    if args.pos_gain is not None:
-        _try_set(axis, "controller.config.pos_gain", args.pos_gain)
-    if args.vel_gain is not None:
-        _try_set(axis, "controller.config.vel_gain", args.vel_gain)
-    if args.vel_integrator_gain is not None:
-        _try_set(axis, "controller.config.vel_integrator_gain", args.vel_integrator_gain)
+    # 3) Cyclic feedback message rates
+    print("\n[3] Enabling cyclic feedback message rates:")
+    _trysetattr(can_cfg, "heartbeat_msg_rate_ms", HEARTBEAT_RATE_MS)
+    _trysetattr(can_cfg, "encoder_msg_rate_ms", ENCODER_RATE_MS)
+    # firmware has used both 'torques_' and 'torque_' spellings — try both
+    if not _trysetattr(can_cfg, "torques_msg_rate_ms", TORQUES_RATE_MS):
+        _trysetattr(can_cfg, "torque_msg_rate_ms", TORQUES_RATE_MS)
 
-    # Make sure the drive comes up idle, not spinning, after reboot.
-    _try_set(axis, "config.startup_closed_loop_control", False)
+    # 4) Controller mode + gains
+    print("\n[4] Ensuring POSITION_CONTROL / PASSTHROUGH + gains:")
+    axis.controller.config.control_mode = ControlMode.POSITION_CONTROL
+    axis.controller.config.input_mode = InputMode.PASSTHROUGH
+    axis.controller.config.pos_gain = POS_GAIN
+    axis.controller.config.vel_gain = VEL_GAIN
+    axis.controller.config.vel_integrator_gain = VEL_INTEGRATOR_GAIN
+    print(f"    control_mode=POSITION, input_mode=PASSTHROUGH, "
+          f"pos_gain={POS_GAIN}, vel_gain={VEL_GAIN}, "
+          f"vel_integrator_gain={VEL_INTEGRATOR_GAIN}")
 
-    if args.no_save:
-        print("\n--no-save given: configuration NOT persisted (no reboot).")
-        return
-
-    # ── save (reboots + drops USB) ────────────────────────────────
-    print("\nSaving configuration (drive will reboot and USB will drop — this is normal)...")
+    # 5) Save (reboots the drive and drops USB — tolerate the disconnect)
+    print("\n[5] Saving configuration (drive will reboot, USB will drop) ...")
     try:
         odrv.save_configuration()
-    except Exception as e:
-        # save_configuration reboots, which tears down the USB link mid-call.
-        print(f"  (expected disconnect on reboot: {type(e).__name__})")
+    except Exception as exc:  # noqa: BLE001 — expected: USB drops on reboot
+        print(f"    save_configuration() raised (expected on reboot): {exc}")
 
-    print("\nDone. Re-plug / reconnect if needed, then verify with `candump can0`:")
-    nid = args.node_id
-    print(f"  heartbeat frame id = 0x{(nid << 5) | 0x01:03X}")
-    print(f"  encoder   frame id = 0x{(nid << 5) | 0x09:03X}")
-    print(f"  torque    frame id = 0x{(nid << 5) | 0x1C:03X}")
+    print("\nReconnecting to confirm saved config ...")
+    time.sleep(2.0)
+    odrv = odrive.find_sync()
+    axis = odrv.axis0
+    can_cfg = getattr(axis.config, "can", None)
+    print("Config after reboot (axis0.config.can):")
+    _print_can_config(can_cfg)
+    if hasattr(odrv, "can") and hasattr(odrv.can, "config"):
+        print(f"    odrv.can.config.baud_rate = {getattr(odrv.can.config, 'baud_rate', '?')}")
+
+    print("\nDone. The ODrive is configured for CAN Simple. "
+          "Next: bring up can0 @ 1M and run the CAN bench test.")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(130)
+    main()

@@ -1,0 +1,15 @@
+# Dodo sim-to-real deployment stack
+# (ROS 2 Humble / rclpy is provided by the system ROS install, not pip.)
+
+# Policy + simulation verification
+onnxruntime>=1.16        # run exported policy.onnx
+mujoco>=3.2              # SimEnv physics (MjSpec API)
+numpy>=1.21
+
+# Motors (real robot)
+python-can
+damiao_motor==1.0.6      # Damiao MIT-mode CAN
+# odrive==0.6.11.post0   # only for odrive_can_setup.py (USB config), not runtime
+
+# IMU (Observer)
+pyserial
