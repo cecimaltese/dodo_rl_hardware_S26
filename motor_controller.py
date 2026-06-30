@@ -34,6 +34,33 @@ Safety: every position command is clamped, and measured feedback is monitored,
 against SAFETY_FACTOR (= 0.9) of each motor's rated position / velocity / torque
 limits. A breach (or a motor fault flag) triggers an e-stop: all motors are
 disabled and commands are ignored until the node is restarted.
+Sim-to-real (IsaacLab) alignment
+--------------------------------
+DEPLOYMENT CONSTRAINT (from the professor): do NOT use base_lin_vel in the policy
+observation. Base *linear* velocity can't be estimated reliably from the IMU
+without sophisticated state estimation, so the policy must not depend on it. The
+first deployment target is a STAND-AND-BALANCE policy (hold two-leg balance, resist
+mild pushes) — that needs neither linear velocity nor velocity commands.
+
+So the observation we target is:
+
+  action      = per-joint position target, applied as
+                target = default_joint_pos + action_scale * action   (radians, sim)
+  observation = concat[ base_ang_vel(3), projected_gravity(3),
+                        joint_pos_rel(n), joint_vel(n), last_action(n) ]
+
+  EXCLUDED on purpose: base_lin_vel (unreliable from IMU) and velocity_commands
+  (no command for a pure balance policy). The IsaacLab env must drop these terms
+  too (observations.policy.base_lin_vel = None, .velocity_commands = None) so the
+  trained obs layout matches this exactly.
+
+This file owns everything MOTOR-derived: joint_pos_rel, joint_vel, last_action,
+and it applies actions to the right motor in that motor's native units (Damiao =
+radians, ODrive = turns). The IMU terms that ARE used (base_ang_vel from the gyro,
+projected_gravity from accel/orientation) come from the FeedbackAggregator / IMU
+module (colleague "Jim") and are stitched in via to_policy_vector(). Keep
+POLICY_JOINTS in the SAME order as the sim's articulation joint order so the final
+Isaac Lab swap is a one-liner, not a rewrite.
 
 Run with:
     python3 motor_controller.py
@@ -378,6 +405,70 @@ class MotorController(Node):
         self._estopped = True
         self.get_logger().error(f"E-STOP: {reason}. Disabling all motors.")
         self.disable_all()
+
+    '''
+       # ── sim-to-real hook: step / observe ──────────────────────────
+    def step(self, action: Sequence[float]) -> None:
+        """ simulation runs at 100Hz and hardware at 50Hz -> MISSING decimation factor (?)
+        Apply one policy action. 
+
+        action[i] corresponds to policy_joints[i]; target (rad) =
+        default_pos + action_scale * action[i], converted to the joint's native
+        units and sent. Mirrors IsaacLab JointPositionAction(use_default_offset).
+        """
+        if len(action) != len(self.policy_joints):
+            raise ValueError(
+                f"action len {len(action)} != n joints {len(self.policy_joints)}")
+        for i, (pj, j) in enumerate(zip(self.policy_joints, self._policy_objs)):
+            target_rad = pj.default_pos + self.cfg.action_scale * float(action[i])
+            j.send_position(self._rad_to_native(j, target_rad))
+        self._last_action = [float(a) for a in action]
+
+    def get_observation(self) -> dict:
+        """Return the MOTOR-derived part of the observation, in policy order.
+
+        joint_pos_rel and joint_vel are in RADIANS / rad·s (sim convention),
+        regardless of each motor's native units. The used IMU term (base_ang_vel)
+        is left None for the FeedbackAggregator (Jim) to fill; projected_gravity
+        likewise. base_lin_vel is intentionally absent (see module docstring).
+        Use to_policy_vector() to assemble the full balance-policy observation.
+        """
+        joint_pos_rel, joint_vel = [], []
+        for pj, j in zip(self.policy_joints, self._policy_objs):
+            joint_pos_rel.append(self._native_to_rad(j, j.get_position()) - pj.default_pos)
+            vel_native = j.get_state().get("vel", 0.0)
+            joint_vel.append(self._native_to_rad(j, vel_native))
+        return {
+            # motor-derived (filled here)
+            "joint_pos_rel": joint_pos_rel,
+            "joint_vel": joint_vel,
+            "last_action": list(self._last_action),
+            # IMU terms used by the balance policy — filled by FeedbackAggregator
+            "base_ang_vel": None,
+            "projected_gravity": None,
+            # NOTE: base_lin_vel and velocity_commands are intentionally excluded.
+        }
+
+    def to_policy_vector(self,
+                         base_ang_vel: Sequence[float],
+                         projected_gravity: Sequence[float]) -> List[float]:
+        """Assemble the stand-and-balance policy observation in canonical order:
+        [base_ang_vel(3), projected_gravity(3),
+         joint_pos_rel(n), joint_vel(n), last_action(n)].
+
+        Caller supplies the two IMU terms (from Jim's module). base_lin_vel and
+        velocity_commands are deliberately NOT part of this vector — the trained
+        IsaacLab policy must be configured to match (no base_lin_vel, no commands).
+        """
+        obs = self.get_observation()
+        return [
+            *base_ang_vel,
+            *projected_gravity,
+                        *obs["joint_pos_rel"],
+            *obs["joint_vel"],
+            *obs["last_action"],
+        ]
+        '''
 
     # ------------------------------------------------------------------ #
     # Shutdown
