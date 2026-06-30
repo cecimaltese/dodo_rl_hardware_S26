@@ -40,15 +40,18 @@ import numpy as np
 
 TWO_PI = 2.0 * math.pi
 
-# --- Joint order the POLICY expects (IsaacLab/PhysX BFS articulation order). -----
-# VERIFY once against `env.unwrapped.scene["robot"].joint_names` in IsaacLab; the
-# practical check is that SimEnv produces stable behavior (wrong order → instant
-# flailing). MuJoCo's own order differs and is remapped by name in SimEnv.
+# --- Joint order the POLICY expects (IsaacLab/PhysX articulation order). ----------
+# PhysX orders DOFs breadth-first by tree depth → TYPE-GROUPED (all hips, then all
+# upper_legs, then lower_legs, then feet), and within each level LEFT precedes RIGHT.
+# This is NOT the URDF/MuJoCo order (which is per-leg, right-first); SimEnv/RealEnv
+# remap to this order BY NAME.
+# Empirically pinned in MuJoCo with the dodo_stand policy (test_sim2sim_consistency):
+# this order stands stably 30 s+; right-first or per-leg orders flip the robot <1 s.
 POLICY_JOINT_ORDER: List[str] = [
-    "hip_right", "hip_left",
-    "upper_leg_right", "upper_leg_left",
-    "lower_leg_right", "lower_leg_left",
-    "foot_right", "foot_left",
+    "hip_left", "hip_right",
+    "upper_leg_left", "upper_leg_right",
+    "lower_leg_left", "lower_leg_right",
+    "foot_left", "foot_right",
 ]
 
 # Test/override hook: set DODO_JOINT_ORDER="a,b,..." to override (used to verify

@@ -57,10 +57,17 @@ def _build_model(urdf_path: str) -> mujoco.MjModel:
     for g in spec.geoms:
         g.contype = 2
         g.conaffinity = 1
-    # Joint armature (reflected rotor inertia), matching IsaacLab actuator cfg.
+    # Match IsaacLab's implicit actuator on each revolute joint:
+    #  - armature 0.01 (reflected rotor inertia), from the actuator cfg;
+    #  - zero passive joint damping/friction so the ONLY velocity-dependent term is
+    #    the software PD's KD below. (MuJoCo imports <dynamics damping="0.01"> from the
+    #    URDF as passive dof_damping; IsaacLab's ImplicitActuator drives damping=KD and
+    #    adds no separate passive damping, so the 0.01 would be a sim2sim mismatch.)
     for j in spec.joints:
         if j.type == mujoco.mjtJoint.mjJNT_HINGE:
             j.armature = 0.01
+            j.damping = [0.0, 0.0, 0.0]   # MjSpec stores joint damping as a 3-vector
+            j.frictionloss = 0.0
 
     # Ground plane in the world (a light is only needed for rendering).
     spec.worldbody.add_geom(
