@@ -3,8 +3,8 @@ sim_env.py — SimEnv(Env): MuJoCo backend for verifying the policy before hardw
 
 Loads the robot URDF, makes it a floating base on a ground plane, adds torque
 actuators + an IMU site (gyro / velocimeter / orientation), and runs software PD
-control that mirrors IsaacLab's EXPLICIT PD actuator (DelayedPDActuatorCfg,
-stiffness 30, damping 0.5, effort limits 27 Nm hips/upper, 9 Nm knee/ankle), at sim dt 0.005 with
+control that mirrors IsaacLab's ImplicitActuator (stiffness 32, damping 3.0,
+effort limits 27 Nm hips/upper, 9 Nm knee/ankle), at sim dt 0.005 with
 decimation 4 → 50 Hz control. Observations are read from the sim and remapped
 from MuJoCo joint order into the policy joint order.
 
@@ -25,12 +25,13 @@ import numpy as np
 from rl_env import (Env, ObsCfg, OBS_FLAT, POLICY_JOINT_ORDER,
                     DEFAULT_JOINT_POS, projected_gravity_from_quat)
 
-# PD gains + effort limits. MUST match dodo.py's DelayedPDActuatorCfg (explicit PD,
-# kp=30 kd=0.5) and the real Damiao hip gains, so the same policy behaves the same
-# across IsaacLab, MuJoCo, and hardware. dodo.py now uses an EXPLICIT PD actuator
-# (not implicit) specifically so this MuJoCo torque-PD loop matches it.
-KP = 30.0
-KD = 0.5
+# PD gains + effort limits. MUST match the trained policy's actuator cfg so the same
+# policy behaves the same across IsaacLab, MuJoCo, and hardware. The dodo_stand run
+# (params/env.yaml) uses an ImplicitActuator with stiffness=32, damping=3.0 and
+# effort_limit_sim 27 Nm (hips/upper) / 9 Nm (knee/ankle). This MuJoCo torque-PD loop
+# mirrors that: tau = KP*(target-q) - KD*qd, clipped to the effort limits.
+KP = 32.0
+KD = 3.0
 EFFORT_LIMIT = {  # Nm, by joint-name prefix
     "hip_": 27.0, "upper_leg_": 27.0, "lower_leg_": 9.0, "foot_": 9.0,
 }
