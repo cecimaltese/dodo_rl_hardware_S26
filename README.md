@@ -104,6 +104,7 @@ sudo ip link set can0 up type can bitrate 1000000
 | `odrive_position_control.py` | **USB** — interactive ODrive gain-tuning / config tool. |
 | `motor_controller.py` | `MotorController` — owns the whole fleet on one bus; `enable_all`/`disable_all`/`set_zero_all`/`shutdown` + the sim-to-real `step(action)` / `get_observation()`. |
 | `demo_combined.py` | Bench demo (1 Damiao + 1 ODrive over CAN) driving everything through `MotorController`. |
+| `read_motor_state.py` | **Read-only bench diagnostic** — connects to the whole configured fleet, marks each motor ONLINE/OFFLINE, and streams parameters + live pos/vel/torque. Damiao read LIMP (kp=kd=0, backdrivable) by default; no motion commanded. First hardware bring-up / sanity-check tool. |
 | `dm_position_control.py` | Original flat single-Damiao sample script (reference). |
 | `HANDOFF.md` | Full context / roadmap recap. |
 
@@ -115,7 +116,8 @@ Dependencies: `python-can`, `damiao_motor==1.0.6`, `odrive==0.6.11.post0`.
 sudo ip link set can0 up type can bitrate 1000000   # 1) bus up
 python3 odrive_can_setup.py                          # 2) once: ODrive → CAN (node 7, 1M), saves+reboots
 candump can0                                          # 3) sanity: see DM feedback + ODrive heartbeat/encoder
-python3 demo_combined.py                              # 4) both motors move through MotorController
+python3 read_motor_state.py                          # 4) read-only: which motors are ONLINE + live states
+python3 demo_combined.py                              # 5) both motors move through MotorController
 ```
 
 ## Sim-to-real hook

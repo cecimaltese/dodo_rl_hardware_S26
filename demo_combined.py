@@ -23,7 +23,7 @@ from motor_controller import MotorController, MotorControllerConfig, PolicyJoint
 # ── configuration (bench: 1 Damiao + 1 ODrive) ────────────────────
 DM_CONFIGS = [
     DamiaoJointConfig(name="dm_bench", motor_id=0x02, feedback_id=0x12,
-                      motor_type="4310", kp=30.0, kd=0.5, rated_torque=9.0),
+                      motor_type="4310", kp=32.0, kd=3.0, rated_torque=9.0),
 ]
 OD_CONFIGS = [
     OdriveCanJointConfig(name="od_bench", node_id=7, rated_torque=27.0),

@@ -135,6 +135,48 @@ CAN migration is **implemented** (in the `dodo_rl_hardware_S26/` repo; py_compil
 
 **Still pending:** bench hardware-in-the-loop verification (user-run), then the safety layer (§4).
 
+### UPDATE 2026-07-01 (sim side verified; hardware bring-up prep)
+- **MuJoCo sim2sim now works** for the `dodo_stand` policy. Root cause of the earlier
+  fall/shake: `sim_env.py` PD gains were stale (KP 30 / KD 0.5) vs the trained policy's
+  actuator cfg (`params/env.yaml`: ImplicitActuator **stiffness 32 / damping 3.0**). Fixed
+  `sim_env.py` → KP=32, KD=3.0. Robot now stands stably. **The same mismatch exists on the
+  real side:** `DamiaoJoint` / `dm_position_control.py` default kp=30 kd=0.5 and `DM_JOINTS`
+  in `motor_controller.py` sets kp=30 kd=0.5 — the trained target is kp≈32 kd≈3.0 (Damiao MIT
+  units differ, so treat as a calibration target, not a literal copy). TODO before deploy.
+- **Added `read_motor_state.py`** — read-only bench diagnostic that connects to the whole
+  configured fleet (DAMIAO_MOTORS + ODRIVE_MOTORS, kept in sync with `DM_JOINTS`/`OD_JOINTS`),
+  marks each motor ONLINE/OFFLINE, and streams parameters + live pos/vel/torque. Damiao read
+  LIMP (kp=kd=0) by default so joints are backdrivable — use it to verify each joint's
+  direction/sign matches the sim's +angle convention. py_compile-clean, **not yet hardware-run.**
+- **Deployment gaps found (blockers for `--backend real`):**
+  1. **IMU/body-state module is a hard dependency.** `OBS_STAND` = base_ang_vel(3) +
+     projected_gravity(3) + joint terms; both IMU terms come only from `/imu_states`. Without
+     the IMU node ("Jim"), `RealEnv` publishes zeros → policy is blind to tilt → cannot balance.
+  2. **Per-joint zero/calibration** must map the real motor zeros to the sim default pose
+     (hip 0 / upper_leg 0.2 / lower_leg -0.5 / foot 0.3 rad) and confirm sign per joint.
+  3. **Doc/code reconciliation:** `motor_controller.py` already implements a safety skeleton
+     (SAFETY_FACTOR 0.9 pos/vel/torque + e-stop), but §4 below and the README still describe
+     the 0.8→IDLE spec as pending. Decide clamp-vs-IDLE and the 0.8-vs-0.9 threshold, then
+     make docs + code agree.
+
+### UPDATE 2026-07-01 (b) — safety layer implemented in motor_controller.py
+Reconciled the safety layer with §4.1 and the professor's spec. Now in `motor_controller.py`:
+- **Physical joint limits from the URDF** (`JOINT_LIMITS_RAD`, `RATED_TORQUE_NM`,
+  `JOINT_VEL_LIMIT_RAD=6`) are the single source of truth. `_JointAdapter` converts them to
+  each motor's native units, so position commands are clamped to the real leg/body range
+  (hip ±0.35, upper_leg ±1.57, knee -3.14..1.40, ankle -1.05..1.57 rad) with a 0.9 margin.
+- **Torque → IDLE (professor's spec):** `|torque| > 0.8 * rated` → that ONE motor is disabled
+  (`_idle_joint`), fleet keeps running. `TORQUE_IDLE_FACTOR=0.8`, separate from `SAFETY_FACTOR`.
+- **Full e-stop** (disable-all) on: motor fault, over-speed (>0.9×6 rad/s), measured position
+  past the hard mechanical limit (+0.10 rad margin), stalled command stream (`CMD_WATCHDOG_S=0.5`),
+  or a live joint going silent (`FB_WATCHDOG_S=0.5`).
+- **Caveat (biped):** IDLE-ing one leg motor will make the robot fall — run on a gantry.
+- **Caveat (ODrive gearing):** turns↔rad assumes direct drive (1 turn = 2π rad). If the
+  ODrive joints are geared, both commands AND these limits must be divided by the gear ratio —
+  VERIFY before trusting the ODrive clamps. (Same note in the code.)
+- `py_compile`-clean; **not yet hardware-tested.** Still TODO: match real motor gains to the
+  trained kp≈32/kd≈3.0, and the IMU node (both from update (a)).
+
 ### Decisions captured from the user (don't re-ask)
 - ODrive transport → **move to CAN** (same `can0` bus as DM). Same interface, different ids.
 - ODrive CAN config state → **unknown** → include the USB inspect/config step.

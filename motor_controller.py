@@ -83,8 +83,38 @@ from odrive_can_joint import OdriveCanJoint, OdriveCanJointConfig
 
 
 TWO_PI = 2.0 * math.pi
-SAFETY_FACTOR = 0.9
 DM_REGISTER_ID = 0x7FF  # Damiao register read/write reply arbitration id
+
+# --- Safety factors / thresholds ------------------------------------------------
+SAFETY_FACTOR = 0.9          # margin applied to position-clamp + velocity limit
+TORQUE_IDLE_FACTOR = 0.8     # |torque| > 0.8 * rated  ->  that motor goes to IDLE
+                             # (professor's spec; per-joint, NOT a full e-stop)
+CMD_WATCHDOG_S = 0.5         # once commands are streaming, a gap this long -> e-stop
+FB_WATCHDOG_S = 0.5          # a joint that WAS reporting goes silent this long -> e-stop
+POS_OVERTRAVEL_MARGIN = 0.10 # rad past the hard URDF limit (measured) -> e-stop
+STARTUP_GRACE_S = 1.0        # ignore safety trips for the first second (transients)
+
+# --- Physical constraints of the legs/body (from dodo_daimao.urdf) --------------
+# The mechanical range of each joint, in RADIANS. This is the single source of
+# truth for position safety; _JointAdapter converts to each motor's native units
+# (Damiao=rad, ODrive=turns) for clamping. Keep in sync with the URDF <limit> tags.
+JOINT_LIMITS_RAD = {
+    "hip_left":        (-0.35,   0.35),   "hip_right":       (-0.35,   0.35),    # hip roll
+    "upper_leg_left":  (-1.57,   1.57),   "upper_leg_right": (-1.57,   1.57),    # hip pitch
+    "lower_leg_left":  (-3.1416, 1.3963), "lower_leg_right": (-3.1416, 1.3963),  # knee
+    "foot_left":       (-1.05,   1.57),   "foot_right":      (-1.05,   1.57),    # ankle
+}
+# Rated torque per joint (URDF effort limits, Nm): hips/upper 27, knee/ankle 9.
+RATED_TORQUE_NM = {
+    "hip_left": 27.0, "hip_right": 27.0, "upper_leg_left": 27.0, "upper_leg_right": 27.0,
+    "lower_leg_left": 9.0, "lower_leg_right": 9.0, "foot_left": 9.0, "foot_right": 9.0,
+}
+JOINT_VEL_LIMIT_RAD = 6.0    # URDF velocity limit (rad/s), same for all joints.
+
+# NOTE (ODrive gearing): unit conversion assumes 1 motor turn == 2*pi rad at the
+# joint (direct drive). If the T-Motor/ODrive joints are geared, this scaling —
+# and therefore BOTH the commands and these limits — must be divided by the gear
+# ratio. Verify the real ratio before trusting the ODrive position clamps.
 
 # Damiao fault status names (anything other than DISABLED/ENABLED) -> e-stop.
 DM_FAULT_STATUS = {
@@ -140,30 +170,32 @@ class _JointAdapter:
         self.joint = joint
         self.name = joint.cfg.name
         self.is_odrive = isinstance(joint, OdriveCanJoint)
+        self.idled = False              # set True once this joint is IDLEd by safety
+        self._last_fb_time: Optional[float] = None  # last time we saw feedback
 
-        if self.is_odrive:
-            cfg: OdriveCanJointConfig = joint.cfg
-            self.pos_lo = cfg.pos_min  # turns; None -> unclamped
-            self.pos_hi = cfg.pos_max
-            self.vel_limit = SAFETY_FACTOR * cfg.vel_limit if cfg.vel_limit else None  # turns/s
-            self.torque_limit = SAFETY_FACTOR * cfg.rated_torque if cfg.rated_torque else None
-            if logger and (self.pos_lo is None or self.pos_hi is None):
-                logger.warn(f"{self.name}: ODrive position is UNCLAMPED "
-                            f"(set pos_min/pos_max in OD_JOINTS for safety).")
-        else:
-            motor = joint.motor  # damiao_motor.DaMiaoMotor with resolved limits
-            p_max = abs(getattr(motor, "_p_max", 12.5))
-            v_max = abs(getattr(motor, "_v_max", 10.0))
-            t_max = abs(getattr(motor, "_t_max", 28.0))
-            cfg = joint.cfg
-            lo, hi = -SAFETY_FACTOR * p_max, SAFETY_FACTOR * p_max
-            if cfg.pos_min is not None:
-                lo = max(lo, cfg.pos_min)
-            if cfg.pos_max is not None:
-                hi = min(hi, cfg.pos_max)
-            self.pos_lo, self.pos_hi = lo, hi          # rad
-            self.vel_limit = SAFETY_FACTOR * v_max     # rad/s
-            self.torque_limit = SAFETY_FACTOR * t_max  # Nm
+        cfg = joint.cfg
+
+        # Position limits: URDF mechanical range (rad) with SAFETY_FACTOR margin,
+        # converted to native units. A per-joint cfg.pos_min/max (native) may
+        # further tighten but never loosen it.
+        lo_rad, hi_rad = JOINT_LIMITS_RAD.get(self.name, (None, None))
+        self.pos_hard_lo_rad, self.pos_hard_hi_rad = lo_rad, hi_rad  # for over-travel check
+        self.pos_lo = self.to_native(lo_rad * SAFETY_FACTOR) if lo_rad is not None else None
+        self.pos_hi = self.to_native(hi_rad * SAFETY_FACTOR) if hi_rad is not None else None
+        cpm, cpx = getattr(cfg, "pos_min", None), getattr(cfg, "pos_max", None)
+        if cpm is not None:
+            self.pos_lo = cpm if self.pos_lo is None else max(self.pos_lo, cpm)
+        if cpx is not None:
+            self.pos_hi = cpx if self.pos_hi is None else min(self.pos_hi, cpx)
+        if logger and (self.pos_lo is None or self.pos_hi is None):
+            logger.warn(f"{self.name}: position UNCLAMPED (no URDF limit found).")
+
+        # Velocity limit (native) from the URDF, with margin.
+        self.vel_limit = self.to_native(SAFETY_FACTOR * JOINT_VEL_LIMIT_RAD)
+        # Torque: rated from the URDF group; IDLE this joint above 0.8 * rated.
+        self.rated_torque = RATED_TORQUE_NM.get(
+            self.name, getattr(cfg, "rated_torque", None) or 9.0)
+        self.torque_idle_limit = TORQUE_IDLE_FACTOR * self.rated_torque
 
     # ── unit conversion (native is turns for ODrive, rad for Damiao) ──
     def to_native(self, rad: float) -> float:
@@ -232,6 +264,8 @@ class MotorController(Node):
         self._estopped = False
         self._stop = threading.Event()
         self._start_time = time.time()
+        self._got_cmd = False          # have we ever received a /motor_commands msg?
+        self._last_cmd_time = 0.0       # time of the last command (for the watchdog)
 
         # ── Damiao: one controller/socket ─────────────────────────
         self.dm_controller = DaMiaoController(channel=dm_channel, bustype=bustype)
@@ -280,10 +314,11 @@ class MotorController(Node):
             lo = f"{a.pos_lo:+.2f}" if a.pos_lo is not None else "-inf"
             hi = f"{a.pos_hi:+.2f}" if a.pos_hi is not None else "+inf"
             vl = f"{a.vel_limit:.1f}" if a.vel_limit is not None else "n/a"
-            tl = f"{a.torque_limit:.1f}" if a.torque_limit is not None else "n/a"
+            tl = f"{a.torque_idle_limit:.1f}"
             unit = "turns" if a.is_odrive else "rad"
             self.get_logger().info(
-                f"  {name}: pos[{lo},{hi}] {unit}, |vel|<={vl}, |torque|<={tl} Nm")
+                f"  {name}: pos[{lo},{hi}] {unit}, |vel|<={vl}, "
+                f"torque->IDLE @{tl} Nm (0.8 x {a.rated_torque:.0f})")
 
     # ── ODrive reader thread ──────────────────────────────────────
     def _reader_loop(self):
@@ -329,6 +364,9 @@ class MotorController(Node):
             self.get_logger().warn("Command had no positions; ignored.")
             return
 
+        self._got_cmd = True
+        self._last_cmd_time = time.time()
+
         # Match by name when names are given, else by joint order.
         if msg.name:
             pairs = []
@@ -344,6 +382,8 @@ class MotorController(Node):
             pairs = list(zip(self.adapters.values(), msg.position))
 
         for a, target_rad in pairs:
+            if a.idled:
+                continue  # this joint was IDLEd by safety; don't re-command it
             native = a.clamp_native(a.to_native(float(target_rad)))
             if abs(a.to_rad(native) - float(target_rad)) > 1e-6:
                 self.get_logger().warn(
@@ -359,6 +399,8 @@ class MotorController(Node):
             return
 
         for joint in self.joints:
+            if self.adapters[joint.cfg.name].idled:
+                continue  # IDLEd by safety — leave it disabled, don't re-drive it
             try:
                 joint.update()  # drive ramp / hold last target
             except Exception as e:
@@ -367,6 +409,7 @@ class MotorController(Node):
         states = {name: a.read_state() for name, a in self.adapters.items()}
         self._publish_states(states)
         self._safety_check(states)
+        self._watchdog_check(states)
 
     def _publish_states(self, states: dict):
         msg = JointState()
@@ -379,25 +422,73 @@ class MotorController(Node):
         self.state_pub.publish(msg)
 
     def _safety_check(self, states: dict):
-        """E-stop if any joint faults or exceeds its safe velocity/torque."""
+        """Per-cycle safety. Severe/systemic breaches (fault, over-speed, position
+        over-travel) -> full e-stop; a torque breach on ONE joint -> IDLE just that
+        joint (professor's spec: |torque| > 0.8*rated -> motor to IDLE)."""
         # Small startup grace so transient feedback doesn't nuisance-trip.
-        if time.time() - self._start_time < 1.0:
+        if time.time() - self._start_time < STARTUP_GRACE_S:
             return
         for name, st in states.items():
             if not st["has_feedback"]:
                 continue
             a = self.adapters[name]
+            a._last_fb_time = time.time()
+            if a.idled:
+                continue  # already protected
+
+            # (1) Motor-reported fault -> systemic -> e-stop everything.
             if st["fault"]:
                 self._estop(f"{name} reported fault: {st['fault']}")
                 return
+            # (2) Over-speed -> instability -> e-stop everything.
             if a.vel_limit is not None and abs(st["vel_native"]) > a.vel_limit:
                 self._estop(f"{name} velocity {abs(st['vel_native']):.2f} > "
                             f"{a.vel_limit:.2f} ({'turns/s' if a.is_odrive else 'rad/s'})")
                 return
-            if a.torque_limit is not None and abs(st["torque"]) > a.torque_limit:
-                self._estop(f"{name} torque {abs(st['torque']):.2f} > "
-                            f"{a.torque_limit:.2f} Nm")
+            # (3) Measured position past the hard mechanical limit -> e-stop.
+            if a.pos_hard_lo_rad is not None:
+                p = st["pos_rad"]
+                if (p < a.pos_hard_lo_rad - POS_OVERTRAVEL_MARGIN or
+                        p > a.pos_hard_hi_rad + POS_OVERTRAVEL_MARGIN):
+                    self._estop(f"{name} position {p:+.3f} rad past mechanical limit "
+                                f"[{a.pos_hard_lo_rad:+.3f},{a.pos_hard_hi_rad:+.3f}]")
+                    return
+            # (4) Torque over 0.8*rated -> IDLE just this motor (per professor).
+            if abs(st["torque"]) > a.torque_idle_limit:
+                self._idle_joint(name, f"torque {abs(st['torque']):.2f} > "
+                                        f"{a.torque_idle_limit:.2f} Nm "
+                                        f"(0.8 x {a.rated_torque:.0f} Nm rated)")
+
+    def _watchdog_check(self, states: dict):
+        """E-stop on a stalled command stream or a joint that went silent."""
+        if time.time() - self._start_time < STARTUP_GRACE_S or self._estopped:
+            return
+        now = time.time()
+        # Command watchdog: only after the stream has started (avoids tripping while idle).
+        if self._got_cmd and (now - self._last_cmd_time) > CMD_WATCHDOG_S:
+            self._estop(f"no /motor_commands for {now - self._last_cmd_time:.2f}s "
+                        f"(> {CMD_WATCHDOG_S}s watchdog)")
+            return
+        # Feedback watchdog: a joint that was reporting has gone silent (lost comm).
+        for name, a in self.adapters.items():
+            if a.idled:
+                continue
+            if a._last_fb_time is not None and (now - a._last_fb_time) > FB_WATCHDOG_S:
+                self._estop(f"{name} feedback silent for {now - a._last_fb_time:.2f}s "
+                            f"(> {FB_WATCHDOG_S}s watchdog)")
                 return
+
+    def _idle_joint(self, name: str, reason: str):
+        """Disable a single motor (send it to IDLE) without stopping the fleet."""
+        a = self.adapters[name]
+        if a.idled:
+            return
+        a.idled = True
+        self.get_logger().error(f"IDLE {name}: {reason}. Disabling this motor.")
+        try:
+            a.joint.disable()
+        except Exception as e:
+            self.get_logger().error(f"{name}: disable failed: {e}")
 
     def _estop(self, reason: str):
         if self._estopped:
