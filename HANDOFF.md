@@ -177,6 +177,16 @@ Reconciled the safety layer with §4.1 and the professor's spec. Now in `motor_c
 - `py_compile`-clean; **not yet hardware-tested.** Still TODO: match real motor gains to the
   trained kp≈32/kd≈3.0, and the IMU node (both from update (a)).
 
+### UPDATE 2026-07-06 — height domain randomization added to the stand policy (sim only)
+`dodo_rl/.../stand_env_cfg.py` now randomizes standing height for robustness: initial
+crouch varied across a ~±5 cm band (`_HEIGHT_JOINT_SCALE=(0.7,1.3)`, STAGE 1) + relaxed
+leg-joint pose anchoring (new `joint_deviation_legs`, `joint_deviation_all` re-scoped to
+hips) so the policy tolerates small standing-height / zero-calibration offsets on the real
+robot. **Robustness only — height is NOT commanded or observed**, so obs stays **30-dim**
+and the hardware side (`rl_env.py` / `RealEnv` / `run_policy.py` / `sim_env.py`) is
+**unchanged**. Retrain STAGE 1 (or resume from a STAGE-0 checkpoint) to bake it in; verify
+in PLAY that base height holds across a ~10 cm spread without falling. Tuning: `REWARD_TUNING.md` §9.
+
 ### Decisions captured from the user (don't re-ask)
 - ODrive transport → **move to CAN** (same `can0` bus as DM). Same interface, different ids.
 - ODrive CAN config state → **unknown** → include the USB inspect/config step.

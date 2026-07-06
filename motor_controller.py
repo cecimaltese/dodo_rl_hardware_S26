@@ -99,8 +99,10 @@ STARTUP_GRACE_S = 1.0        # ignore safety trips for the first second (transie
 # truth for position safety; _JointAdapter converts to each motor's native units
 # (Damiao=rad, ODrive=turns) for clamping. Keep in sync with the URDF <limit> tags.
 JOINT_LIMITS_RAD = {
-    "hip_left":        (-0.35,   0.35),   "hip_right":       (-0.35,   0.35),    # hip roll
-    "upper_leg_left":  (-1.57,   1.57),   "upper_leg_right": (-1.57,   1.57),    # hip pitch
+    #Damiao
+    "hip_left":        (-0.966,0.641),  "hip_right":       (-0.544, 1.104),   # hip roll
+    "upper_leg_left":  (-0.324, 2.379), "upper_leg_right": (-2.303, 0.293), # hip pitch
+    #ODrive
     "lower_leg_left":  (-3.1416, 1.3963), "lower_leg_right": (-3.1416, 1.3963),  # knee
     "foot_left":       (-1.05,   1.57),   "foot_right":      (-1.05,   1.57),    # ankle
 }

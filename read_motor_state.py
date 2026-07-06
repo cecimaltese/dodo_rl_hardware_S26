@@ -17,11 +17,11 @@ Pass --hold to read Damiao with its configured kp/kd instead (it will resist).
 
 Prereqs:
   sudo ip link set can0 up type can bitrate 1000000     # bus up (OS level)
-  python3 odrive_can_setup.py                            # once: ODrive -> CAN node/baud/feedback
+  python3 dodo_rl_hardware_S26/odrive_can_setup.py      # once: ODrive -> CAN node/baud/feedback
 Then:
-  python3 read_motor_state.py                            # scan the whole fleet
-  python3 read_motor_state.py --damiao-only --hz 20      # just the Damiao motors, faster
-  python3 read_motor_state.py --hold                     # Damiao with real gains (resists)
+  python3 dodo_rl_hardware_S26/read_motor_state.py                            # scan the whole fleet
+  python3 dodo_rl_hardware_S26/read_motor_state.py --damiao-only --hz 20      # just the Damiao motors, faster
+  python3 dodo_rl_hardware_S26/read_motor_state.py --hold                     # Damiao with real gains (resists)
 
 NOTE (verify against your damiao_motor version): DamiaoJoint.get_state() returns
 pos/vel/torque built from motor.get_states(); this tool also dumps the raw
