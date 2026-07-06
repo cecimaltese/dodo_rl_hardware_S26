@@ -96,33 +96,69 @@ sudo ip link set can0 up type can bitrate 1000000
 
 ## Files
 
+The stack is **ZMQ-based** (we deliberately chose ZMQ over ROS2) — full topic
+spec, rationale and status in **`ZMQ_MIGRATION.md`**.
+
 | File | What it is |
 |---|---|
+| `dodo_ipc.py` | **The contract file**: topics/ports, binary schemas, canonical joint order, Publisher/Subscriber (latest-value), ctl REQ/REP, RateLoop. Everything imports this. |
+| `motor_service.py` | The motor fleet as a ZMQ service: PUB `motor_states` @200 Hz, SUB `motor_commands`, REP `ctl` (calibrate/enable/disable/set_zero/estop_reset/status). Safety layer inside. Bumpless fail-closed enable + boot-pose calibration (`BOOT_POSE_RAD`). No auto-enable. |
+| `imu_service.py` | IMU serial → PUB `imu`. Parses the real `imu.cpp` protocol (poll `'L'`, raw LSB → SI) and the stream-firmware format. |
+| `imu.cpp` | The IMU firmware as flashed today (Nicla Sense ME, poll-based). |
+| `firmware/` | `imu_stream_nicla/` — recommended firmware upgrade: 100 Hz stream + BHI260 fused quaternion (see `firmware/README.md`). |
+| `sim_service.py` | **MuJoCo as a real-time virtual robot** on the same topics — sim2sim = sim2real rehearsal, incl. optional latency/drop injection. |
+| `zmq_env.py` | `ZmqEnv(Env)` — the deployment backend for `run_policy.py --backend zmq`; can't tell sim_service from the real robot. |
+| `rl_env.py` / `sim_env.py` / `run_policy.py` | Policy contract + in-process MuJoCo (fast checks) + the Env-agnostic runner. |
+| `tools/` | `zmq_echo.py`, `zmq_hz.py` (rate/age/jitter/drops), `dodo_ctl.py` (bring-up CLI), `dodo_startup.py` (rehearse the full power-on ritual: calibrate → enable → ramp to default pose → hold → fold back). |
 | `damiao_joint.py` | `DamiaoJoint` — one Damiao motor over CAN MIT mode (radians). |
 | `odrive_can_joint.py` | `OdriveCanJoint` — one ODrive axis over CAN Simple (turns), runtime path. |
 | `odrive_can_setup.py` | **USB, run once** — put the ODrive on CAN (node id, 1 Mbit, cyclic feedback) and save. Gains can't be set over CAN. |
 | `odrive_position_control.py` | **USB** — interactive ODrive gain-tuning / config tool. |
-| `motor_controller.py` | `MotorController` — owns the whole fleet on one bus; `enable_all`/`disable_all`/`set_zero_all`/`shutdown` + the sim-to-real `step(action)` / `get_observation()`. |
-| `demo_combined.py` | Bench demo (1 Damiao + 1 ODrive over CAN) driving everything through `MotorController`. |
-| `read_motor_state.py` | **Read-only bench diagnostic** — connects to the whole configured fleet, marks each motor ONLINE/OFFLINE, and streams parameters + live pos/vel/torque. Damiao read LIMP (kp=kd=0, backdrivable) by default; no motion commanded. First hardware bring-up / sanity-check tool. |
+| `demo_combined.py` | Bench demo over ZMQ: sine-drive any joint subset through the full service stack. |
+| `read_motor_state.py` | **Read-only direct-CAN diagnostic** (pre-ZMQ bring-up): who's ONLINE + live pos/vel/torque, Damiao limp. |
 | `dm_position_control.py` | Original flat single-Damiao sample script (reference). |
-| `HANDOFF.md` | Full context / roadmap recap. |
+| `test_ipc.py` / `test_e2e_zmq.py` / `test_sim2sim_consistency.py` | Message layer tests, end-to-end ZMQ pipeline tests, IsaacLab↔MuJoCo contract tests. |
+| `legacy_ros2/` | Frozen pre-ZMQ ROS2 nodes (reference only). |
+| `HANDOFF.md` | Full context / progress recap. |
 
-Dependencies: `python-can`, `damiao_motor==1.0.6`, `odrive==0.6.11.post0`.
+Dependencies: `pip install -r requirements.txt` (pyzmq, mujoco, onnxruntime,
+python-can, damiao_motor, pyserial — **no ROS**).
 
-## Quick start (bench)
+## Quick start (bench, Ubuntu robot box)
+
+**Startup convention (no homing — it could overload the printed parts/belts):
+POWER ON with the ODrive joints folded all the way back against their stops.**
+`calibrate` then maps turns-since-boot onto those known angles (`BOOT_POSE_RAD`).
 
 ```bash
 sudo ip link set can0 up type can bitrate 1000000   # 1) bus up
 python3 odrive_can_setup.py                          # 2) once: ODrive → CAN (node 7, 1M), saves+reboots
-candump can0                                          # 3) sanity: see DM feedback + ODrive heartbeat/encoder
-python3 read_motor_state.py                          # 4) read-only: which motors are ONLINE + live states
-python3 demo_combined.py                              # 5) both motors move through MotorController
+candump can0                                          # 3) sanity: DM feedback + ODrive heartbeat/encoder
+python3 read_motor_state.py                          # 4) read-only: who is ONLINE + live states
+python3 motor_service.py --only hip_left,lower_leg_left   # 5) service up (subset for the bench)
+python3 tools/dodo_ctl.py status                     # 6) what does the service see?
+python3 tools/dodo_ctl.py calibrate                  # 7) robot was powered on folded at the stops!
+python3 tools/dodo_ctl.py status                     # 8) VERIFY the boot angles match reality
+python3 tools/dodo_startup.py                        # 9) enable → unpark → ramp to default pose → hold → fold back
+python3 demo_combined.py --joints hip_left,lower_leg_left #    or: sine-drive through the stack
+python3 imu_service.py                               #    IMU on /dev/ttyACM0 (see firmware/README.md)
+python3 tools/zmq_hz.py motor_states                 #    (anytime) rate/latency/drops
+```
+
+## Quick start (sim2sim, any machine — no hardware)
+
+```bash
+python3 sim_service.py &                             # real-time MuJoCo "robot" (needs ../dodo_files URDF)
+python3 run_policy.py --backend zmq --task stand \
+    --policy ../dodo_rl/.../dodo_stand/<run>/exported/policy.onnx \
+    --startup-ramp 0        # sim spawns already posed; on the robot keep the default 5 s pre-start ramp
 ```
 
 ## Sim-to-real hook
 
-`MotorController` is the single substitution point for the IsaacLab policy.
+`ZmqEnv` (over the `dodo_ipc` topics) is the single substitution point for the
+IsaacLab policy — the runner's loop is identical against MuJoCo (`sim_service`)
+and the real robot (`motor_service` + `imu_service`).
 
 > **Deployment constraint:** the policy must **not** use `base_lin_vel` — base linear
 > velocity can't be estimated reliably from the IMU without heavier state-estimation. The
@@ -152,12 +188,18 @@ rewrite.
 
 ## Roadmap
 
-1. **Safety layer** in `MotorController`: per-joint position limits, max-velocity limit,
-   and torque cutoff — at **0.8 of rated torque → motor to IDLE** (normalized 0–1).
-2. **IMU / body-state module** → produces base velocity, acceleration, pitch, yaw.
-3. **Two-class consolidation**: one control class (`MotorController`) + one feedback class
-   (`FeedbackAggregator` = motor feedback + IMU).
-4. **IsaacLab substitution**: replace the sim env's step/observation with the real ones.
+Phases 0–2 of the ZMQ framework (message layer, service ports, real-time
+sim2sim) are **done and tested on dev** — see `ZMQ_MIGRATION.md` for status,
+measured timing, and what remains:
+
+1. **Phase 3 — hardware bring-up** (Ubuntu box): bench-run `motor_service` +
+   `tools/dodo_startup.py` + `demo_combined`, verify the `BOOT_POSE_RAD` stop
+   angles/signs and the IMU scale constants + mounting axes, measure the Damiao
+   hip/upper joint limits, verify ODrive gearing, calibrate gains toward the
+   trained 32/3.0 behavior. (IMU firmware is committed now — `imu.cpp`; consider
+   flashing `firmware/imu_stream_nicla/` for the fused quaternion.)
+2. **Phase 4 — walking**: retrain flat *without* `base_lin_vel` (stand-style
+   obs + `velocity_commands`) — `dodo_flat` as-is cannot deploy.
 
 See `HANDOFF.md` for the full technical context.
 

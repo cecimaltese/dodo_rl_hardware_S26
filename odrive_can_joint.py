@@ -117,9 +117,16 @@ class OdriveCanJoint:
         return self._axis_state == AXIS_STATE_CLOSED_LOOP_CONTROL
 
     # ── feedback (from cached frames) ─────────────────────────────
-    def set_zero(self) -> None:
-        """Define the current shaft position as 0 (software offset, turns)."""
-        self._zero_offset = self._raw_pos
+    def set_zero(self, current: float = 0.0) -> None:
+        """Declare that the joint is physically at `current` (turns) right now.
+
+        Sets the software offset so get_position() == current at this shaft
+        position. current=0.0 keeps the old semantics ("this pose is zero");
+        a nonzero value is the boot-pose calibration: power the robot on with
+        the joint folded against its known mechanical stop and pass that
+        angle — no homing move needed.
+        """
+        self._zero_offset = self._raw_pos - current
 
     def get_position(self) -> float:
         return self._raw_pos - self._zero_offset

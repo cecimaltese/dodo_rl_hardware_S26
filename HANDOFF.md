@@ -177,12 +177,87 @@ Reconciled the safety layer with §4.1 and the professor's spec. Now in `motor_c
 - `py_compile`-clean; **not yet hardware-tested.** Still TODO: match real motor gains to the
   trained kp≈32/kd≈3.0, and the IMU node (both from update (a)).
 
+### UPDATE 2026-07-06 — ZMQ migration IMPLEMENTED (Phases 0–2); ROS2 retired
+The team decided to build the real-time framework on **ZMQ, not ROS2**, and the
+migration is now **implemented and tested on the dev Mac** (hardware bring-up on the
+Ubuntu robot box still pending). Full spec + status + measured numbers:
+**`ZMQ_MIGRATION.md`** (read that first). What exists now:
+- **`dodo_ipc.py`** — THE contract file: topics/ports, binary schemas, canonical
+  joint order (= POLICY_JOINT_ORDER, names off the wire, NaN = "no command"),
+  Publisher/Subscriber (CONFLATE latest-value), CtlServer/CtlClient, RateLoop.
+  Convention: each topic's single producer binds; consumers connect (the policy
+  runner binds `motor_commands` → exactly one commander, observable by tools).
+- **`motor_service.py`** (replaces motor_controller.py): safety layer carried over
+  verbatim; NO auto-enable (bring-up: status → set_zero → enable via
+  `tools/dodo_ctl.py`); publishes per-joint flags incl. `calibrated` (Damiao = from
+  boot, ODrive = only after set_zero); keeps publishing states while e-stopped.
+- **`imu_service.py`** (replaces observer.py): `parse_imu_line()` still the single
+  firmware edit point; `--mode stream` ready for when Jim's firmware pushes
+  continuously (preferred over 'L'-polling).
+- **`zmq_env.py`** `ZmqEnv` (replaces real_env.py) + `run_policy.py --backend zmq`
+  (`real` = deprecated alias): refuses to run on stale streams / e-stop / disabled /
+  uncalibrated / flat-obs-without-sim; 50 Hz absolute-deadline pacing.
+- **`sim_service.py`** — MuJoCo as a real-time virtual robot on the SAME topics
+  (fixes the instructor's "sim2sim isn't real time": physics runs on the wall clock
+  whether or not the policy keeps up). Optional `--extra-latency-ms/--drop`
+  robustness injection, `--imu-no-quat`, `--require-enable` for bring-up parity.
+- **Tools**: `tools/zmq_echo.py`, `tools/zmq_hz.py`, `tools/dodo_ctl.py`.
+- **Tests**: `test_ipc.py` + `test_e2e_zmq.py` — 18 green on macOS (synthetic-rig
+  E2E incl. real-time pacing, latency/drop survival, dead-service detection,
+  disabled-service gating). `test_stand_policy_over_zmq` is the Ubuntu acceptance
+  run (auto-skips without ../dodo_files URDF + a dodo_stand ONNX).
+- **Measured (dev, separate processes):** states 200.0 Hz / imu 100.0 Hz, 0 drops;
+  policy loop 50.0 Hz, 0 overruns; state age at read avg 0.21 ms; sim==wall clock.
+- Old ROS2 nodes moved to **`legacy_ros2/`** (frozen reference). requirements.txt:
+  +pyzmq, ROS2 note dropped. demo_combined.py rewritten as a ZMQ bench client.
+- **Next (Phase 3, needs the robot):** pip install -r requirements.txt on the Ubuntu
+  box, bench-run motor_service + demo, then homing procedure, Damiao hip/upper limit
+  measurement, ODrive gearing check, gain calibration toward 32/3.0. IMU firmware
+  still uncommitted (blocker for balance).
+
+### UPDATE 2026-07-06 (b) — real IMU firmware wired in; homing REPLACED by boot-pose startup
+Two team decisions landed and are implemented + tested (37 tests green + 1 URDF skip):
+- **IMU firmware is committed** (`imu.cpp` at repo root — Arduino **Nicla Sense ME**,
+  BHY2/BHI260AP). Protocol: poll-based, host sends `'L'`, firmware answers
+  `ALL ax ay az gx gy gz pitch roll` with accel/gyro as **RAW int16 LSB**
+  (Arduino_BHY2 SensorXYZ is unscaled), pitch/roll accel-only degrees. `imu_service.py`
+  now converts raw→SI (constants `ACC_LSB_PER_G=4096` for ±8 g, `GYRO_LSB_PER_DPS=16.384`
+  for ±2000 °/s — **bench-verify:** |a|≈9.81 at rest, 90° turn integrates 1.57 rad;
+  also verify mounting axes), default port `/dev/ttyACM0`, discards pitch/roll (same
+  quasi-static info as the env's accel fallback, but yaw-less). Provided
+  **`firmware/imu_stream_nicla/`** — recommended flash: streams
+  `IMU gx gy gz ax ay az qw qx qy qz` at 100 Hz in SI with the BHI260's **fused
+  quaternion** (projected_gravity stays valid under motion). imu_service auto-detects
+  both formats; tests: `test_imu_service.py`.
+- **No homing routine, ever** (user decision: a homing drive could overload the
+  3D-printed structure + belts). Startup convention instead: **power on with the
+  ODrive joints folded all the way back against their stops**, then
+  `dodo_ctl calibrate` maps turns-since-boot onto `BOOT_POSE_RAD` (motor_service.py;
+  knees −3.1416 / ankles +1.57 rad = PLACEHOLDERS until the stop angles/signs are
+  bench-verified). Supporting changes: drivers' `set_zero(current=…)` ("joint is AT
+  angle X"), `DamiaoJoint.send_limp()` (zero-gain MIT frame → DM reports without
+  torque; DMs only report while enabled), **bumpless fail-closed `enable`** (refuses
+  silent joints, presets setpoints at measured positions, auto-"unparks" out-of-band
+  joints to the safety-band edge over 1.5 s), **pre-start ramp** in ZmqEnv
+  (`run_policy --startup-ramp 5`, default ON for zmq; ramps to the default pose inside
+  the commander process so the cmd watchdog stays fed), ZmqEnv now **disables on
+  close** (clean session end instead of a watchdog e-stop), and
+  **`tools/dodo_startup.py`** rehearses the whole ritual incl. folding back down on
+  exit. `set_zero` stays as the jig fallback. Tests: `test_boot_calibration.py`
+  (fake-CAN ODrive joint, offset/clamp math), E2E ramp test in `test_e2e_zmq.py`.
+- New bring-up order (robot): power on folded → `motor_service` → `dodo_ctl status`
+  → `calibrate` → `status` (VERIFY!) → `dodo_startup.py` (or `run_policy --backend
+  zmq`). README quick start + ZMQ_MIGRATION Phase 3/§8 updated to match.
+
 ### Decisions captured from the user (don't re-ask)
 - ODrive transport → **move to CAN** (same `can0` bus as DM). Same interface, different ids.
 - ODrive CAN config state → **unknown** → include the USB inspect/config step.
 - Start order → **CAN migration first** (before safety layer).
 - Bench now → **1 DM + 1 ODrive**; classes must be config-driven for the full fleet.
 - Torque safety threshold "0.8" → **normalized 0–1 of rated torque** (for the later safety step).
+- **NO homing routine** (2026-07-06): would load the weak 3D-printed parts/belts. The robot
+  is powered on with the ODrive joints folded at their stops (boot pose) + `ctl calibrate`;
+  a pre-start ramp then moves to the default pose (`--startup-ramp` / dodo_startup.py).
 
 ---
 

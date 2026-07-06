@@ -1,18 +1,21 @@
 """
 run_policy.py — the Env-agnostic policy runner (the sim-to-real substitution point).
 
-The SAME loop drives MuJoCo (verification) and the real robot (deployment); only
+The SAME loop drives MuJoCo (verification) and the robot (deployment); only
 `--backend` changes:
 
-    # verify a policy in MuJoCo (sim-to-sim)
+    # quick in-process verification in MuJoCo (lockstep, not real-time)
     python3 run_policy.py --backend sim  --task flat  --policy <path>/policy.onnx \
         --command 0.5 0 0 --steps 500 --render
 
-    # deploy to the real robot (needs MotorController + Observer running)
-    python3 run_policy.py --backend real --task stand --policy <path>/policy.onnx
+    # through the ZMQ stack — REAL ROBOT (motor_service + imu_service running)
+    # or REAL-TIME SIM (sim_service running): the runner cannot tell them apart.
+    python3 run_policy.py --backend zmq --task stand --policy <path>/policy.onnx
 
 `--task` selects the observation layout (must match how the .onnx was trained):
-  flat  = walking (obs 36, includes base_lin_vel + velocity_commands) — SIM ONLY.
+  flat  = walking (obs 36, includes base_lin_vel + velocity_commands) — SIM ONLY
+          (over zmq it runs against sim_service, which publishes ground-truth
+           lin_vel; hardware never can).
   stand = balance (obs 30) — the deployable layout (no base_lin_vel).
 """
 
@@ -28,13 +31,21 @@ from rl_env import OnnxPolicy, OBS_FLAT, OBS_STAND
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", choices=["sim", "real"], default="sim")
+    ap.add_argument("--backend", choices=["sim", "zmq", "real"], default="sim",
+                    help="sim = in-process MuJoCo (lockstep); zmq = through the "
+                         "ZMQ stack (real robot OR sim_service). 'real' is a "
+                         "deprecated alias for zmq.")
     ap.add_argument("--task", choices=["flat", "stand"], default="stand")
     ap.add_argument("--policy", help="path to exported policy.onnx (not needed with --hold-pose)")
     ap.add_argument("--command", type=float, nargs=3, default=[0.0, 0.0, 0.0],
                     metavar=("VX", "VY", "WZ"), help="velocity command (flat task)")
     ap.add_argument("--steps", type=int, default=1000)
     ap.add_argument("--control-hz", type=float, default=50.0)
+    ap.add_argument("--startup-ramp", type=float, default=5.0,
+                    help="(zmq) pre-start routine: seconds to ramp the joints "
+                         "from where they are (boot pose) to the default pose "
+                         "before the policy takes over. 0 = skip (robot already "
+                         "posed). Ignored for --backend sim.")
     ap.add_argument("--render", action="store_true", help="(sim) open the viewer")
     ap.add_argument("--hold-pose", action="store_true",
                     help="(sim) ignore the policy and just PD-hold the default pose, "
@@ -80,12 +91,16 @@ def main():
         from sim_env import SimEnv
         env = SimEnv(urdf_path=args.urdf, obs_cfg=obs_cfg,
                      command=tuple(args.command), render=args.render)
-    else:
+    else:  # zmq (or the deprecated 'real' alias)
         if args.task == "flat":
-            print("WARNING: 'flat' obs needs base_lin_vel, which the real robot "
-                  "cannot observe — use a 'stand' policy for real deployment.")
-        from real_env import RealEnv
-        env = RealEnv(obs_cfg=obs_cfg, command=tuple(args.command), control_dt=control_dt)
+            print("NOTE: 'flat' obs needs base_lin_vel — over zmq this only works "
+                  "against sim_service (hardware cannot observe it).")
+        from zmq_env import ZmqEnv
+        env = ZmqEnv(obs_cfg=obs_cfg, command=tuple(args.command),
+                     control_dt=control_dt, startup_ramp_s=args.startup_ramp)
+        if args.startup_ramp > 0:
+            print(f"[zmq] reset will ramp to the default pose over "
+                  f"{args.startup_ramp:.1f}s before the policy takes over.")
 
     obs = env.reset()
     print(f"[{args.backend}] obs_dim {env.obs_dim}, action_dim {env.action_dim}; "
