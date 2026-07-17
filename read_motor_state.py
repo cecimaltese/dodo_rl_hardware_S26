@@ -15,13 +15,15 @@ Motors are read LIMP by default:
   * ODrive — pure listen (+ optional RTR polling). Never commanded closed-loop.
 Pass --hold to read Damiao with its configured kp/kd instead (it will resist).
 
-Prereqs:
-  sudo ip link set can0 up type can bitrate 1000000     # bus up (OS level)
-  python3 dodo_rl_hardware_S26/odrive_can_setup.py      # once: ODrive -> CAN node/baud/feedback
+Prereqs (TWO buses -- can0 = Damiao, can1 = ODrive; see fleet_config.py):
+  sudo ip link set can0 up type can bitrate 1000000
+  sudo ip link set can1 up type can bitrate 1000000
+  python3 odrive_can_setup.py --node-id N               # once PER DRIVE, over USB
 Then:
-  python3 dodo_rl_hardware_S26/read_motor_state.py                            # scan the whole fleet
-  python3 dodo_rl_hardware_S26/read_motor_state.py --damiao-only --hz 20      # just the Damiao motors, faster
-  python3 dodo_rl_hardware_S26/read_motor_state.py --hold                     # Damiao with real gains (resists)
+  python3 read_motor_state.py                      # whole fleet, both buses
+  python3 read_motor_state.py --damiao-only --hz 20 # just the Damiao motors, faster
+  python3 read_motor_state.py --odrive-only        # just the ODrives (can1)
+  python3 read_motor_state.py --hold               # Damiao with real gains (RESISTS)
 
 NOTE (verify against your damiao_motor version): DamiaoJoint.get_state() returns
 pos/vel/torque built from motor.get_states(); this tool also dumps the raw
@@ -33,6 +35,7 @@ once we confirm the library's register API.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import threading
 import time
 from typing import Dict, Optional
@@ -43,20 +46,12 @@ from damiao_motor import DaMiaoController
 from damiao_joint import DamiaoJoint, DamiaoJointConfig
 from odrive_can_joint import OdriveCanJoint, OdriveCanJointConfig
 
-# --- Fleet config (kept in sync with motor_controller.py DM_JOINTS / OD_JOINTS) ---
-# Edit here as motors are added to the bench. Names match the URDF / policy joints.
-DAMIAO_MOTORS = [
-    DamiaoJointConfig(name="hip_left",        motor_id=0x01, feedback_id=0x11, motor_type="4340P"),
-    DamiaoJointConfig(name="upper_leg_left",  motor_id=0x02, feedback_id=0x12, motor_type="4340P"),
-    DamiaoJointConfig(name="hip_right",       motor_id=0x05, feedback_id=0x15, motor_type="4340P"),
-    DamiaoJointConfig(name="upper_leg_right", motor_id=0x06, feedback_id=0x16, motor_type="4340P"),
-]
-ODRIVE_MOTORS = [
-    OdriveCanJointConfig(name="lower_leg_left",  node_id=7,  vel_limit=10.0, rated_torque=9.0),
-    OdriveCanJointConfig(name="foot_left",       node_id=8,  vel_limit=10.0, rated_torque=9.0),
-    OdriveCanJointConfig(name="lower_leg_right", node_id=9,  vel_limit=10.0, rated_torque=9.0),
-    OdriveCanJointConfig(name="foot_right",      node_id=10, vel_limit=10.0, rated_torque=9.0),
-]
+# Fleet config comes from fleet_config.py — the SINGLE source of truth, shared with
+# motor_controller.py. It used to be hand-copied here under a "kept in sync with
+# motor_controller.py" comment; it drifted (this file still hunted ODrive nodes 7-10
+# after they were changed to 0-3, so every ODrive would have read OFFLINE).
+from fleet_config import (DM_JOINTS as DAMIAO_MOTORS, OD_JOINTS as ODRIVE_MOTORS,
+                          DM_CHANNEL, OD_CHANNEL, BUSTYPE)
 
 # ODrive CAN Simple command ids used for RTR polling (see HANDOFF §3).
 OD_CMD_GET_ENCODER = 0x09
@@ -70,8 +65,15 @@ def _fmt(v: Optional[float], w: int = 8, p: int = 3) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description="Read parameters + live states from the dodo motors.")
-    ap.add_argument("--channel", default="can0")
-    ap.add_argument("--bustype", default="socketcan")
+    # Two buses by default (can0 = Damiao, can1 = ODrive) — see fleet_config.py.
+    # This tool used to take ONE --channel for both, which cannot read the real
+    # two-adapter robot at all: it would open the ODrive socket on the Damiao bus.
+    ap.add_argument("--channel", "--dm-channel", dest="channel", default=DM_CHANNEL,
+                    help=f"Damiao bus (default: {DM_CHANNEL})")
+    ap.add_argument("--od-channel", dest="od_channel", default=OD_CHANNEL,
+                    help=f"ODrive bus (default: {OD_CHANNEL}; set equal to --channel "
+                         f"if both motor types share one adapter)")
+    ap.add_argument("--bustype", default=BUSTYPE)
     ap.add_argument("--hz", type=float, default=5.0, help="print rate")
     ap.add_argument("--duration", type=float, default=0.0, help="seconds; 0 = until Ctrl-C")
     ap.add_argument("--hold", action="store_true",
@@ -98,6 +100,12 @@ def main():
         # damiao_motor 1.0.6 shares one socket for all Damiao motors on this channel.
         dm_controller = DaMiaoController(channel=args.channel, bustype=args.bustype)
         for cfg in DAMIAO_MOTORS:
+            # COPY before touching gains: DAMIAO_MOTORS are the shared fleet_config
+            # objects now, so zeroing kp/kd for LIMP in place would mutate the config
+            # motor_controller uses. Copy here, and the joints are limp by construction
+            # rather than by a mutation applied later.
+            if not args.hold:
+                cfg = dataclasses.replace(cfg, kp=0.0, kd=0.0)
             j = DamiaoJoint(dm_controller, cfg)
             dm_joints[cfg.name] = j
             last_seen[cfg.name] = 0.0
@@ -105,7 +113,7 @@ def main():
     if do_od and ODRIVE_MOTORS:
         # Separate, node-filtered socket so we only ingest ODrive frames.
         filters = [{"can_id": c.node_id << 5, "can_mask": 0x7E0} for c in ODRIVE_MOTORS]
-        od_bus = can.Bus(channel=args.channel, interface=args.bustype, can_filters=filters)
+        od_bus = can.Bus(channel=args.od_channel, interface=args.bustype, can_filters=filters)
         for cfg in ODRIVE_MOTORS:
             j = OdriveCanJoint(od_bus, cfg)
             od_joints[cfg.name] = j
@@ -138,11 +146,8 @@ def main():
         print(f"{cfg.name:16s} ODrive     node={cfg.node_id:<9d} "
               f"vel_lim={cfg.vel_limit} rated_torque={cfg.rated_torque} Nm (gains via USB)")
 
-    # ── enable Damiao for reading (limp unless --hold) ──────────────────────────
+    # ── enable Damiao for reading (limp by construction unless --hold) ──────────
     for name, j in dm_joints.items():
-        if not args.hold:
-            j.cfg.kp = 0.0   # limp: report state, apply ~no torque
-            j.cfg.kd = 0.0
         j.enable()
     if dm_joints:
         mode = "HOLD (configured kp/kd — will resist)" if args.hold else "LIMP (kp=kd=0 — backdrivable)"

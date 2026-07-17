@@ -19,16 +19,27 @@ Fleet (8 DOF):
 
 CAN topology
 ------------
-Both motor types can share ONE bus (can0 @ 1 Mbit/s): SocketCAN gives each open
-socket its own copy of every frame, so each motor type gets its own *filtered*
-socket and never mis-ingests the other's frames. The installed `damiao_motor`
-1.0.6 `DaMiaoController.__init__` does NOT accept `can_filters`, so the Damiao
-filter is applied to its bus afterwards via `bus.set_filters(...)` (only needed
-when Damiao and ODrive share a channel). If you have two USB-CAN adapters, set
-`od_channel` to the second bus (e.g. can1) and no Damiao filter is applied.
+TWO buses, one USB-CAN adapter each (the actual robot wiring, and the same split
+last semester's WS25 stack used):
+    can0 = the 4 Damiao motors   (ids 0x01/0x02/0x05/0x06, feedback 0x11..0x16)
+    can1 = the 4 ODrive motors   (CAN Simple node ids 0..3)
+Separate electrical buses means no cross-talk and no arbitration-id collisions,
+so no Damiao filter is needed.
 
-Bring the bus up first (OS level, not python-can):
+Both types CAN share one bus (SocketCAN gives each open socket its own copy of
+every frame, so each type gets its own *filtered* socket). If you do that, set
+`od_channel` = `dm_channel` and the Damiao filter is applied via
+`bus.set_filters(...)` (the installed `damiao_motor` 1.0.6 `DaMiaoController.
+__init__` does NOT accept `can_filters`, so it must be applied afterwards).
+BUT on a shared bus the ODrive node ids MUST avoid the Damiao id windows:
+CAN Simple encodes `arb_id = (node_id << 5) | cmd_id`, so node 0 owns
+0x000-0x01F -- which covers every Damiao command AND feedback id above. Use
+node 7..10 (windows 0x0E0-0x15F) on a shared bus; node 0..3 are safe ONLY
+because can1 is separate.
+
+Bring both buses up first (OS level, not python-can):
     sudo ip link set can0 up type can bitrate 1000000
+    sudo ip link set can1 up type can bitrate 1000000
 
 Safety: every position command is clamped, and measured feedback is monitored,
 against SAFETY_FACTOR (= 0.9) of each motor's rated position / velocity / torque
@@ -80,6 +91,8 @@ from damiao_motor import DaMiaoController
 
 from damiao_joint import DamiaoJoint, DamiaoJointConfig
 from odrive_can_joint import OdriveCanJoint, OdriveCanJointConfig
+from fleet_config import (DM_JOINTS, OD_JOINTS, DM_CHANNEL, OD_CHANNEL, BUSTYPE,
+                          JOINT_LIMITS_RAD, RATED_TORQUE_NM, JOINT_VEL_LIMIT_RAD)
 
 
 TWO_PI = 2.0 * math.pi
@@ -94,30 +107,6 @@ FB_WATCHDOG_S = 0.5          # a joint that WAS reporting goes silent this long 
 POS_OVERTRAVEL_MARGIN = 0.10 # rad past the hard URDF limit (measured) -> e-stop
 STARTUP_GRACE_S = 1.0        # ignore safety trips for the first second (transients)
 
-# --- Physical constraints of the legs/body (from dodo_daimao.urdf) --------------
-# The mechanical range of each joint, in RADIANS. This is the single source of
-# truth for position safety; _JointAdapter converts to each motor's native units
-# (Damiao=rad, ODrive=turns) for clamping. Keep in sync with the URDF <limit> tags.
-JOINT_LIMITS_RAD = {
-    #Damiao
-    "hip_left":        (-0.966,0.641),  "hip_right":       (-0.544, 1.104),   # hip roll
-    "upper_leg_left":  (-0.324, 2.379), "upper_leg_right": (-2.303, 0.293), # hip pitch
-    #ODrive
-    "lower_leg_left":  (-3.1416, 1.3963), "lower_leg_right": (-3.1416, 1.3963),  # knee
-    "foot_left":       (-1.05,   1.57),   "foot_right":      (-1.05,   1.57),    # ankle
-}
-# Rated torque per joint (URDF effort limits, Nm): hips/upper 27, knee/ankle 9.
-RATED_TORQUE_NM = {
-    "hip_left": 27.0, "hip_right": 27.0, "upper_leg_left": 27.0, "upper_leg_right": 27.0,
-    "lower_leg_left": 9.0, "lower_leg_right": 9.0, "foot_left": 9.0, "foot_right": 9.0,
-}
-JOINT_VEL_LIMIT_RAD = 6.0    # URDF velocity limit (rad/s), same for all joints.
-
-# NOTE (ODrive gearing): unit conversion assumes 1 motor turn == 2*pi rad at the
-# joint (direct drive). If the T-Motor/ODrive joints are geared, this scaling —
-# and therefore BOTH the commands and these limits — must be divided by the gear
-# ratio. Verify the real ratio before trusting the ODrive position clamps.
-
 # Damiao fault status names (anything other than DISABLED/ENABLED) -> e-stop.
 DM_FAULT_STATUS = {
     "OVER_VOLTAGE", "UNDER_VOLTAGE", "OVER_CURRENT",
@@ -127,36 +116,10 @@ DM_FAULT_STATUS = {
 AnyJoint = Union[DamiaoJoint, OdriveCanJoint]
 
 
-# ---------------------------------------------------------------------------
-# Fleet configuration (real robot)
-# ---------------------------------------------------------------------------
-# Joint NAMES match the URDF / IsaacLab articulation (hip_*=hip roll,
-# upper_leg_*=hip pitch, lower_leg_*=knee, foot_*=ankle) so the whole stack
-# (sim, policy, ROS topics, motors) shares ONE naming scheme — no remapping.
-#
-# Damiao hips (roll + pitch) — ids already set on the physical motors (DM4340P).
-DM_JOINTS = [
-    DamiaoJointConfig(name="hip_left",        motor_id=0x01, feedback_id=0x11,
-                      motor_type="4340P", kp=30.0, kd=0.5),  # left hip roll
-    DamiaoJointConfig(name="upper_leg_left",  motor_id=0x02, feedback_id=0x12,
-                      motor_type="4340P", kp=30.0, kd=0.5),  # left hip pitch
-    DamiaoJointConfig(name="hip_right",       motor_id=0x05, feedback_id=0x15,
-                      motor_type="4340P", kp=30.0, kd=0.5),  # right hip roll
-    DamiaoJointConfig(name="upper_leg_right", motor_id=0x06, feedback_id=0x16,
-                      motor_type="4340P", kp=30.0, kd=0.5),  # right hip pitch
-]
-
-# ODrive knees (lower_leg_*) + ankles (foot_*) — T-Motor via ODrive, CAN Simple.
-# TODO(user): set the real CAN node ids (as configured with odrive_can_setup.py)
-# and, ideally, soft pos_min/pos_max (turns) for each joint's mechanical range.
-# rated_torque = the sim effort-limit for the knee/ankle group (9 Nm), used to
-# normalize the torque safety check; vel_limit (turns/s) bounds the velocity check.
-OD_JOINTS = [
-    OdriveCanJointConfig(name="lower_leg_left",  node_id=7,  vel_limit=10.0, rated_torque=9.0),
-    OdriveCanJointConfig(name="foot_left",       node_id=8,  vel_limit=10.0, rated_torque=9.0),
-    OdriveCanJointConfig(name="lower_leg_right", node_id=9,  vel_limit=10.0, rated_torque=9.0),
-    OdriveCanJointConfig(name="foot_right",      node_id=10, vel_limit=10.0, rated_torque=9.0),
-]
+# Fleet configuration + physical limits now live in fleet_config.py — the SINGLE
+# source of truth, imported above and shared with read_motor_state.py. They used to
+# be duplicated here and hand-copied there under a "kept in sync" comment; they
+# drifted (ODrive node ids). Edit fleet_config.py, not this file.
 
 
 # ---------------------------------------------------------------------------
@@ -247,9 +210,12 @@ class MotorController(Node):
         super().__init__("motor_controller")
 
         # ----- Parameters -----
-        self.declare_parameter("dm_channel", "can0")
-        self.declare_parameter("od_channel", "can0")  # set to e.g. can1 with a 2nd adapter
-        self.declare_parameter("bustype", "socketcan")
+        # Bus defaults come from fleet_config (can0 = Damiao, can1 = ODrive). Set
+        # od_channel == dm_channel to run both types on one adapter — but read the
+        # node-id collision warning in fleet_config.py FIRST.
+        self.declare_parameter("dm_channel", DM_CHANNEL)
+        self.declare_parameter("od_channel", OD_CHANNEL)
+        self.declare_parameter("bustype", BUSTYPE)
         self.declare_parameter("command_topic", "/motor_commands")
         self.declare_parameter("state_topic", "/motor_states")
         self.declare_parameter("update_rate", 200.0)   # Hz

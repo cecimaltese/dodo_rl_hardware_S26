@@ -35,6 +35,19 @@ from sensor_msgs.msg import Imu, JointState
 from rl_env import (Env, ObsCfg, OBS_STAND, POLICY_JOINT_ORDER, DEFAULT_POS_VEC,
                     projected_gravity_from_quat)
 
+# Feedback staleness limits. base_ang_vel + projected_gravity (6 of the 30 obs dims)
+# come ONLY from /imu_states; if it stops, the cached values freeze and the policy
+# believes the robot is upright and motionless while it topples. Reused feedback is
+# worse than no feedback, so a stall is a hard error: raising stops the command
+# stream, which trips MotorController's own CMD_WATCHDOG_S e-stop.
+IMU_TIMEOUT_S = 0.2      # ~20 missed samples at the Observer's 100 Hz
+STATES_TIMEOUT_S = 0.2   # same for /motor_states
+STARTUP_WAIT_S = 5.0
+
+
+class FeedbackStalled(RuntimeError):
+    """Raised when a required feedback stream is absent or has gone stale."""
+
 
 class RealEnv(Env):
     def __init__(self, obs_cfg: ObsCfg = OBS_STAND, command=(0.0, 0.0, 0.0),
@@ -56,6 +69,9 @@ class RealEnv(Env):
         self._proj_gravity = np.array([0.0, 0.0, -1.0], dtype=np.float32)
         self._got_states = False
         self._got_imu = False
+        # Arrival times of the most recent message on each stream (None = never).
+        self._t_states: Optional[float] = None
+        self._t_imu: Optional[float] = None
 
         self._idx = {name: i for i, name in enumerate(POLICY_JOINT_ORDER)}
 
@@ -84,6 +100,7 @@ class RealEnv(Env):
                 if i < len(msg.velocity):
                     self._joint_vel[k] = msg.velocity[i]
             self._got_states = True
+            self._t_states = time.time()
 
     def _on_imu(self, msg: Imu):
         with self._lock:
@@ -102,10 +119,26 @@ class RealEnv(Env):
                 if n > 1e-3:
                     self._proj_gravity = (-a / n).astype(np.float32)
             self._got_imu = True
+            self._t_imu = time.time()
+
+    def _check_fresh(self, now: float):
+        """Raise if either feedback stream is missing or stale. Caller holds the lock."""
+        for label, t, limit in (("/imu_states", self._t_imu, IMU_TIMEOUT_S),
+                                ("/motor_states", self._t_states, STATES_TIMEOUT_S)):
+            if t is None:
+                raise FeedbackStalled(
+                    f"{label} has never published — refusing to run the policy on "
+                    f"placeholder feedback.")
+            age = now - t
+            if age > limit:
+                raise FeedbackStalled(
+                    f"{label} stale by {age * 1e3:.0f} ms (limit {limit * 1e3:.0f} ms) — "
+                    f"the cached value is frozen and no longer describes the robot.")
 
     # ---- Env backend hooks ----
     def _read_signals(self) -> Dict[str, np.ndarray]:
         with self._lock:
+            self._check_fresh(time.time())
             return {
                 "base_lin_vel": np.zeros(3, dtype=np.float32),  # unobservable on hardware
                 "base_ang_vel": self._base_ang_vel.copy(),
@@ -124,14 +157,19 @@ class RealEnv(Env):
 
     def _reset_backend(self):
         # Can't physically reset the robot; wait for first feedback so the initial
-        # observation is real, not the default placeholder.
+        # observation is real, not the default placeholder. This is a HARD gate: a
+        # warning here used to let the policy start against _proj_gravity=[0,0,-1]
+        # and _base_ang_vel=0, i.e. "perfectly upright and still" — forever.
         t0 = time.time()
-        while not (self._got_states and self._got_imu) and time.time() - t0 < 5.0:
+        while not (self._got_states and self._got_imu) and time.time() - t0 < STARTUP_WAIT_S:
             time.sleep(0.05)
-        if not self._got_states:
-            self.node.get_logger().warn("RealEnv.reset: no /motor_states yet.")
-        if not self._got_imu:
-            self.node.get_logger().warn("RealEnv.reset: no /imu_states yet.")
+        missing = [n for n, ok in (("/motor_states", self._got_states),
+                                   ("/imu_states", self._got_imu)) if not ok]
+        if missing:
+            raise FeedbackStalled(
+                f"RealEnv.reset: no {' or '.join(missing)} after {STARTUP_WAIT_S:.0f}s. "
+                f"Start MotorController and Observer first. (Is the Nicla on the right "
+                f"port? Does imu_sniff.py see 'ALL ...' lines?)")
 
     def close(self):
         self._spin = False

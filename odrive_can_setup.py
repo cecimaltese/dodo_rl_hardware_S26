@@ -22,11 +22,19 @@ firmware build; the printed tree in step 1 is the ground truth.
 
 import time
 
+import argparse
+
 import odrive
 from odrive.enums import AxisState, ControlMode, InputMode, Protocol
 
+from fleet_config import OD_JOINTS
+
 # ── desired CAN config ────────────────────────────────────────────
-NODE_ID = 7
+# NODE_ID is now a REQUIRED --node-id argument, not a constant. It used to default to
+# 7, which meant running this tool on an already-configured drive would silently
+# REASSIGN it — clobbering the node ids in fleet_config.py (currently 0-3) and making
+# every ODrive read OFFLINE. It connects over USB to whichever drive is plugged in, so
+# it cannot know which joint that is; you must say.
 BAUD_RATE = 1_000_000
 # Cyclic feedback rates (ms)
 HEARTBEAT_RATE_MS = 10
@@ -72,9 +80,28 @@ def _print_can_config(can_cfg) -> None:
 
 
 def main():
+    ap = argparse.ArgumentParser(
+        description="Configure ONE ODrive (over USB) for CAN Simple. "
+                    "Run once per drive; --node-id is required.")
+    ap.add_argument("--node-id", type=int, required=True,
+                    help="CAN node id to assign. Must match fleet_config.OD_JOINTS: "
+                         + ", ".join(f"{c.name}={c.node_id}" for c in OD_JOINTS))
+    args = ap.parse_args()
+
+    valid = {c.node_id: c.name for c in OD_JOINTS}
+    if args.node_id not in valid:
+        print(f"WARNING: node id {args.node_id} is not in fleet_config.OD_JOINTS "
+              f"({valid}). MotorController will not find this drive.")
+        if input("  continue anyway? [y/N] ").strip().lower() != "y":
+            return
+    else:
+        print(f"Assigning node id {args.node_id} = {valid[args.node_id]}")
+
     print("Waiting for ODrive over USB ...")
     odrv = odrive.find_sync()
     print(f"Found ODrive {odrv._dev.serial_number}")
+    print("NOTE: this configures whichever drive is plugged in over USB. Make sure it "
+          "is the one you mean — this OVERWRITES its node id.")
 
     axis = odrv.axis0
     can_cfg = getattr(axis.config, "can", None)
@@ -90,7 +117,7 @@ def main():
     # ODrive ignores CAN entirely (no cyclic frames, no command response) even
     # though node_id/baud/rates are set. It MUST be Protocol.SIMPLE (1).
     print("\n[2] Setting node id + baud rate + protocol:")
-    _trysetattr(can_cfg, "node_id", NODE_ID)
+    _trysetattr(can_cfg, "node_id", args.node_id)
     if hasattr(odrv, "can") and hasattr(odrv.can, "config"):
         _trysetattr(odrv.can.config, "baud_rate", BAUD_RATE)
         _trysetattr(odrv.can.config, "protocol", Protocol.SIMPLE)
