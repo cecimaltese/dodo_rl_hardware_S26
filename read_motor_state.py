@@ -47,8 +47,8 @@ from damiao_joint import DamiaoJoint, DamiaoJointConfig
 from odrive_can_joint import OdriveCanJoint, OdriveCanJointConfig
 
 # Fleet config comes from fleet_config.py — the SINGLE source of truth, shared with
-# motor_controller.py. It used to be hand-copied here under a "kept in sync with
-# motor_controller.py" comment; it drifted (this file still hunted ODrive nodes 7-10
+# motor_service.py. It used to be hand-copied here under a "kept in sync with the
+# motor controller" comment; it drifted (this file still hunted ODrive nodes 7-10
 # after they were changed to 0-3, so every ODrive would have read OFFLINE).
 from fleet_config import (DM_JOINTS as DAMIAO_MOTORS, OD_JOINTS as ODRIVE_MOTORS,
                           DM_CHANNEL, OD_CHANNEL, BUSTYPE)
@@ -102,7 +102,7 @@ def main():
         for cfg in DAMIAO_MOTORS:
             # COPY before touching gains: DAMIAO_MOTORS are the shared fleet_config
             # objects now, so zeroing kp/kd for LIMP in place would mutate the config
-            # motor_controller uses. Copy here, and the joints are limp by construction
+            # motor_service uses. Copy here, and the joints are limp by construction
             # rather than by a mutation applied later.
             if not args.hold:
                 cfg = dataclasses.replace(cfg, kp=0.0, kd=0.0)

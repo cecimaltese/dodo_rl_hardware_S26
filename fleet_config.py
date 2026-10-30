@@ -1,19 +1,19 @@
 """
 fleet_config.py — the SINGLE SOURCE OF TRUTH for the robot's motors and their limits.
 
-Why this file exists: `motor_controller.py` and `read_motor_state.py` each used to carry
-their own hand-copied fleet config with a "kept in sync with motor_controller.py" comment
-on top. They drifted — the ODrive node ids were updated in one and not the other, so the
+Why this file exists: the motor controller (then a ROS2 node) and `read_motor_state.py`
+each used to carry their own hand-copied fleet config with a "kept in sync" comment on
+top. They drifted — the ODrive node ids were updated in one and not the other, so the
 diagnostic tool would have hunted for nodes 7-10 that no longer exist and reported every
 ODrive OFFLINE. A comment is not a mechanism. Import from here instead. (motor_service.py,
 the ZMQ port, grew a third copy that went stale the same way — node ids 7-10 and a single
 shared bus — until it was switched to this module.)
 
-Deliberately ROS-free: the bench tools (`read_motor_state.py`, `odrive_can_scan.py`) must
-run without a ROS install, so nothing here may import rclpy.
+Import-only: nothing here opens a bus, so the services and every bench tool can share
+it.
 
-Joint NAMES match the URDF / IsaacLab articulation, so the whole stack (sim, policy, ROS
-topics, motors) shares ONE naming scheme with no remapping:
+Joint NAMES match the URDF / IsaacLab articulation, so the whole stack (sim, policy,
+services, motors) shares ONE naming scheme with no remapping:
     hip_*       = hip roll     (Damiao)
     upper_leg_* = hip pitch    (Damiao)
     lower_leg_* = knee         (ODrive)

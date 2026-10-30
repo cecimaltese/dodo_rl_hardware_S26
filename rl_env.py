@@ -3,7 +3,7 @@ rl_env.py — the sim-to-real Env interface + the IsaacLab policy contract.
 
 This is the single substitution point for deploying the trained policy: a runner
 loops `action = policy(obs); obs = env.step(action)` against an `Env`, and the SAME
-loop runs in MuJoCo (`SimEnv`) for verification and on the real robot (`RealEnv`)
+loop runs in MuJoCo (`SimEnv`) for verification and on the real robot (`ZmqEnv`)
 for deployment. Everything the policy "knows" — joint order, default pose, action
 scaling, and the observation layout — lives here so both backends are identical.
 
@@ -26,7 +26,7 @@ Contract extracted from the IsaacLab training config
 
   * Joint order is the IsaacLab/PhysX articulation order (regex ".*",
     preserve_order=False → BFS of the kinematic tree), which is NOT the URDF/MuJoCo
-    order. SimEnv/RealEnv therefore map to this order BY NAME.
+    order. SimEnv/ZmqEnv therefore map to this order BY NAME.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ TWO_PI = 2.0 * math.pi
 # --- Joint order the POLICY expects (IsaacLab/PhysX articulation order). ----------
 # PhysX orders DOFs breadth-first by tree depth → TYPE-GROUPED (all hips, then all
 # upper_legs, then lower_legs, then feet), and within each level LEFT precedes RIGHT.
-# This is NOT the URDF/MuJoCo order (which is per-leg, right-first); SimEnv/RealEnv
+# This is NOT the URDF/MuJoCo order (which is per-leg, right-first); SimEnv/ZmqEnv
 # remap to this order BY NAME.
 # Empirically pinned in MuJoCo with the dodo_stand policy (test_sim2sim_consistency):
 # this order stands stably 30 s+; right-first or per-leg orders flip the robot <1 s.

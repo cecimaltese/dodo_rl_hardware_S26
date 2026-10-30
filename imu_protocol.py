@@ -1,16 +1,17 @@
 """
-imu_protocol.py — the Nicla Sense ME wire protocol. ROS-FREE, on purpose.
+imu_protocol.py — the Nicla Sense ME wire protocol.
 
 Everything about talking to the IMU lives here: the 'ALL'/'V' line formats, the raw
 int16 -> SI scaling, the board->base AXIS_REMAP, baud auto-detection. `imu_service.py`
 (the ZMQ service), `imu_check.py` and `imu_sniff.py` all import from this one module.
 
 Why it is its own file: this logic used to live inside observer.py (the former ROS2
-node), which imports rclpy. imu_sniff.py is deliberately ROS-free, so it could not share it and kept its
-OWN hardcoded baud — then the firmware moved to 921600 and imu_sniff silently read a
-921600 stream at 115200 and reported "no parsable 'ALL' lines", as if the IMU were
-broken. Same failure as the duplicated fleet config (see fleet_config.py): a
-constant that must agree in two places will eventually not. One definition, imported.
+node), which imports rclpy. imu_sniff.py was deliberately ROS-free, so it could not
+share it and kept its OWN hardcoded baud — then the firmware moved to 921600 and
+imu_sniff silently read a 921600 stream at 115200 and reported "no parsable 'ALL'
+lines", as if the IMU were broken. Same failure as the duplicated fleet config (see
+fleet_config.py): a constant that must agree in two places will eventually not. One
+definition, imported.
 
 The IMU is an Arduino Nicla Sense ME (BHI260AP); it answers the single character 'L'
 with one full reading. The formats below are VERIFIED against the firmware source +
@@ -79,7 +80,7 @@ ACCEL_RANGE_G = 8.0       # v1 only; VERIFY — accel full scale, +/- g
 
 GYRO_LSB_TO_RAD_S = (GYRO_RANGE_DPS / 32768.0) * (math.pi / 180.0)
 ACCEL_LSB_TO_M_S2 = (ACCEL_RANGE_G / 32768.0) * 9.80665
-# NOTE: the accel scale CANCELS for our only use of it — RealEnv normalizes
+# NOTE: the accel scale CANCELS for our only use of it — ZmqEnv normalizes
 # (-a/|a|) to get the gravity direction — so an accel_range_g error is harmless to
 # the policy. It matters only for the published sensor_msgs/Imu being honest m/s^2.
 # The GYRO scale does NOT cancel: it feeds base_ang_vel directly. Get it right.
@@ -136,7 +137,7 @@ def _quat_mul(a, b) -> Tuple[float, float, float, float]:
             aw * bz + ax * by - ay * bx + az * bw)
 
 
-# The quaternion must be remapped TOO, not just accel/gyro — RealEnv PREFERS the quat,
+# The quaternion must be remapped TOO, not just accel/gyro — ZmqEnv PREFERS the quat,
 # so remapping only the vectors would leave projected_gravity silently in the BOARD
 # frame while accel/gyro were in the base frame. Derivation: the IMU quat q maps
 # board->world (v_world = q v_board q*), and v_board = R^T v_base, so the base's
@@ -192,7 +193,7 @@ def parse_imu_line(line: str,
         quat      = (qw, qx, qy, qz)  fused orientation — FIRMWARE v2 ONLY
     or None if the line is not a well-formed "ALL" response.
 
-    On v1 there is no 'quat' key, so RealEnv falls back to deriving gravity from
+    On v1 there is no 'quat' key, so ZmqEnv falls back to deriving gravity from
     `accel`. The firmware's own pitch/roll are NOT used for that: they are computed
     from the accelerometer alone, so they carry exactly the same information as the
     raw accel while adding trig and a degrees round-trip.
@@ -212,9 +213,9 @@ def parse_imu_line(line: str,
     }
     if len(v) == 12:
         # Firmware v2: fused game-rotation-vector quaternion (already unit-scaled by
-        # the library). RealEnv prefers this over the accel fallback automatically.
+        # the library). ZmqEnv prefers this over the accel fallback automatically.
         # Reject a zero/degenerate quat so a not-yet-converged fusion can't publish a
-        # quaternion that RealEnv would trust over the (valid) accelerometer.
+        # quaternion that ZmqEnv would trust over the (valid) accelerometer.
         qw, qx, qy, qz = v[8], v[9], v[10], v[11]
         if abs(qw) + abs(qx) + abs(qy) + abs(qz) > 1e-6:
             # Rotate board-frame orientation into the base frame (see _Q_REMAP_CONJ).

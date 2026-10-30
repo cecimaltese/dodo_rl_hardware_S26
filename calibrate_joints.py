@@ -134,7 +134,7 @@ class Fleet:
             return
 
         # Damiao — copy the config first: DM_JOINTS are the SHARED fleet_config objects
-        # and zeroing kp/kd in place would disarm motor_controller's gains.
+        # and zeroing kp/kd in place would disarm motor_service's gains.
         self.dm_ctl = DaMiaoController(channel=DM_CHANNEL, bustype=BUSTYPE)
         self.dm: Dict[str, DamiaoJoint] = {}
         for cfg in DM_JOINTS:

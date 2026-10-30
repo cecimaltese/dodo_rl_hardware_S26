@@ -2,7 +2,7 @@
 damiao_joint.py — a small hardware abstraction wrapper around a single Damiao
 motor (MIT mode over CAN), mirroring the OdriveCanJoint / OdriveJoint interface so
 all motors on the robot expose an identical joint interface and can share one
-control loop (see motor_controller.py / demo_combined.py).
+control loop (see motor_service.py).
 
 NOTE on units: Damiao positions are in *radians*, whereas the ODrive works in
 *turns* (revolutions). Keep that in mind when combining the two: 1 turn = 2*pi rad.

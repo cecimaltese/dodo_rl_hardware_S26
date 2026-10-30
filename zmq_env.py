@@ -1,8 +1,7 @@
 """
 zmq_env.py — ZmqEnv(Env): the deployment backend over ZMQ.
 
-Replaces the ROS2 RealEnv (see legacy_ros2/real_env.py). Same Env interface as
-SimEnv, so the identical policy runner deploys unchanged:
+Same Env interface as SimEnv, so the identical policy runner deploys unchanged:
 
     SUB  motor_states   latest-value   joint pos/vel [rad] + flags
     SUB  imu            latest-value   gyro + accel (+ quat / sim lin_vel)

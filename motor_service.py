@@ -1,8 +1,8 @@
 """
-motor_service.py — the dodo motor fleet as a pure-ZMQ service (no ROS).
+motor_service.py — the dodo motor fleet as a pure-ZMQ service.
 
-Port of the former ROS2 node (see legacy_ros2/motor_controller.py). Owns the
-WHOLE motor fleet (Damiao + ODrive) behind one motor-type-agnostic interface:
+Owns the WHOLE motor fleet (Damiao + ODrive) behind one motor-type-agnostic
+interface:
 
     PUB  motor_states    @ rate_hz (200 Hz)  pos/vel/torque [rad, rad/s, Nm]
                                              + per-joint & global flags
@@ -16,7 +16,7 @@ order on the wire is dodo_ipc.JOINT_ORDER; default pose / action scaling live
 in the Env layer). Units are converted to each motor's native units here
 (Damiao = radians, ODrive = turns) and NEVER on the wire.
 
-Differences from the ROS2 node (all deliberate):
+Design choices (all deliberate):
   * NO auto-enable at startup. Bring-up is explicit via tools/dodo_ctl.py:
         status → calibrate → enable            (normal startup, see below)
   * States keep publishing after an e-stop (with the ESTOPPED flag set) so
@@ -38,7 +38,7 @@ driving the ODrive joints into their stops under power could damage the
     Damiao joints are untouched (their zero is hardware-persistent).
   * `calibrate`/`set_zero` are only accepted while DISABLED.
 
-Safety layer (unchanged from the ROS2 node):
+Safety layer:
   * position commands clamped to SAFETY_FACTOR × fleet_config joint limits
     (native units)
   * |torque| > 0.8 × rated  → that ONE motor to IDLE (professor's spec)
@@ -86,7 +86,7 @@ log = logging.getLogger("motor_service")
 TWO_PI = 2.0 * math.pi
 DM_REGISTER_ID = 0x7FF  # Damiao register read/write reply arbitration id
 
-# --- Safety factors / thresholds (identical to the ROS2 node) -------------------
+# --- Safety factors / thresholds -----------------------------------------------
 SAFETY_FACTOR = 0.9          # margin applied to position-clamp + velocity limit
 TORQUE_IDLE_FACTOR = 0.8     # |torque| > 0.8 * rated  ->  that motor goes to IDLE
 CMD_WATCHDOG_S = 0.5         # once commands stream (while enabled), a gap -> e-stop
@@ -548,7 +548,7 @@ class MotorService:
         self.state_pub.send(ipc.MotorStates(
             pos=pos, vel=vel, torque=tau, joint_flags=jflags, global_flags=g))
 
-    # ── safety (identical rules to the ROS2 node) ─────────────────
+    # ── safety ────────────────────────────────────────────────────
     def _safety_check(self, states: Dict[str, dict]):
         if time.time() - self._start_time < STARTUP_GRACE_S:
             return

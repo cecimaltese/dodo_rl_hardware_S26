@@ -321,7 +321,7 @@ def cmd_axes(ser):
     print("              (%2d, %2d, %2d)," % tuple(rows[1]))
     print("              (%2d, %2d, %2d))" % tuple(rows[2]))
     print("\n  Then verify: level robot -> imu_service publishes accel ~ (0, 0, +9.81)")
-    print("  and RealEnv's projected_gravity ~ (0, 0, -1). That is the acceptance test.")
+    print("  and ZmqEnv's projected_gravity ~ (0, 0, -1). That is the acceptance test.")
 
 
 # ---------------------------------------------------------------------------

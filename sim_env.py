@@ -10,7 +10,7 @@ from MuJoCo joint order into the policy joint order.
 
 This is the sim-to-sim verification gate: run the SAME policy + runner here first;
 if it behaves (e.g. dodo_flat walks forward on command), the obs/action plumbing
-and joint mapping are correct and RealEnv is a drop-in swap.
+and joint mapping are correct and ZmqEnv is a drop-in swap.
 """
 
 from __future__ import annotations
