@@ -190,9 +190,11 @@ class TestSyntheticRobot:
             th.join(timeout=3.0)
             time.sleep(0.4)                          # > max_state_age_s
             # One message may still be parked in the conflated queue (see the
-            # _check_health note) — detection must fire within a few steps.
+            # _check_health note). Draining it stamps it fresh, so after this
+            # pause detection can take up to max_state_age_s of further steps.
+            steps = int(env.max_state_age_s / env.control_dt) + 3
             with pytest.raises(RuntimeError, match="stale"):
-                for _ in range(3):
+                for _ in range(steps):
                     env.step(np.zeros(env.action_dim, dtype=np.float32))
         finally:
             env.close()
