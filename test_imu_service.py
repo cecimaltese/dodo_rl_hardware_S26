@@ -1,90 +1,128 @@
 """
-test_imu_service.py — parse_imu_line against REAL firmware line formats.
+test_imu_service.py — the IMU path from firmware line to ZMQ message, no hardware.
 
-Poll firmware = imu.cpp (Nicla Sense ME): "ALL ax ay az gx gy gz pitch roll",
-accel/gyro as raw int16 LSB (BHI260AP defaults: accel ±8 g -> 4096 LSB/g,
-gyro ±2000 °/s -> 16.384 LSB/°/s), pitch/roll accel-derived degrees.
-
-Stream firmware = firmware/imu_stream_nicla: "IMU gx gy gz ax ay az qw qx qy qz"
-already in SI with a fused unit quaternion.
+Lines use the real formats of firmware/imu_firmware_v1 and _v2 as parsed by
+imu_protocol.py: accel/gyro are raw int16 counts scaled by the sensor range, and
+everything is rotated into the body frame by imu_protocol.AXIS_REMAP. Expectations
+go through that same remap, so they stay valid once AXIS_REMAP is measured.
 """
 from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 
 import dodo_ipc as ipc
-from imu_service import (ACC_LSB_PER_G, GRAVITY, GYRO_LSB_PER_DPS,
-                         parse_imu_line, reading_to_msg)
+import imu_protocol as proto
+from imu_service import reading_to_msg, sensor_scales
+from rl_env import projected_gravity_from_quat
+
+G = 9.80665
+V2 = {"proto": 2, "accel_range_g": 4.0, "gyro_range_dps": 1000.0}  # as flashed
+GYRO_V2, ACCEL_V2, _ = sensor_scales(V2)
+GYRO_V1, ACCEL_V1, _ = sensor_scales(None)  # v1: the guessed ranges
 
 
-class TestPollFirmware:  # imu.cpp, 'L' -> ALL line
+def body(x, y, z):
+    """A board-frame vector as the parser reports it (through AXIS_REMAP)."""
+    return proto._remap(x, y, z)
+
+
+class TestScales:
+    def test_v2_self_report_wins_over_guess(self):
+        gyro, accel, src = sensor_scales(V2, gyro_range_dps=2000.0, accel_range_g=8.0)
+        assert gyro == pytest.approx(math.radians(1000.0) / 32768.0)
+        assert accel == pytest.approx(4.0 * G / 32768.0)
+        assert "self-reported" in src
+
+    def test_v1_falls_back_to_guess(self):
+        gyro, accel, src = sensor_scales(None)
+        assert gyro == pytest.approx(math.radians(proto.GYRO_RANGE_DPS) / 32768.0)
+        assert accel == pytest.approx(proto.ACCEL_RANGE_G * G / 32768.0)
+        assert "GUESSED" in src
+
+
+class TestFirmwareV2:  # 'L' -> "ALL" + 8 fields + fused quaternion
+    FLAT = ("ALL 0.000 0.000 8192.000 0.000 0.000 0.000 0.00 0.00 "
+            "1.000000 0.000000 0.000000 0.000000\r\n")
+
     def test_flat_and_still(self):
-        # Robot flat and still: accel = +1 g on z (raw 4096), gyro = 0.
-        r = parse_imu_line("ALL 0.000 0.000 4096.000 0.000 0.000 0.000 0.00 0.00\n")
-        assert r is not None
-        assert r["accel"][0] == pytest.approx(0.0)
-        assert r["accel"][2] == pytest.approx(GRAVITY, abs=1e-6)
-        assert r["gyro"] == pytest.approx((0.0, 0.0, 0.0))
-        assert "quat" not in r  # pitch/roll deliberately discarded
+        r = proto.parse_imu_line(self.FLAT, GYRO_V2, ACCEL_V2)
+        assert r["accel"] == pytest.approx(body(0.0, 0.0, G))  # 8192 counts = 1 g
+        assert r["gyro"] == pytest.approx(body(0.0, 0.0, 0.0))
+        assert "quat" in r
 
     def test_field_order_accel_first(self):
-        # The ALL line is accel-first; our wire/dict convention is gyro-first.
-        # 16.384 raw gyro = 1 °/s; 4096 raw accel = 1 g.
-        r = parse_imu_line("ALL 4096.0 0.0 0.0 16.384 0.0 0.0 12.34 -5.67")
-        assert r["accel"][0] == pytest.approx(GRAVITY)
-        assert r["gyro"][0] == pytest.approx(math.radians(1.0), rel=1e-6)
+        # ALL is accel-first; 32.768 counts = 1 °/s at ±1000 °/s.
+        r = proto.parse_imu_line("ALL 8192 0 0 32.768 0 0 1.0 2.0 1 0 0 0",
+                                 GYRO_V2, ACCEL_V2)
+        assert r["accel"] == pytest.approx(body(G, 0.0, 0.0))
+        assert r["gyro"] == pytest.approx(body(math.radians(1.0), 0.0, 0.0))
 
-    def test_scale_constants(self):
-        assert ACC_LSB_PER_G == pytest.approx(32768 / 8)       # ±8 g
-        assert GYRO_LSB_PER_DPS == pytest.approx(32768 / 2000)  # ±2000 °/s
-
-    def test_truncated_and_garbage(self):
-        assert parse_imu_line("ALL 1.0 2.0 3.0\n") is None
-        assert parse_imu_line("READY\n") is None
-        assert parse_imu_line("ACCEL 1.0 2.0 3.0\n") is None
-        assert parse_imu_line("ALL a b c d e f g h\n") is None
-        assert parse_imu_line("\n") is None
-        assert parse_imu_line("") is None
-
-
-class TestStreamFirmware:  # firmware/imu_stream_nicla, SI units + fused quat
-    LINE = "IMU 0.0100 -0.0200 0.0300 0.100 -0.200 9.810 1.0000 0.0000 0.0000 0.0000"
-
-    def test_si_passthrough_and_quat(self):
-        r = parse_imu_line(self.LINE)
-        assert r["gyro"] == pytest.approx((0.01, -0.02, 0.03))
-        assert r["accel"] == pytest.approx((0.1, -0.2, 9.81))
-        assert r["quat"] == pytest.approx((1.0, 0.0, 0.0, 0.0))
+    def test_quat_goes_through_the_remap(self):
+        q = (0.9238795, 0.3826834, 0.0, 0.0)  # 45° about board x
+        line = "ALL 0 0 8192 0 0 0 0 0 " + " ".join(f"{c:.7f}" for c in q)
+        r = proto.parse_imu_line(line, GYRO_V2, ACCEL_V2)
+        assert r["quat"] == pytest.approx(proto._quat_mul(q, proto._Q_REMAP_CONJ))
 
     def test_unconverged_zero_quat_dropped(self):
-        r = parse_imu_line("IMU 0 0 0 0 0 9.81 0.0 0.0 0.0 0.0")
+        r = proto.parse_imu_line("ALL 0 0 8192 0 0 0 0 0 0 0 0 0", GYRO_V2, ACCEL_V2)
         assert r is not None and "quat" not in r
 
-    def test_gyro_accel_only_line(self):
-        r = parse_imu_line("IMU 0.1 0.2 0.3 0.4 0.5 0.6")
-        assert r["gyro"] == pytest.approx((0.1, 0.2, 0.3))
+
+class TestFirmwareV1:  # 'L' -> "ALL" + 8 fields, no quaternion
+    def test_flat_and_still(self):
+        r = proto.parse_imu_line("ALL 0.000 0.000 4096.000 0.000 0.000 0.000 0.00 0.00\r\n",
+                                 GYRO_V1, ACCEL_V1)
+        assert r["accel"] == pytest.approx(body(0.0, 0.0, G))  # 4096 counts = 1 g
         assert "quat" not in r
+
+    def test_truncated_and_garbage(self):
+        for line in ("ALL 1.0 2.0 3.0\n", "READY\n", "ACCEL 1.0 2.0 3.0\n",
+                     "ALL a b c d e f g h\n", "ALL 1 2 3 4 5 6 7 8 9 10\n", "\n", ""):
+            assert proto.parse_imu_line(line, GYRO_V1, ACCEL_V1) is None, line
+
+
+class TestQuatRemapMath:
+    """imu_protocol rotates the fused quaternion with q_base = q ⊗ conj(q_R). That
+    must move projected_gravity exactly like the vectors move: g_base = R · g_board.
+    Checked for mountings other than the current identity AXIS_REMAP."""
+
+    @pytest.mark.parametrize("remap", [
+        ((0, -1, 0), (1, 0, 0), (0, 0, 1)),    # board yawed 90°
+        ((-1, 0, 0), (0, 1, 0), (0, 0, -1)),   # board upside down
+        ((0, 0, 1), (1, 0, 0), (0, 1, 0)),     # axes cycled
+    ])
+    def test_gravity_follows_the_vector_remap(self, remap):
+        r = np.array(remap, dtype=float)
+        w, x, y, z = proto._matrix_to_quat(remap)
+        q_r_conj = (w, -x, -y, -z)
+        rng = np.random.default_rng(0)
+        for _ in range(20):
+            q = rng.normal(size=4)
+            q /= np.linalg.norm(q)
+            g_board = projected_gravity_from_quat(q)
+            g_base = projected_gravity_from_quat(proto._quat_mul(tuple(q), q_r_conj))
+            assert g_base == pytest.approx(r @ g_board, abs=1e-5)
 
 
 class TestToMessage:
-    def test_quat_flag_set_only_when_fused(self):
-        with_q = reading_to_msg(parse_imu_line(TestStreamFirmware.LINE))
-        assert with_q.flags & ipc.IMU_QUAT_VALID
-        no_q = reading_to_msg(
-            parse_imu_line("ALL 0 0 4096 0 0 0 0.0 0.0"))
-        assert not (no_q.flags & ipc.IMU_QUAT_VALID)
+    def test_quat_flag_only_when_fused(self):
+        assert reading_to_msg(proto.parse_imu_line(
+            TestFirmwareV2.FLAT, GYRO_V2, ACCEL_V2)).quat_valid
+        assert not reading_to_msg(proto.parse_imu_line(
+            "ALL 0 0 4096 0 0 0 0 0", GYRO_V1, ACCEL_V1)).quat_valid
 
     def test_lin_vel_never_claimed(self):
-        # base_lin_vel is unobservable on hardware — the flag must NEVER be set
-        # by imu_service (only sim_service may set it).
-        msg = reading_to_msg(parse_imu_line(TestStreamFirmware.LINE))
-        assert not (msg.flags & ipc.IMU_LIN_VEL_VALID)
+        # base_lin_vel is unobservable on hardware — only sim_service may set it.
+        msg = reading_to_msg(proto.parse_imu_line(TestFirmwareV2.FLAT, GYRO_V2, ACCEL_V2))
+        assert not msg.lin_vel_valid
 
     def test_wire_roundtrip(self):
-        msg = reading_to_msg(parse_imu_line(TestStreamFirmware.LINE))
+        msg = reading_to_msg(proto.parse_imu_line(TestFirmwareV2.FLAT, GYRO_V2, ACCEL_V2))
         back = ipc.decode(msg.pack(seq=1))
         assert back.gyro == pytest.approx(msg.gyro, rel=1e-6)
         assert back.accel == pytest.approx(msg.accel, rel=1e-6)
+        assert back.quat == pytest.approx(msg.quat, rel=1e-6)
         assert back.quat_valid and not back.lin_vel_valid

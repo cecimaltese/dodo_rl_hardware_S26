@@ -37,7 +37,7 @@ try:
 except ImportError:
     sys.exit("pyserial missing:  pip install pyserial")
 
-import imu_protocol as observer   # protocol layer (ROS-free); alias keeps call sites short
+import imu_protocol as proto   # protocol layer; alias keeps call sites short
 from imu_protocol import open_imu
 from rl_env import projected_gravity_from_quat
 
@@ -79,16 +79,16 @@ def main():
                             f"device: accel +/-{ver['accel_range_g']:.0f} g, "
                             f"gyro +/-{ver['gyro_range_dps']:.0f} dps")
     else:
-        gs, as_ = observer.GYRO_LSB_TO_RAD_S, observer.ACCEL_LSB_TO_M_S2
+        gs, as_ = proto.GYRO_LSB_TO_RAD_S, proto.ACCEL_LSB_TO_M_S2
         check("PORT", True, f"firmware v1 (no 'V') @ {baud} baud — ranges are GUESSED "
-                            f"from observer.py constants; SCALE below is the real test")
+                            f"from imu_protocol.py constants; SCALE below is the real test")
 
     # ---- collect --------------------------------------------------------------
     samples, t0 = [], time.time()
     for _ in range(args.samples):
         ser.reset_input_buffer()
         ser.write(b"L")
-        r = observer.parse_imu_line(ser.readline().decode("ascii", "ignore"), gs, as_)
+        r = proto.parse_imu_line(ser.readline().decode("ascii", "ignore"), gs, as_)
         if r:
             samples.append(r)
     elapsed = time.time() - t0
@@ -115,7 +115,7 @@ def main():
           f"accel=({a[0]:+.2f},{a[1]:+.2f},{a[2]:+.2f})")
     if err >= 3.0:
         print("           -> the counts->m/s^2 scale is WRONG (or the board is moving).")
-        print("              v1: fix ACCEL_RANGE_G in observer.py (imu_sniff.py says which).")
+        print("              v1: fix ACCEL_RANGE_G in imu_protocol.py (imu_sniff.py says which).")
         print("              v2: the device reported its range — suspect a moving board.")
 
     # ---- 4. GYRO bias ---------------------------------------------------------

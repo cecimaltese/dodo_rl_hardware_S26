@@ -1,7 +1,7 @@
 """
 imu_sniff.py — bench diagnostic for the Nicla Sense ME IMU. No ROS, no deps but pyserial.
 
-Answers the three questions observer.py cannot answer from source alone:
+Answers the three questions imu_service.py cannot answer from source alone:
 
   1. WIRE FORMAT   — dumps the raw bytes the firmware actually sends, undecoded.
   2. SENSOR RANGE  — firmware v1 never calls setRange(), so its raw
@@ -16,7 +16,7 @@ Usage:
     python3 imu_sniff.py                       # dump + verdict on the format & accel range
     python3 imu_sniff.py --port /dev/ttyACM0   # Nicla usually enumerates as ttyACM*
     python3 imu_sniff.py --gyro-cal            # pin the gyro range (do this one!)
-    python3 imu_sniff.py --axes                # build AXIS_REMAP for observer.py
+    python3 imu_sniff.py --axes                # build AXIS_REMAP for imu_protocol.py
 
 Firmware v2 self-reports its ranges over 'V', so the range checks here are an
 INDEPENDENT cross-check of the chip rather than the source of truth. On v2 the only
@@ -35,7 +35,7 @@ try:
 except ImportError:
     sys.exit("pyserial missing:  pip install pyserial")
 
-# Shared with observer.py / imu_check.py. In particular open_imu AUTO-DETECTS the baud
+# Shared with imu_service.py / imu_check.py. In particular open_imu AUTO-DETECTS the baud
 # (v2 = 921600, v1 = 115200). This file used to hardcode 115200; when the firmware moved
 # to 921600 it silently read a 921600 stream at 115200, every line was garbage, and it
 # reported "no parsable 'ALL' lines" — looking exactly like a broken IMU.
@@ -132,7 +132,7 @@ def cmd_dump(ser, count, ver=None):
 
     if abs(mag - 9.80665) < 1.5:
         print("  -> |accel| ~= 9.81: firmware is ALREADY sending m/s^2, not raw counts.")
-        print("     observer.py assumes RAW COUNTS — set accel_range_g so the scale is 1.0,")
+        print("     imu_protocol.py assumes RAW COUNTS — set accel_range_g so the scale is 1.0,")
         print("     or simplify the parser. Re-check SensorXYZ's return type.")
     elif abs(mag - 1.0) < 0.2:
         print("  -> |accel| ~= 1.0: firmware is already sending g.")
@@ -153,7 +153,7 @@ def cmd_dump(ser, count, ver=None):
             print(f"\n  Device 'V' reports +/-{claimed:.0f} g; measured +/-{implied:.2f} g "
                   f"-> {'AGREE' if agree else 'DISAGREE !!'}")
             if agree:
-                print("  Nothing to set — observer.py already takes the scale from the device.")
+                print("  Nothing to set — imu_service.py already takes the scale from the device.")
             else:
                 print("  The chip's self-report and physics disagree. Do NOT trust 'V'; "
                       "investigate before deploying.")
@@ -176,7 +176,7 @@ def cmd_gyro_cal(ser, ver=None):
     """Integrate raw gyro counts through a known rotation -> implied full-scale range.
 
     Why this matters most: gyro counts feed base_ang_vel with NO normalization, so a
-    wrong range scales 3 of the 30 obs dims by a constant. observer.py guesses 2000 dps.
+    wrong range scales 3 of the 30 obs dims by a constant. imu_protocol.py guesses 2000 dps for v1.
 
     You do NOT need to know the board's axes. The BHI260AP range is one global setting
     for all three gyro axes, and for a rotation about any fixed axis the integral is
@@ -257,7 +257,7 @@ def cmd_gyro_cal(ser, ver=None):
               f"-> {'AGREE' if agree else 'DISAGREE !!'}")
         if agree:
             print("  Nothing to set — the chip's self-report is confirmed by physics, and")
-            print("  observer.py already takes the scale from the device. base_ang_vel is sound.")
+            print("  imu_service.py already takes the scale from the device. base_ang_vel is sound.")
         else:
             print(f"  The chip claims one range and the rotation says another (off by "
                   f"{claimed / implied:.1f}x). base_ang_vel would be scaled WRONG and nothing")
@@ -316,11 +316,11 @@ def cmd_axes(ser):
     print("  base_x <- board", f"{'+-'[xs < 0]}{AXES[xi]}")
     print("  base_y <- board", f"{'+-'[ys < 0]}{AXES[yi]}")
     print("  base_z <- board", f"{'+-'[zs < 0]}{AXES[zi]}")
-    print("\n  PASTE INTO observer.py:\n")
+    print("\n  PASTE INTO imu_protocol.py:\n")
     print("AXIS_REMAP = ((%2d, %2d, %2d)," % tuple(rows[0]))
     print("              (%2d, %2d, %2d)," % tuple(rows[1]))
     print("              (%2d, %2d, %2d))" % tuple(rows[2]))
-    print("\n  Then verify: level robot -> observer publishes accel ~ (0, 0, +9.81)")
+    print("\n  Then verify: level robot -> imu_service publishes accel ~ (0, 0, +9.81)")
     print("  and RealEnv's projected_gravity ~ (0, 0, -1). That is the acceptance test.")
 
 
@@ -342,7 +342,7 @@ def main():
     except RuntimeError as e:
         sys.exit(f"{e}\n"
                  f"  ls /dev/ttyACM* /dev/ttyUSB*   to find the port\n"
-                 f"  a serial monitor or a running observer.py will also hold it")
+                 f"  a serial monitor or a running imu_service.py will also hold it")
 
     ser.timeout = 0.2
     if ver:
@@ -350,7 +350,7 @@ def main():
               f"ranges from device: accel +/-{ver['accel_range_g']:.0f} g, "
               f"gyro +/-{ver['gyro_range_dps']:.0f} dps")
         print("NOTE: v2 self-reports its ranges, so --gyro-cal is only a cross-check now;\n"
-              "      observer.py already takes the scale from the device.")
+              "      imu_service.py already takes the scale from the device.")
     else:
         print(f"connected: {args.port} @ {baud} — firmware v1 (no 'V'), ranges UNKNOWN. "
               f"This is what --gyro-cal is for.")

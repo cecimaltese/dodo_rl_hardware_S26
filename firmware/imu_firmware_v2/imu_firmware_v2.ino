@@ -1,7 +1,7 @@
 /*
  * imu_firmware_v2.ino — Dodo IMU firmware for the Arduino Nicla Sense ME (BHI260AP).
  *
- * Supersedes imu_firmware.cpp (v1). Host side: dodo_rl_hardware_S26/observer.py.
+ * Supersedes v1 (../imu_firmware_v1). Host side: imu_service.py + imu_protocol.py.
  * Board: Arduino Nicla Sense ME     FQBN: arduino:mbed_nicla:nicla_sense
  *
  * WHAT CHANGED FROM v1, AND WHY
@@ -10,7 +10,7 @@
  *    v1 never called setRange(), so accel/gyro raw int16 counts scaled by an unknown
  *    BHI260AP default and the host had to GUESS. The gyro guess doesn't cancel — it
  *    feeds base_ang_vel straight into the policy. Now the ranges are set explicitly
- *    AND reported over 'V', so observer.py configures its scales from the device
+ *    AND reported over 'V', so imu_service.py configures its scales from the device
  *    instead of a hardcoded constant. This deletes a whole class of silent bug.
  *
  * 2. FUSED ORIENTATION (game rotation vector).
@@ -31,7 +31,7 @@
  * and that per-char term matches 115200's 0.087 ms/char almost exactly: the UART was
  * genuinely the bottleneck, capping the poll at ~41 Hz -- BELOW the 50 Hz control
  * loop. At 921600 the ~100-char line costs ~1 ms instead of ~13 ms.
- * The host (observer.py / imu_check.py) auto-detects, so old tools still work.
+ * The host (imu_service.py / imu_check.py) auto-detects, so old tools still work.
  *
  * WIRE PROTOCOL (ASCII lines, 921600 baud, request/response — one char in, one line out)
  *   'V' -> "VER <proto> <accel_range_g> <gyro_range_dps>"
@@ -48,7 +48,7 @@
  *   accuracy    = fusion accuracy estimate, radians.
  *
  *   'L' stays a superset of v1's line (same first 8 fields, 4 appended), so an old
- *   host still parses it if it ignores extra fields. observer.py accepts 9 or 13.
+ *   host still parses it if it ignores extra fields. imu_protocol.py accepts 9 or 13.
  */
 
 #include <Arduino.h>
@@ -69,7 +69,7 @@ static const int PROTO_VERSION = 2;
 static const uint16_t ACCEL_RANGE_G  = 4;
 static const uint16_t GYRO_RANGE_DPS = 1000;
 
-// Sample rate must comfortably exceed the host's poll rate (observer.py: 100 Hz) so
+// Sample rate must comfortably exceed the host's poll rate (imu_service.py: 100 Hz) so
 // every request is answered with a fresh sample. Latency 0 = don't sit in the FIFO.
 static const float    SENSOR_RATE_HZ = 400.0f;
 static const uint32_t SENSOR_LATENCY = 0;
@@ -199,7 +199,7 @@ void loop() {
             Serial.println(rv.accuracy(), 4);
             break;
 
-        case 'L': { // ALL — the line observer.py polls at 100 Hz
+        case 'L': { // ALL — the line imu_service.py polls at 100 Hz
             float pitch = atan2(-ax, sqrt(ay*ay + az*az)) * 57.2958;
             float roll  = atan2(ay, az) * 57.2958;
 

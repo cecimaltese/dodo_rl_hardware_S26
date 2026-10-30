@@ -2,11 +2,11 @@
 imu_protocol.py — the Nicla Sense ME wire protocol. ROS-FREE, on purpose.
 
 Everything about talking to the IMU lives here: the 'ALL'/'V' line formats, the raw
-int16 -> SI scaling, the board->base AXIS_REMAP, baud auto-detection. `observer.py`
-(a ROS2 node), `imu_check.py` and `imu_sniff.py` all import from this one module.
+int16 -> SI scaling, the board->base AXIS_REMAP, baud auto-detection. `imu_service.py`
+(the ZMQ service), `imu_check.py` and `imu_sniff.py` all import from this one module.
 
-Why it is its own file: this logic used to live inside observer.py, which imports
-rclpy. imu_sniff.py is deliberately ROS-free, so it could not share it and kept its
+Why it is its own file: this logic used to live inside observer.py (the former ROS2
+node), which imports rclpy. imu_sniff.py is deliberately ROS-free, so it could not share it and kept its
 OWN hardcoded baud — then the firmware moved to 921600 and imu_sniff silently read a
 921600 stream at 115200 and reported "no parsable 'ALL' lines", as if the IMU were
 broken. Same failure as the duplicated fleet config (see fleet_config.py): a
@@ -17,12 +17,12 @@ with one full reading. The formats below are VERIFIED against the firmware sourc
 the Arduino_BHY2 library.
 
 BOTH firmware versions are supported — flashing is decoupled from this code:
-  * v1 (`imu_firmware_v1/`, = Jim's `~/Arduino/nicla_reader`) — 'L' -> 8 fields, NO fused
+  * v1 (`firmware/imu_firmware_v1/`, = Jim's `~/Arduino/nicla_reader`) — 'L' -> 8 fields, NO fused
     orientation, 115200 baud. Gravity is derived from the accelerometer, valid only
     QUASI-STATIC: the accelerometer reads gravity PLUS linear acceleration, so during
     a shove the estimate is corrupted exactly when a balance policy needs it. Sensor
     ranges are BHI260AP defaults and must be GUESSED (see below).
-  * v2 (`imu_firmware_v2/`) — 'L' -> 12 fields, appends a fused game-rotation-vector
+  * v2 (`firmware/imu_firmware_v2/`) — 'L' -> 12 fields, appends a fused game-rotation-vector
     quaternion (accel+gyro, no magnetometer, so motor fields can't poison it), answers
     'V' with its actual configured ranges, and runs at 921600. Auto-detected. Preferred.
 
@@ -69,7 +69,7 @@ except ImportError:
 # Firmware v1 never calls setRange(), so its ranges are BHI260AP DEFAULTS and the
 # values below are a GUESS that MUST BE VERIFIED — run `python3 imu_sniff.py`
 # (measures the accel range directly) and `--gyro-cal` (pins the gyro range).
-# Overridable as ROS params (`gyro_range_dps`, `accel_range_g`).
+# Overridable with imu_service.py --gyro-range-dps / --accel-range-g.
 #
 # Firmware v2 makes all of this moot: it sets its ranges explicitly and reports them
 # over 'V', so query_version() below takes them from the device and these constants
