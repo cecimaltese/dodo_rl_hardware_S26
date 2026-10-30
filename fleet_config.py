@@ -5,7 +5,9 @@ Why this file exists: `motor_controller.py` and `read_motor_state.py` each used 
 their own hand-copied fleet config with a "kept in sync with motor_controller.py" comment
 on top. They drifted — the ODrive node ids were updated in one and not the other, so the
 diagnostic tool would have hunted for nodes 7-10 that no longer exist and reported every
-ODrive OFFLINE. A comment is not a mechanism. Import from here instead.
+ODrive OFFLINE. A comment is not a mechanism. Import from here instead. (motor_service.py,
+the ZMQ port, grew a third copy that went stale the same way — node ids 7-10 and a single
+shared bus — until it was switched to this module.)
 
 Deliberately ROS-free: the bench tools (`read_motor_state.py`, `odrive_can_scan.py`) must
 run without a ROS install, so nothing here may import rclpy.
@@ -41,6 +43,9 @@ BITRATE = 1_000_000   # set at OS level: sudo ip link set canX up type can bitra
 # ids are already set on the physical motors. motor_type MUST be "4340P": the
 # DamiaoJointConfig default is "4310", a much weaker motor (+/-10 Nm vs +/-28 Nm), and
 # the preset drives the MIT-mode P/V/T encoding — a wrong one mis-scales every command.
+# TODO(bench): kp/kd 30/0.5 are the legacy values; the trained policy expects the
+# behavior of IsaacLab stiffness 32 / damping 3.0 — calibrate on the bench
+# (Damiao MIT units are NOT IsaacLab units; match step response, don't copy).
 DM_JOINTS = [
     DamiaoJointConfig(name="hip_left",        motor_id=0x01, feedback_id=0x11,
                       motor_type="4340P", kp=30.0, kd=0.5),  # left hip roll
@@ -103,6 +108,20 @@ JOINT_LIMITS_RAD = {
     # ODrive — URDF values, NOT yet measured
     "lower_leg_left":  (-3.1416, 1.3963), "lower_leg_right": (-3.1416, 1.3963), # knee
     "foot_left":       (-1.05,   1.57),   "foot_right":      (-1.05,   1.57),   # ankle
+}
+
+# Boot pose: where the ODrive joints physically ARE at power-on. The startup convention
+# (no homing drive — it could overload the 3D-printed structure/belts): switch the robot
+# on with the knees and ankles folded ALL THE WAY BACK against their mechanical stops;
+# motor_service's ctl `calibrate` then maps each joint's turns-since-boot onto these
+# angles. These are the URDF limits = PLACEHOLDERS. `calibrate_joints.py --limits`
+# measures the real stops (its sim_lo/sim_hi) — put those here once measured. Verify
+# after `calibrate`: `dodo_ctl status` must show these values, and nudging each joint by
+# hand must change it with the expected sign. The e-stop over-travel margin covers ±0.10
+# rad of error.
+BOOT_POSE_RAD = {
+    "lower_leg_left": -3.1416, "lower_leg_right": -3.1416,  # knee folded back (min limit)
+    "foot_left": 1.57,         "foot_right": 1.57,          # foot folded against shank (max limit)
 }
 
 # Rated torque per joint (URDF effort limits, Nm): hips/upper 27, knee/ankle 9.

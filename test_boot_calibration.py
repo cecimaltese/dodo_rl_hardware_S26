@@ -19,7 +19,8 @@ import can
 import pytest
 
 import motor_service as ms
-from motor_service import BOOT_POSE_RAD, JOINT_LIMITS_RAD, OD_JOINTS, _JointAdapter
+from fleet_config import BOOT_POSE_RAD, JOINT_LIMITS_RAD, OD_JOINTS
+from motor_service import _JointAdapter
 from odrive_can_joint import (CMD_GET_ENCODER_ESTIMATES, CMD_SET_INPUT_POS,
                               OdriveCanJoint, OdriveCanJointConfig)
 

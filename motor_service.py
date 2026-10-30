@@ -39,15 +39,23 @@ driving the ODrive joints into their stops under power could damage the
   * `calibrate`/`set_zero` are only accepted while DISABLED.
 
 Safety layer (unchanged from the ROS2 node):
-  * position commands clamped to SAFETY_FACTOR × URDF joint limits (native units)
+  * position commands clamped to SAFETY_FACTOR × fleet_config joint limits
+    (native units)
   * |torque| > 0.8 × rated  → that ONE motor to IDLE (professor's spec)
   * motor fault / over-speed / measured over-travel / silent feedback /
     stalled command stream → full e-stop (all motors disabled, latched until
     ctl estop_reset)
 
-CAN topology (unchanged): both motor types share can0 @ 1 Mbit/s on separately
-filtered SocketCAN sockets. Bring the bus up first (Ubuntu robot box):
-    sudo ip link set can0 up type can bitrate 1000000
+Fleet, buses, limits and the boot pose all come from fleet_config.py — the
+single source of truth; nothing about the robot is configured here.
+
+CAN topology: two buses, one USB-CAN adapter each (Damiao on DM_CHANNEL, ODrive
+on OD_CHANNEL; stable names from the udev rule, see fleet_config.py). Both types
+can share one bus (pass the same channel twice) — then the Damiao socket gets
+filtered, and the ODrive node ids must stay out of the Damiao id windows.
+Bring the buses up first (Ubuntu robot box):
+    sudo ip link set can_dm up type can bitrate 1000000
+    sudo ip link set can_od up type can bitrate 1000000
 
 Run (robot):
     python3 motor_service.py                    # full 8-joint fleet
@@ -67,8 +75,11 @@ import can
 from damiao_motor import DaMiaoController
 
 import dodo_ipc as ipc
-from damiao_joint import DamiaoJoint, DamiaoJointConfig
-from odrive_can_joint import OdriveCanJoint, OdriveCanJointConfig
+from damiao_joint import DamiaoJoint
+from odrive_can_joint import OdriveCanJoint
+from fleet_config import (DM_JOINTS, OD_JOINTS, DM_CHANNEL, OD_CHANNEL, BUSTYPE,
+                          JOINT_LIMITS_RAD, RATED_TORQUE_NM, JOINT_VEL_LIMIT_RAD,
+                          BOOT_POSE_RAD)
 
 log = logging.getLogger("motor_service")
 
@@ -82,44 +93,7 @@ CMD_WATCHDOG_S = 0.5         # once commands stream (while enabled), a gap -> e-
 FB_WATCHDOG_S = 0.5          # a joint that WAS reporting goes silent -> e-stop
 POS_OVERTRAVEL_MARGIN = 0.10 # rad past the hard URDF limit (measured) -> e-stop
 STARTUP_GRACE_S = 1.0        # ignore safety trips for the first second
-
-# --- Physical constraints of the legs/body (from dodo_daimao.urdf) --------------
-# Single source of truth for position safety, in RADIANS; converted per-motor.
-# NOTE (status 2026-07): knee/ankle (ODrive) ranges are considered confirmed;
-# hip/upper (Damiao) ranges still need to be measured about the calibrated zero
-# on the real robot — update here when done (see ZMQ_MIGRATION.md Phase 3).
-JOINT_LIMITS_RAD = {
-    "hip_left":        (-0.35,   0.35),   "hip_right":       (-0.35,   0.35),    # hip roll
-    "upper_leg_left":  (-1.57,   1.57),   "upper_leg_right": (-1.57,   1.57),    # hip pitch
-    "lower_leg_left":  (-3.1416, 1.3963), "lower_leg_right": (-3.1416, 1.3963),  # knee
-    "foot_left":       (-1.05,   1.57),   "foot_right":      (-1.05,   1.57),    # ankle
-}
-# --- Boot pose: where the ODrive joints physically ARE at power-on --------------
-# The startup convention (replaces homing): the robot is switched on with the
-# ODrive-driven joints folded ALL THE WAY BACK against their mechanical stops.
-# ctl `calibrate` maps each joint's turns-since-boot onto these angles.
-# TODO(bench): VERIFY on the robot — which URDF limit each stop corresponds to
-# (sign!), and whether the printed stop sits exactly at the URDF limit. After
-# `calibrate`, `dodo_ctl status` must show these values; then move each joint a
-# little by hand and check the sign of the change. If a stop is slightly past
-# the URDF limit, put the MEASURED angle here (the e-stop over-travel margin
-# covers ±0.10 rad).
-BOOT_POSE_RAD = {
-    "lower_leg_left": -3.1416, "lower_leg_right": -3.1416,  # knee folded back (min limit)
-    "foot_left": 1.57,         "foot_right": 1.57,          # foot folded against shank (max limit)
-}
-UNPARK_DURATION_S = 1.5  # slow move from the stop to the safety-band edge at enable
-
-# Rated torque per joint (URDF effort limits, Nm): hips/upper 27, knee/ankle 9.
-RATED_TORQUE_NM = {
-    "hip_left": 27.0, "hip_right": 27.0, "upper_leg_left": 27.0, "upper_leg_right": 27.0,
-    "lower_leg_left": 9.0, "lower_leg_right": 9.0, "foot_left": 9.0, "foot_right": 9.0,
-}
-JOINT_VEL_LIMIT_RAD = 6.0    # URDF velocity limit (rad/s), same for all joints.
-
-# NOTE (ODrive gearing): unit conversion assumes 1 motor turn == 2*pi rad at the
-# joint (direct drive). If the T-Motor/ODrive joints are geared, commands AND
-# limits must be divided by the gear ratio — verify before trusting the clamps.
+UNPARK_DURATION_S = 1.5      # slow move from the stop to the safety-band edge at enable
 
 DM_FAULT_STATUS = {
     "OVER_VOLTAGE", "UNDER_VOLTAGE", "OVER_CURRENT",
@@ -127,31 +101,6 @@ DM_FAULT_STATUS = {
 }
 
 AnyJoint = Union[DamiaoJoint, OdriveCanJoint]
-
-# ---------------------------------------------------------------------------
-# Fleet configuration (real robot) — names match dodo_ipc.JOINT_ORDER / URDF.
-# ---------------------------------------------------------------------------
-# Damiao hips (roll + pitch) — ids already set on the physical motors (DM4340P).
-# TODO(bench): kp/kd 30/0.5 are the legacy values; the trained policy expects the
-# behavior of IsaacLab stiffness 32 / damping 3.0 — calibrate on the bench
-# (Damiao MIT units are NOT IsaacLab units; match step response, don't copy).
-DM_JOINTS = [
-    DamiaoJointConfig(name="hip_left",        motor_id=0x01, feedback_id=0x11,
-                      motor_type="4340P", kp=30.0, kd=0.5),  # left hip roll
-    DamiaoJointConfig(name="upper_leg_left",  motor_id=0x02, feedback_id=0x12,
-                      motor_type="4340P", kp=30.0, kd=0.5),  # left hip pitch
-    DamiaoJointConfig(name="hip_right",       motor_id=0x05, feedback_id=0x15,
-                      motor_type="4340P", kp=30.0, kd=0.5),  # right hip roll
-    DamiaoJointConfig(name="upper_leg_right", motor_id=0x06, feedback_id=0x16,
-                      motor_type="4340P", kp=30.0, kd=0.5),  # right hip pitch
-]
-# ODrive knees (lower_leg_*) + ankles (foot_*) — T-Motor via ODrive, CAN Simple.
-OD_JOINTS = [
-    OdriveCanJointConfig(name="lower_leg_left",  node_id=7,  vel_limit=10.0, rated_torque=9.0),
-    OdriveCanJointConfig(name="foot_left",       node_id=8,  vel_limit=10.0, rated_torque=9.0),
-    OdriveCanJointConfig(name="lower_leg_right", node_id=9,  vel_limit=10.0, rated_torque=9.0),
-    OdriveCanJointConfig(name="foot_right",      node_id=10, vel_limit=10.0, rated_torque=9.0),
-]
 
 
 # ---------------------------------------------------------------------------
@@ -242,9 +191,9 @@ class MotorService:
     """Pure ZMQ control service owning the whole motor fleet."""
 
     def __init__(self,
-                 dm_channel: str = "can0",
-                 od_channel: str = "can0",
-                 bustype: str = "socketcan",
+                 dm_channel: str = DM_CHANNEL,
+                 od_channel: str = OD_CHANNEL,
+                 bustype: str = BUSTYPE,
                  rate_hz: float = 200.0,
                  move_duration: float = 0.0,
                  only: Optional[List[str]] = None):
@@ -731,10 +680,10 @@ class MotorService:
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--dm-channel", default="can0")
-    ap.add_argument("--od-channel", default="can0",
-                    help="set to can1 if the ODrives are on a second adapter")
-    ap.add_argument("--bustype", default="socketcan")
+    ap.add_argument("--dm-channel", default=DM_CHANNEL)
+    ap.add_argument("--od-channel", default=OD_CHANNEL,
+                    help="same as --dm-channel to run both motor types on one adapter")
+    ap.add_argument("--bustype", default=BUSTYPE)
     ap.add_argument("--rate", type=float, default=200.0, help="control loop Hz")
     ap.add_argument("--move-duration", type=float, default=0.0,
                     help="ramp time per received command; 0 = track directly (policy)")
