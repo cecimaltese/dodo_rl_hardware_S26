@@ -187,12 +187,33 @@ and the hardware side (`rl_env.py` / `RealEnv` / `run_policy.py` / `sim_env.py`)
 **unchanged**. Retrain STAGE 1 (or resume from a STAGE-0 checkpoint) to bake it in; verify
 in PLAY that base height holds across a ~10 cm spread without falling. Tuning: `REWARD_TUNING.md` §9.
 
+### UPDATE 2026-10-30 — hardware repaired; URDF restored for Shafeef's training
+- **Hardware (user report):** all motor drivers have power again and the CAN daisy chain
+  has full continuity. No motor has been commanded since.
+- **New plan:** Shafeef Omar trains the next policy himself, so `dodo_rl` (Isaac Lab) is
+  mostly set aside. Work here is sim2real + hardware. He needs an up-to-date URDF
+  including the IMU.
+- **`../dodo_files/` restored** (it was never in a repo; `sim_env`/tests expect it as a
+  sibling). Source: `liambansbach/legged-robot_rl_genesis` @ `1cfa733`,
+  `ressources/robots/dodo_daimao` (urdf + STL meshes). `dodo_rl`'s USD is byte-identical
+  to the one stored there. On the dev Mac, `test_sim2sim_consistency.py` gives 17 pass /
+  1 fail / 1 skip with it, the same as recorded on the robot PC.
+- **URDF changes:** added `<mujoco><compiler fusestatic="false"/>`. Without it, MuJoCo's
+  URDF import fuses fixed links and an `imu_link` silently vanishes. Tests are unchanged
+  with it. `imu_link`/`imu_joint` are **pending the measured IMU pose**: position relative
+  to the hip-pitch axis, and orientation via `imu_sniff.py --axes`. `AXIS_REMAP` must equal
+  the `imu_joint` rotation. Handout notes for the trainer: `../dodo_files/README.md`.
+- **Finding:** `dodo_rl`'s USD has `hip_left` mass 0 in its physics layer. PhysX falls
+  back to about 0.44 kg from the convex hull, so the impact on past training was small.
+  Don't reuse that USD; regenerate it from the URDF.
+
 ### Decisions captured from the user (don't re-ask)
 - ODrive transport → **move to CAN** (same `can0` bus as DM). Same interface, different ids.
 - ODrive CAN config state → **unknown** → include the USB inspect/config step.
 - Start order → **CAN migration first** (before safety layer).
 - Bench now → **1 DM + 1 ODrive**; classes must be config-driven for the full fleet.
 - Torque safety threshold "0.8" → **normalized 0–1 of rated torque** (for the later safety step).
+- Policy training → **Shafeef trains it** (2026-10-30). This repo owns sim2real + hardware.
 
 ---
 
