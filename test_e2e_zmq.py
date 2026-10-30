@@ -36,7 +36,7 @@ from sim_env import SIM_DT, URDF_PATH
 
 HW_DIR = Path(__file__).resolve().parent
 URDF = URDF_PATH
-DODO_RL = HW_DIR.parent / "dodo_rl"
+RUN_ROOTS = (HW_DIR / "policies", HW_DIR.parent / "dodo_rl")  # dodo_rl is optional
 
 
 def _free_port() -> int:
@@ -233,9 +233,10 @@ class TestSyntheticRobot:
 # the real acceptance test (needs URDF + a trained dodo_stand ONNX)
 # ---------------------------------------------------------------------------
 def _latest_stand_onnx():
-    hits = sorted(glob(str(DODO_RL / "**" / "dodo_stand" / "*" / "exported" /
-                           "policy.onnx"), recursive=True))
-    return hits[-1] if hits else None
+    hits = [h for root in RUN_ROOTS for h in glob(str(
+        root / "**" / "dodo_stand" / "*" / "exported" / "policy.onnx"), recursive=True)]
+    # run dirs are timestamps -> newest run last
+    return max(hits, key=lambda h: Path(h).parent.parent.name) if hits else None
 
 
 @pytest.mark.skipif(not URDF.exists(), reason=f"robot URDF not found at {URDF}")

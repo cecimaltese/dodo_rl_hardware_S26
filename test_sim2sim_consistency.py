@@ -51,7 +51,9 @@ import sim_env  # noqa: E402
 from sim_env import (DECIMATION, EFFORT_LIMIT, KD, KP, SIM_DT, URDF_PATH,  # noqa: E402
                      _build_model)
 
-DODO_RL = REPO_ROOT / "dodo_rl"
+DODO_RL = REPO_ROOT / "dodo_rl"   # optional training checkout next to this repo
+# Trained runs: the vendored policies/ plus, if present, dodo_rl. Newest run wins.
+RUN_ROOTS = (HW_DIR / "policies", DODO_RL)
 URDF = URDF_PATH
 USD = DODO_RL / "source" / "dodo_rl" / "dodo_rl" / "assets" / "usd" / "dodo_daimao.usd"
 
@@ -86,14 +88,14 @@ ENV_TO_RL_OBS = {
 # ground-truth discovery / loading
 # ----------------------------------------------------------------------------------
 def _latest_run(task: str):
-    """Newest <run> dir under dodo_rl that has BOTH params/env.yaml and the ONNX."""
+    """Newest <run> dir (policies/ or dodo_rl) that has BOTH params/env.yaml and the ONNX."""
     hits = []
-    for y in glob(str(DODO_RL / "**" / f"dodo_{task}" / "*" / "params" / "env.yaml"),
-                  recursive=True):
-        run = Path(y).parent.parent
-        onnx = run / "exported" / "policy.onnx"
-        if onnx.exists():
-            hits.append(run)
+    for root in RUN_ROOTS:
+        for y in glob(str(root / "**" / f"dodo_{task}" / "*" / "params" / "env.yaml"),
+                      recursive=True):
+            run = Path(y).parent.parent
+            if (run / "exported" / "policy.onnx").exists():
+                hits.append(run)
     if not hits:
         return None
     # run dir names are timestamps (YYYY-MM-DD_HH-MM-SS) -> lexicographic == chronological
@@ -323,7 +325,8 @@ def test_usd_asset_present_and_is_dodo_daimao():
     yaml_usd = cfg["scene"]["robot"]["spawn"]["usd_path"]
     assert os.path.basename(yaml_usd) == "dodo_daimao.usd", (
         f"env.yaml trained on {yaml_usd!r}, not the dodo_daimao asset")
-    assert USD.exists(), f"local USD missing: {USD}"
+    if not USD.exists():
+        skip(f"no dodo_rl checkout next to this repo ({USD.parent} missing)")
     cfgdir = USD.parent / "configuration"
     for layer in ("base", "physics", "robot", "sensor"):
         f = cfgdir / f"dodo_daimao_{layer}.usd"
