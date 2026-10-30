@@ -1,15 +1,22 @@
-# Dodo sim-to-real deployment stack
-# (ROS 2 Humble / rclpy is provided by the system ROS install, not pip.)
+# Dodo sim-to-real deployment stack (ZMQ-based — no ROS required).
+# Robot target: Ubuntu box, Python >= 3.10. Dev: any OS.
+
+# Messaging (all services + env + tools)
+pyzmq
 
 # Policy + simulation verification
 onnxruntime>=1.16        # run exported policy.onnx
-mujoco>=3.2              # SimEnv physics (MjSpec API)
+mujoco>=3.2              # SimEnv / sim_service physics (MjSpec API)
 numpy>=1.21
 
-# Motors (real robot)
+# Motors (real robot; Linux socketcan)
 python-can
 damiao_motor==1.0.6      # Damiao MIT-mode CAN
 # odrive==0.6.11.post0   # only for odrive_can_setup.py (USB config), not runtime
 
-# IMU (Observer)
+# IMU (imu_service)
 pyserial
+
+# Tests
+pytest
+pyyaml                   # test_sim2sim_consistency parses params/env.yaml

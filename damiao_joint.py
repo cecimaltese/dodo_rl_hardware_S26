@@ -99,9 +99,23 @@ class DamiaoJoint:
         time.sleep(0.2)
         self._zero_offset = 0.0
 
-    def set_zero(self) -> None:
-        """Define the current shaft position as 0 via a software offset."""
-        self._zero_offset = self._read_raw_pos()
+    def set_zero(self, current: float = 0.0) -> None:
+        """Declare that the joint is physically at `current` (rad) right now,
+        via a software offset. current=0.0 keeps the old semantics ("this pose
+        is zero"). Prefer set_zero_hardware() for the one-time persistent zero."""
+        self._zero_offset = self._read_raw_pos() - current
+
+    def send_limp(self) -> None:
+        """Send a zero-gain MIT frame (kp=kd=tau=0): applies NO torque but makes
+        the motor report its state — the only way to read a Damiao that has just
+        been enabled, without moving it (same trick as read_motor_state.py)."""
+        self.motor.send_cmd_mit(
+            target_position=0.0,
+            target_velocity=0.0,
+            stiffness=0.0,
+            damping=0.0,
+            feedforward_torque=0.0,
+        )
 
     def get_position(self) -> float:
         return self._read_raw_pos() - self._zero_offset

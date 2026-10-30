@@ -1,109 +1,162 @@
 """
-demo_combined.py — drive a Damiao motor (radians) and an ODrive motor (turns)
-through the unified MotorController, with BOTH motors on the same CAN bus (can0).
+demo_combined.py — bench demo over ZMQ: drive any subset of joints with a
+smooth sine through the full service stack (the same path the policy uses).
 
-This replaces the old USB-ODrive demo: the ODrive now speaks CAN Simple via
-OdriveCanJoint, and everything goes through MotorController so the motors share
-one filtered bus and one control loop. The same loop is the sim-to-real hook:
-swap the hand-written moves below for `mc.step(policy_action)` driven by the
-trained IsaacLab policy.
+Replaces the old direct-CAN demo. Works IDENTICALLY against:
+  * motor_service.py on the robot/bench (1 Damiao + 1 ODrive, or the full fleet)
+  * sim_service.py in MuJoCo (expect the robot to flop around URDF-zero unless
+    you pass --center default — this demo is a plumbing check, not a policy)
 
-Before running:
-    sudo ip link set can0 up type can bitrate 1000000
-    python3 odrive_can_setup.py            # once, to put the ODrive on CAN (node 7, 1M)
+What it exercises end-to-end: ctl (status/enable/disable), motor_commands
+streaming at 50 Hz with NaN for un-selected joints (they hold still), live
+motor_states feedback, and the service's clamps + watchdogs.
+
+    # bench: wiggle two joints ±0.3 rad at 0.25 Hz for 10 s
+    python3 demo_combined.py --joints hip_left,lower_leg_left
+
+    # everything, gentler, against sim_service around the standing pose
+    python3 demo_combined.py --amp 0.1 --center default
+
+Bring-up first (real robot): motor_service running, ODrives calibrated (robot
+was POWERED ON with the legs folded at the stops — see tools/dodo_startup.py):
+    python3 tools/dodo_ctl.py status
+    python3 tools/dodo_ctl.py calibrate    # if ODrives not calibrated yet
 """
 
+from __future__ import annotations
+
+import argparse
 import math
+import sys
 import time
 
-from damiao_joint import DamiaoJointConfig
-from odrive_can_joint import OdriveCanJointConfig
-from motor_controller import MotorController, MotorControllerConfig, PolicyJoint
+import dodo_ipc as ipc
 
-# ── configuration (bench: 1 Damiao + 1 ODrive) ────────────────────
-DM_CONFIGS = [
-    DamiaoJointConfig(name="dm_bench", motor_id=0x02, feedback_id=0x12,
-                      motor_type="4310", kp=32.0, kd=3.0, rated_torque=9.0),
-]
-OD_CONFIGS = [
-    OdriveCanJointConfig(name="od_bench", node_id=7, rated_torque=27.0),
-]
-
-# Policy joint order + home pose (radians). On the bench this is just the two
-# test motors; on the robot, list all 8 in the sim's articulation order with the
-# matching default_pos from dodo.py (hip 0.0, upper_leg -0.15, lower_leg 0.30,
-# foot -0.15).
-POLICY_JOINTS = [
-    PolicyJoint(name="dm_bench", default_pos=0.0),
-    PolicyJoint(name="od_bench", default_pos=0.0),
-]
-
-CONTROL_HZ = 200.0
-DT = 1.0 / CONTROL_HZ
+# Default (home) pose for --center default, kept in sync with rl_env / dodo.py.
+_DEFAULT_CENTER = {
+    "hip_": 0.0, "upper_leg_": 0.20, "lower_leg_": -0.50, "foot_": 0.30,
+}
 
 
-def spin_until(mc, done, extra=None):
-    """Tick every joint at CONTROL_HZ until `done` returns True."""
-    t0 = time.time()
-    while not done():
-        if extra is not None:
-            extra(time.time() - t0)
-        mc.update_all()
-        time.sleep(DT)
+def _center_for(joint: str, mode: str) -> float:
+    if mode == "zero":
+        return 0.0
+    for prefix, val in _DEFAULT_CENTER.items():
+        if joint.startswith(prefix):
+            return val
+    return 0.0
+
+
+def _smoothstep(x: float) -> float:
+    x = min(max(x, 0.0), 1.0)
+    return 3.0 * x * x - 2.0 * x * x * x
 
 
 def main():
-    mc = MotorController(MotorControllerConfig(
-        dm_configs=DM_CONFIGS,
-        od_configs=OD_CONFIGS,
-        policy_joints=POLICY_JOINTS,
-    ))
-    # Give the ODrive reader thread a moment to receive the first feedback frames.
-    time.sleep(0.3)
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--joints", default=None,
+                    help="comma-separated subset (default: every joint that has "
+                         "feedback per ctl status)")
+    ap.add_argument("--amp", type=float, default=0.3, help="sine amplitude [rad]")
+    ap.add_argument("--freq", type=float, default=0.25, help="sine frequency [Hz]")
+    ap.add_argument("--secs", type=float, default=10.0, help="run time [s]")
+    ap.add_argument("--rate", type=float, default=50.0, help="command rate [Hz]")
+    ap.add_argument("--center", choices=["zero", "default"], default="zero",
+                    help="sine center: joint zero (bench) or the standing pose (sim)")
+    ap.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    args = ap.parse_args()
+
+    ctl = ipc.CtlClient()
+
+    # ── 1) status: what is actually out there? ────────────────────
+    try:
+        status = ctl.request("status")
+    except TimeoutError as e:
+        print(f"ERROR: {e}")
+        sys.exit(2)
+    joints_info = status.get("joints", {})
+    online = [n for n, j in joints_info.items() if j.get("has_feedback")]
+    print(f"service: enabled={status.get('enabled')} estopped={status.get('estopped')} "
+          f"all_calibrated={status.get('all_calibrated')}")
+    for n, j in sorted(joints_info.items()):
+        print(f"  {n:<16} {j.get('type', '?'):<7} fb={str(j.get('has_feedback')):<5} "
+              f"cal={str(j.get('calibrated')):<5} pos={j.get('pos_rad', 0):+.3f} rad")
+
+    if status.get("estopped"):
+        print("service is E-STOPPED — tools/dodo_ctl.py estop_reset first.")
+        sys.exit(1)
+
+    # ── 2) pick joints ────────────────────────────────────────────
+    if args.joints:
+        selected = [s.strip() for s in args.joints.split(",")]
+        unknown = [s for s in selected if s not in ipc.JOINT_INDEX]
+        if unknown:
+            print(f"ERROR: unknown joints {unknown}; known: {ipc.JOINT_ORDER}")
+            sys.exit(1)
+    else:
+        selected = online or list(joints_info)
+    if not selected:
+        print("no joints to drive (nothing online?) — aborting.")
+        sys.exit(1)
+    print(f"\ndriving {selected} : ±{args.amp} rad @ {args.freq} Hz for {args.secs}s "
+          f"(center={args.center})")
+    if not args.yes and input("continue? (y/N): ").strip().lower() != "y":
+        sys.exit(0)
+
+    # ── 3) enable + streams ───────────────────────────────────────
+    r = ctl.request("enable")
+    if not r.get("ok"):
+        print(f"enable failed: {r}")
+        sys.exit(1)
+    cmd_pub = ipc.Publisher(ipc.TOPIC_MOTOR_COMMANDS)
+    state_sub = ipc.Subscriber(ipc.TOPIC_MOTOR_STATES, conflate=True)
+    time.sleep(0.3)                       # slow-joiner settle before streaming
+
+    idx = [ipc.JOINT_INDEX[n] for n in selected]
+    center = [_center_for(n, args.center) for n in selected]
+    loop = ipc.RateLoop(args.rate, name="demo")
+    t0 = time.monotonic()
+    last_print = 0.0
+    ramp_out_started = None
 
     try:
-        # ── optional zeroing ──────────────────────────────────────
-        if input("\nSet zero at current shaft position(s)? (y/N): ").strip().lower() == "y":
-            mc.set_zero_all()
-            print("  Zero set.")
+        while True:
+            t = time.monotonic() - t0
+            # smooth ramp-in over 2 s; ramp-out over the final second
+            gain = _smoothstep(t / 2.0)
+            if t >= args.secs and ramp_out_started is None:
+                ramp_out_started = t
+            if ramp_out_started is not None:
+                gain *= 1.0 - _smoothstep((t - ramp_out_started) / 1.0)
+                if t - ramp_out_started >= 1.0:
+                    break
+            wave = args.amp * gain * math.sin(2.0 * math.pi * args.freq * t)
 
-        mc.enable_all()
+            targets = [ipc.NO_COMMAND] * ipc.N_JOINTS
+            for k, i in enumerate(idx):
+                targets[i] = center[k] + wave
+            cmd_pub.send(ipc.MotorCommands(target_pos=targets))
 
-        # 1) BLOCKING goto (homing) — each motor in its own native units
-        print("\n[1] Blocking goto to 0 ...")
-        for j in mc.joints:
-            j.goto(0.0, duration=2.0, ramp=1.0)
-
-        # 2) NON-BLOCKING coordinated transition through the shared loop
-        print("[2] Non-blocking transition ...")
-        for j in mc.joints:
-            j.start_move(+1.5, duration=2.0)        # rad for DM, turns for ODrive
-        spin_until(mc, done=lambda: not any(j.is_moving() for j in mc.joints))
-        print("    transition done.")
-
-        # 3) POLICY path — exercise the sim-to-real hook directly.
-        #    Here we feed a sine "action" through mc.step() instead of a real
-        #    policy; on the robot this is where policy(obs) plugs in.
-        print("[3] Policy-style step() (5 s sine) ...")
-        t0 = time.time()
-        while (t := time.time() - t0) < 5.0:
-            a = 0.5 * math.sin(2.0 * math.pi * 0.5 * t)
-            mc.step([a] * len(POLICY_JOINTS))
-            time.sleep(DT)
-
-        # quick look at the assembled observation (motor part)
-        obs = mc.get_observation()
-        print("    obs.joint_pos_rel =", [round(x, 3) for x in obs["joint_pos_rel"]])
-
-        # 4) Homing
-        print("[4] Easing back to 0 ...")
-        for j in mc.joints:
-            j.start_move(0.0, duration=2.0)
-        spin_until(mc, done=lambda: not any(j.is_moving() for j in mc.joints))
-
+            if t - last_print >= 0.5:
+                st = state_sub.latest()
+                if st is not None:
+                    got = " ".join(f"{n}={st.pos[i]:+.3f}" for n, i in zip(selected, idx))
+                    print(f"  t={t:5.1f}s cmd={wave + center[0]:+.3f} | {got}")
+                last_print = t
+            loop.sleep()
+    except KeyboardInterrupt:
+        print("\ninterrupted — disabling.")
     finally:
-        mc.shutdown()
-        print("\nDone, buses shut down.")
+        try:
+            ctl.request("disable")
+        except TimeoutError:
+            print("WARNING: disable request timed out — check the service!")
+        print(loop.stats_str())
+        cmd_pub.close()
+        state_sub.close()
+        ctl.close()
+        print("done.")
 
 
 if __name__ == "__main__":
