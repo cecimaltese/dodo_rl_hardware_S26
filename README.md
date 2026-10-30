@@ -28,7 +28,7 @@ decisions behind it.
 | Subsystem | State |
 |---|---|
 | **Hardware** | ✅ Every motor driver powered, CAN daisy chain continuous (repaired 2026-10-30). |
-| **ZMQ stack** | ✅ Merged into main 2026-10-30. In sim, the stand policy balances 10 s through `sim_service` + `ZmqEnv`. ⚠️ Never run against `motor_service` on the robot. |
+| **ZMQ stack** | ✅ Reconciled with main's July work 2026-10-30. In sim, the stand policy balances 10 s through `sim_service` + `ZmqEnv`. ⚠️ Never run against `motor_service` on the robot. |
 | **Sim → sim (MuJoCo)** | ✅ The `dodo_stand` policy stands 30 s+. |
 | **IMU** | ✅ Verified on hardware (firmware v2): scale 0.5 % off 1 g, gyro bias ~1 °/s, ~60 Hz. Now mounted on the robot; its pose (`AXIS_REMAP`, URDF `imu_link`) is not measured yet. |
 | **Safety layer** | ✅ In `motor_service`: position/velocity clamps, 0.8 × rated torque → that motor IDLE, e-stop. ⚠️ Never exercised on hardware. |
@@ -230,7 +230,8 @@ the robot.
 ## Tests
 
 ```bash
-python3 -m pytest
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # any OS, Python >= 3.10
+.venv/bin/python -m pytest
 ```
 
 Everything runs on any machine without hardware: the message layer (`test_ipc.py`), the

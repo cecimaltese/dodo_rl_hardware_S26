@@ -2,7 +2,7 @@
 
 The services, `ZmqEnv` and the tools talk over ZMQ. This is the spec. Everything in it is
 defined once in **`dodo_ipc.py`**, which every side imports. Built on `zmq_dev`
-(2026-07-06), merged into main 2026-10-30. Verified in sim (numbers in §6), not yet on
+(2026-07-06), reconciled with main's July work on 2026-10-30. Verified in sim (numbers in §6), not yet on
 the robot; status and next steps are in the README and HANDOFF.
 
 ## 1. Why ZMQ, and what it replaced

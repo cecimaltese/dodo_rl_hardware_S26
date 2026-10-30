@@ -15,6 +15,18 @@ record decisions). If you change code, reflect it here in the same turn.
 Machines: the robot is driven from an Ubuntu PC (repo under `/home/dodo/Documents/dodo/`);
 development happens on Macs. Anything touching hardware can only run on the robot PC.
 
+**Resuming on any machine.** Until `merge-zmq-dev` is merged, `main` still has the
+pre-merge ROS2 stack and its old docs, so work from the branch:
+```bash
+git clone git@github.com:cecimaltese/dodo_rl_hardware_S26.git && cd dodo_rl_hardware_S26
+git switch merge-zmq-dev
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # Python >= 3.10
+.venv/bin/python -m pytest   # 62 passed, 1 known failure, 1 skip
+                             # (59 passed, 4 skips without dodo_rl next to the repo)
+```
+Then read §2. A Claude session's local memory doesn't travel between machines; this file
+does.
+
 ---
 
 ## 1. Goal
@@ -32,32 +44,45 @@ and nothing has been commanded on the robot yet.
 - **Verified:** the stand policy in MuJoCo (30 s+ lockstep; 10 s through the full ZMQ
   stack), the IMU on the bench, and power + CAN continuity on the repaired robot. The test
   suite runs anywhere: 62 passed, 1 known failure (the joint-order guard), 1 skip (stale
-  flat run).
+  flat run); without `dodo_rl` beside the repo, 59 passed and 4 training-side skips. Also
+  checked from a clean export in a fresh Python 3.10 venv built from `requirements.txt`
+  (3.10 is the robot PC's version).
 - **Never run on hardware:** `motor_service`, the safety layer, any commanded motion.
 
 **Next steps, in order:**
 1. **IMU pose → URDF + `AXIS_REMAP`** (Shafeef is waiting for the URDF). Measure the
    board's position relative to the hip-pitch axis, midway between the legs (x forward,
-   y left, z up, ±5 mm is plenty). Get the orientation from `imu_sniff.py --axes`. Then add
-   `imu_link` + fixed `imu_joint` to `description/urdf/dodo_daimao.urdf` (the rotation must
-   equal `AXIS_REMAP`), fill the IMU table in `description/README.md`, and paste
-   `AXIS_REMAP` into `imu_protocol.py`.
-2. **Commit `99-dodo-can.rules`** from the robot PC. Optionally also its MJCF
+   y left, z up, ±5 mm is plenty). Get the orientation from `imu_sniff.py --axes` and paste
+   its `AXIS_REMAP` into `imu_protocol.py`. Then, in `description/urdf/dodo_daimao.urdf`:
+   - add an `imu_link` with a small explicit inertial (the Nicla is a 23 × 23 mm board of
+     a few grams), so no importer that keeps fixed links has to invent a mass;
+   - add a fixed `imu_joint` from `body` at the measured position. Its rotation must equal
+     `AXIS_REMAP`: the rows are body axes in board terms, so `v_body = R · v_board`, which
+     is exactly what a URDF joint rotation means. URDF `rpy` is extrinsic xyz:
+     `scipy.spatial.transform.Rotation.from_matrix(R).as_euler("xyz")`;
+   - verify by loading the URDF in MuJoCo (the `<mujoco>` block keeps `imu_link`) and
+     comparing `imu_link`'s `body_quat` with `AXIS_REMAP`;
+   - fill the IMU table in `description/README.md`.
+
+   Optional: weigh the robot (the CAD says 4.72 kg).
+2. **Merge `merge-zmq-dev` into `main`** once the team has looked at it (it's on origin).
+   Until then, fresh clones land on the old docs.
+3. **Commit `99-dodo-can.rules`** from the robot PC. Optionally also its MJCF
    `dodo_daimao.xml` (the meshed model `visualize_motor_state.py` used to load).
-3. **Knee/ankle gear ratio.** A nameplate, CAD or WS25 number beats inference. Otherwise
+4. **Knee/ankle gear ratio.** A nameplate, CAD or WS25 number beats inference. Otherwise
    go limp, rotate an ankle through a known angle and read the turn delta:
    `ratio = turns × 2π ÷ angle`. Wire it into `fleet_config.py` as a per-joint ratio, used
    by every rad ↔ turns conversion (`_JointAdapter` in `motor_service`,
    `to_rad`/`to_native` in `calibrate_joints.py`).
-4. **Redo the calibration** (README bring-up step 3). Delete the July `joint_calib.py`
+5. **Redo the calibration** (README bring-up step 3). Delete the July `joint_calib.py`
    first. Record the `--check-persistence` verdict here.
-5. **Wire the calibration into `motor_service`:** a per-joint sign and the measured
+6. **Wire the calibration into `motor_service`:** a per-joint sign and the measured
    motor → joint mapping in `_JointAdapter`, and `BOOT_POSE_RAD` ← the measured stops. Mind
    which stop each joint is folded against: knees at `sim_lo`, ankles at `sim_hi`, while
    `calibrate_joints.py --home` uses `sim_hi` for every joint.
-6. **First motion** (bring-up steps 5–6), then the Damiao gains toward the trained
+7. **First motion** (bring-up steps 5–6), then the Damiao gains toward the trained
    kp 32 / kd 3 behavior (MIT units ≠ Isaac Lab units: match the step response, don't copy).
-7. **Shafeef's policy:** adapt `rl_env.py` to its contract, add the run to `policies/`,
+8. **Shafeef's policy:** adapt `rl_env.py` to its contract, add the run to `policies/`,
    rehearse on `sim_service`, then the gantry.
 
 ---
@@ -90,9 +115,10 @@ and nothing has been commanded on the robot yet.
 
 ## 4. Log (newest first)
 
-### 2026-10-30 (b) — zmq_dev merged into main; repo made self-contained
-Branch `merge-zmq-dev` (local, not pushed). `zmq_dev` (2026-07-06) and main (to
-2026-07-17) had diverged, and the ZMQ services still carried their pre-07-16 config.
+### 2026-10-30 (b) — zmq_dev and main merged; repo made self-contained
+On branch `merge-zmq-dev`, pushed to origin, not yet merged into `main`. `zmq_dev`
+(2026-07-06) and main (to 2026-07-17) had diverged, and the ZMQ services still carried
+their pre-07-16 config.
 - **Merge** of `zmq_dev` (`582c32e`). Textual conflicts only in the README and HANDOFF.
 - **`motor_service` ← `fleet_config`.** It hunted ODrive nodes 7–10 (the bus has 3/4/7/8),
   defaulted both motor types onto one `can0` (the robot has `can_dm`/`can_od`), and clamped
