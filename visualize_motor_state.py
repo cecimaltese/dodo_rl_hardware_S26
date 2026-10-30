@@ -8,8 +8,9 @@ visual version of the sign/direction check — if you push a joint the way the s
 +angle goes and the model swings the OTHER way, that joint's sign is mirrored.
 
 No physics is stepped: hardware positions are written straight into qpos and the
-model is re-posed with mj_forward. The floating base stays fixed at the "home"
-keyframe height (this tool shows joint states; it does not estimate the base).
+model is re-posed with mj_forward. The base stays where the model puts it (this
+tool shows joint states; it does not estimate the base): at the origin for the
+default URDF, or at the "home" keyframe of an MJCF passed with --model.
 
 Units / calibration:
   * joint_calib.py       if present (from calibrate_joints.py), its measured motor
@@ -39,7 +40,6 @@ import dataclasses
 import math
 import threading
 import time
-from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import can
@@ -50,10 +50,11 @@ from damiao_motor import DaMiaoController
 from damiao_joint import DamiaoJoint
 from odrive_can_joint import OdriveCanJoint
 from fleet_config import (DM_JOINTS, OD_JOINTS, DM_CHANNEL, OD_CHANNEL, BUSTYPE)
+from sim_env import URDF_PATH
 
 TWO_PI = 2.0 * math.pi
 FRESH_S = 0.5  # ODrive counts as ONLINE if feedback arrived within this many seconds
-DEFAULT_MODEL = Path(__file__).resolve().parent.parent / "dodo_files" / "urdf" / "dodo_daimao.xml"
+DEFAULT_MODEL = URDF_PATH  # collision boxes only; pass --model for a meshed MJCF
 
 # ODrive CAN Simple command id for RTR encoder polling (as in read_motor_state.py).
 OD_CMD_GET_ENCODER = 0x09
@@ -82,7 +83,7 @@ def motor_to_sim(raw_pos: float, raw_vel: float, is_odrive: bool,
 
 def main():
     ap = argparse.ArgumentParser(description="MuJoCo live view of the real robot's joint states.")
-    ap.add_argument("--model", default=str(DEFAULT_MODEL), help=f"MuJoCo XML (default: {DEFAULT_MODEL})")
+    ap.add_argument("--model", default=str(DEFAULT_MODEL), help=f"MuJoCo model, MJCF or URDF (default: {DEFAULT_MODEL})")
     ap.add_argument("--channel", "--dm-channel", dest="channel", default=DM_CHANNEL,
                     help=f"Damiao bus (default: {DM_CHANNEL})")
     ap.add_argument("--od-channel", dest="od_channel", default=OD_CHANNEL,

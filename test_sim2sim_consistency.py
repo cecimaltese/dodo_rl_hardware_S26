@@ -48,10 +48,11 @@ import rl_env  # noqa: E402
 from rl_env import (ACTION_SCALE, DEFAULT_JOINT_POS, OBS_FLAT, OBS_STAND,  # noqa: E402
                     POLICY_JOINT_ORDER)
 import sim_env  # noqa: E402
-from sim_env import DECIMATION, EFFORT_LIMIT, KD, KP, SIM_DT, _build_model  # noqa: E402
+from sim_env import (DECIMATION, EFFORT_LIMIT, KD, KP, SIM_DT, URDF_PATH,  # noqa: E402
+                     _build_model)
 
 DODO_RL = REPO_ROOT / "dodo_rl"
-URDF = REPO_ROOT / "dodo_files" / "urdf" / "dodo_daimao.urdf"
+URDF = URDF_PATH
 USD = DODO_RL / "source" / "dodo_rl" / "dodo_rl" / "assets" / "usd" / "dodo_daimao.usd"
 
 # pytest's skip exception, with a no-pytest fallback so the file also runs under bare

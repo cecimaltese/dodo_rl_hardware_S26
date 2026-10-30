@@ -39,6 +39,9 @@ SIM_DT = 0.005
 DECIMATION = 4
 SPAWN_HEIGHT = 0.50  # m, from init_state.pos
 
+# The robot model (URDF + meshes) lives in this repo; see description/README.md.
+URDF_PATH = Path(__file__).resolve().parent / "description" / "urdf" / "dodo_daimao.urdf"
+
 
 def _effort_for(joint: str) -> float:
     for p, v in EFFORT_LIMIT.items():
@@ -105,7 +108,7 @@ def _build_model(urdf_path: str) -> mujoco.MjModel:
 
 
 class SimEnv(Env):
-    def __init__(self, urdf_path: str = "dodo_files/urdf/dodo_daimao.urdf",
+    def __init__(self, urdf_path: str = str(URDF_PATH),
                  obs_cfg: ObsCfg = OBS_FLAT, command=(0.0, 0.0, 0.0),
                  render: bool = False):
         super().__init__(obs_cfg, command=command, control_dt=SIM_DT * DECIMATION)

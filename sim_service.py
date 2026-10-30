@@ -33,7 +33,7 @@ timing noise is unlikely to be what kills it.
                                                     #   dodo_ctl enable first
     python3 sim_service.py --imu-no-quat            # rehearse accel-only IMUs
 
-Needs the URDF (default ../dodo_files/urdf/dodo_daimao.urdf — not in this repo).
+Loads the robot from description/urdf/dodo_daimao.urdf (override with --urdf).
 """
 
 from __future__ import annotations
@@ -50,9 +50,11 @@ import mujoco
 import numpy as np
 
 import dodo_ipc as ipc
-from motor_service import JOINT_LIMITS_RAD, SAFETY_FACTOR
+from fleet_config import JOINT_LIMITS_RAD
+from motor_service import SAFETY_FACTOR
 from rl_env import DEFAULT_JOINT_POS, projected_gravity_from_quat
-from sim_env import KD, KP, SIM_DT, SPAWN_HEIGHT, _build_model, _effort_for
+from sim_env import (KD, KP, SIM_DT, SPAWN_HEIGHT, URDF_PATH, _build_model,
+                     _effort_for)
 
 log = logging.getLogger("sim_service")
 
@@ -97,7 +99,8 @@ class SimService:
                                 dtype=np.float64)
         self._default = np.array([DEFAULT_JOINT_POS[j] for j in ipc.JOINT_ORDER],
                                  dtype=np.float64)
-        # Same clamp as motor_service: SAFETY_FACTOR × URDF limits.
+        # Same clamp as motor_service: SAFETY_FACTOR × fleet_config limits (the
+        # measured Damiao ranges), so the sim rehearses what the robot will clamp.
         self._clamp_lo = np.array(
             [JOINT_LIMITS_RAD[j][0] * SAFETY_FACTOR for j in ipc.JOINT_ORDER])
         self._clamp_hi = np.array(
@@ -309,8 +312,7 @@ class SimService:
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--urdf", default="dodo_files/urdf/dodo_daimao.urdf",
-                    help="robot URDF (also tried relative to the parent dir)")
+    ap.add_argument("--urdf", default=str(URDF_PATH), help="robot URDF")
     ap.add_argument("--render", action="store_true")
     ap.add_argument("--require-enable", action="store_true",
                     help="start disabled, like the real motor_service "
@@ -328,16 +330,10 @@ def main():
                         format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 
     from pathlib import Path
-    urdf = Path(args.urdf)
-    if not urdf.exists():
-        alt = Path(__file__).resolve().parent.parent / args.urdf
-        if alt.exists():
-            urdf = alt
-        else:
-            raise SystemExit(f"URDF not found: {args.urdf} (also tried {alt}). "
-                             f"Copy dodo_files/ next to the repo or pass --urdf.")
+    if not Path(args.urdf).exists():
+        raise SystemExit(f"URDF not found: {args.urdf}")
 
-    svc = SimService(urdf_path=str(urdf),
+    svc = SimService(urdf_path=args.urdf,
                      auto_enable=not args.require_enable,
                      render=args.render,
                      imu_no_quat=args.imu_no_quat,

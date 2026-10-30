@@ -13,8 +13,8 @@ Two tiers:
 
 2. `test_stand_policy_over_zmq` — the REAL acceptance test (robot URDF + a
    trained dodo_stand ONNX): the stand policy must keep the dodo upright for
-   10 s through the full network stack. Skips where ../dodo_files is missing;
-   run it on the Ubuntu robot box:
+   10 s through the full network stack. Skips if no dodo_stand ONNX is found.
+   Run:
 
        .venv/bin/python -m pytest test_e2e_zmq.py -v
 """
@@ -32,10 +32,10 @@ import pytest
 
 import dodo_ipc as ipc
 from rl_env import DEFAULT_JOINT_POS, DEFAULT_POS_VEC, OBS_STAND
-from sim_env import SIM_DT
+from sim_env import SIM_DT, URDF_PATH
 
 HW_DIR = Path(__file__).resolve().parent
-URDF = HW_DIR.parent / "dodo_files" / "urdf" / "dodo_daimao.urdf"
+URDF = URDF_PATH
 DODO_RL = HW_DIR.parent / "dodo_rl"
 
 

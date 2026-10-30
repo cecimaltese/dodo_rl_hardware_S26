@@ -50,7 +50,9 @@ def main():
     ap.add_argument("--hold-pose", action="store_true",
                     help="(sim) ignore the policy and just PD-hold the default pose, "
                          "to preview the home stance. Implies --backend sim --render.")
-    ap.add_argument("--urdf", default="dodo_files/urdf/dodo_daimao.urdf")
+    ap.add_argument("--urdf", default=None,
+                    help="robot URDF for --backend sim "
+                         "(default: description/urdf/dodo_daimao.urdf)")
     args = ap.parse_args()
 
     obs_cfg = OBS_FLAT if args.task == "flat" else OBS_STAND
@@ -58,8 +60,8 @@ def main():
     # --- Preview mode: hold the default (home) pose, no policy needed ---------
     if args.hold_pose:
         import numpy as np
-        from sim_env import SimEnv
-        env = SimEnv(urdf_path=args.urdf, obs_cfg=obs_cfg, render=True)
+        from sim_env import SimEnv, URDF_PATH
+        env = SimEnv(urdf_path=args.urdf or str(URDF_PATH), obs_cfg=obs_cfg, render=True)
         env.reset()
         print(f"[hold-pose] PD-holding the default pose ({args.steps} steps). "
               f"Close the window to exit.")
@@ -88,8 +90,8 @@ def main():
 
     control_dt = 1.0 / args.control_hz
     if args.backend == "sim":
-        from sim_env import SimEnv
-        env = SimEnv(urdf_path=args.urdf, obs_cfg=obs_cfg,
+        from sim_env import SimEnv, URDF_PATH
+        env = SimEnv(urdf_path=args.urdf or str(URDF_PATH), obs_cfg=obs_cfg,
                      command=tuple(args.command), render=args.render)
     else:  # zmq (or the deprecated 'real' alias)
         if args.task == "flat":
