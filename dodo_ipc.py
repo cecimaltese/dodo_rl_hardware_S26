@@ -7,7 +7,7 @@ latest-value delivery rules. Both the real robot services (motor_service.py,
 imu_service.py) and the simulator (sim_service.py) import this module — that is
 what guarantees `run_policy.py --backend zmq` cannot tell sim from robot.
 
-Design (see ZMQ_MIGRATION.md for the full rationale):
+Design (see docs/zmq.md for the full spec and rationale):
 
   * One endpoint per topic, single-part binary messages. That combination makes
     ZMQ_CONFLATE safe on subscribers, so a control loop always reads the NEWEST

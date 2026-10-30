@@ -1,275 +1,278 @@
-# Dodo Motor Control — Handoff / Context Recap
+# Dodo hardware — HANDOFF (cross-session context)
 
-> Purpose: hand this to another Claude session so it can pick up exactly where we left off.
-> Covers the **short-term plan (CAN migration — in progress)** and the **long-term roadmap**.
-> Working directory for all motor-control files: `/home/dodo/Documents/dodo/`
+> Purpose: hand this to a new session (Claude or human) so it can pick up exactly where we
+> left off. The README is the manual; this file is the state, the decisions and the history.
 
 ---
 
 ## 0. WORKING AGREEMENT (read first, every session)
 **Rule:** after doing *anything* in this project, update this `HANDOFF.md` and/or the
-relevant `README.md` before ending the session. We work across different computers with
-fresh Claude sessions, so the repo files are the *only* shared memory — a new chat gets its
-full context by reading these. Keep the "current state" and "progress/todo" sections honest
-and up to date (mark what's done, note what's untested, record any decisions). If you change
-code, reflect it here in the same turn.
+`README.md` before ending the session. We work across different computers with fresh
+sessions, so the repo files are the *only* shared memory — a new chat gets its full context
+by reading these. Keep §2 and the log honest (mark what's done, note what's untested,
+record decisions). If you change code, reflect it here in the same turn.
+
+Machines: the robot is driven from an Ubuntu PC (repo under `/home/dodo/Documents/dodo/`);
+development happens on Macs. Anything touching hardware can only run on the robot PC.
 
 ---
 
-## 1. Project goal (big picture)
-Build a real-hardware motor-control + feedback stack for a robot ("dodo") whose final
-purpose is **sim-to-real**: a trained policy (currently in an Isaac Lab simulation repo)
-should drive the real motors through an interface that matches the sim's
-`env.step(action) -> observation` contract.
-
-Final hardware fleet: **4 Damiao motors + 4 ODrive motors + 1 Tmotor**, all on CAN.
-Right now on the bench: **1 Damiao + 1 ODrive**.
-
-Target architecture (two classes the user wants):
-```
-RobotInterface (sim-to-real bridge)
-  step(action)      -> MotorController -> [Damiao joints, ODrive joints]   (CONTROL class)
-  get_observation() <- FeedbackAggregator <- motor states + IMU            (FEEDBACK class)
-```
-- **MotorController** = control: owns all joints, enforces safety/limits, applies actions.
-- **FeedbackAggregator** = feedback: motor states (pos/vel/torque) + IMU (body lin/ang vel,
-  pitch, yaw). The IMU/body-state part is being written separately by a colleague ("Jim").
-- `step()` + `get_observation()` are the exact hook the Isaac Lab substitution plugs into.
+## 1. Goal
+Run a trained policy on the physical Dodo through the same `step(action) → observation`
+contract it was trained with. `motor_service` + `imu_service` are the robot,
+`sim_service` is a real-time MuJoCo stand-in on the same ZMQ topics, and `ZmqEnv` +
+`run_policy.py` drive either one. The policies so far come from the S26 Isaac Lab project
+`dodo_rl`. The next one is trained by Shafeef Omar from `description/`.
 
 ---
 
-## 2. Current state of the code (what already exists)
-All in `/home/dodo/Documents/dodo/`:
+## 2. Current state (2026-10-30)
+The subsystem table is in the README (*Status*). In short: everything is verified in sim,
+and nothing has been commanded on the robot yet.
+- **Verified:** the stand policy in MuJoCo (30 s+ lockstep; 10 s through the full ZMQ
+  stack), the IMU on the bench, and power + CAN continuity on the repaired robot. The test
+  suite runs anywhere: 62 passed, 1 known failure (the joint-order guard), 1 skip (stale
+  flat run).
+- **Never run on hardware:** `motor_service`, the safety layer, any commanded motion.
 
-| File | Status | What it is |
-|------|--------|-----------|
-| `dm_position_control.py` | working | Original flat script: single Damiao motor sample move over CAN (MIT mode). |
-| `damiao_joint.py` | working | `DamiaoJoint` + `DamiaoJointConfig`: clean class wrapper around one Damiao motor. Interface: `enable/disable`, `set_zero`, `get_position/get_state`, `send_position`, `goto` (blocking ramp), `start_move`/`is_moving`/`update` (non-blocking). Uses the `damiao_motor` pip library. Units: **radians**. |
-| `odrive_position_control.py` | working (USB) | `OdriveJoint` + `OdriveJointConfig`: ODrive over **USB** (`odrive.find_sync`). Same interface as DamiaoJoint. Units: **turns**. Has gain config (`pos_gain`, `vel_gain`, `vel_integrator_gain`), software zero offset, and a reboot-tolerant `save()` for `save_configuration()`. **Going forward this file is repurposed as the USB gain-tuning / config tool**, NOT the runtime path. |
-| `demo.py` | working (DM only) | Drives motors through a shared `spin_until` control loop. Currently DM-only; to be updated to use the new CAN `MotorController`. |
-
-These were built collaboratively this session, mirroring each other so both motor types
-expose an **identical interface** — that uniformity is the key design principle; keep it.
-
-### What we learned tuning the ODrive (USB)
-- It vibrated → that's controller gains. `vel_gain` too high = high-freq buzz; `pos_gain`
-  too high = slow oscillation. Recipe: zero `vel_integrator_gain`, raise `vel_gain` to just
-  before buzz then halve, raise `pos_gain` to just before overshoot then back off,
-  restore integrator ≈ `0.5 * vel_gain`. Starting point used: `pos_gain≈15-20, vel_gain≈0.05,
-  vel_integrator_gain≈0.1`.
-- `save_configuration()` **reboots the drive and drops USB** → wrap in try/except and
-  reconnect (this is implemented in `OdriveJoint.save()`).
+**Next steps, in order:**
+1. **IMU pose → URDF + `AXIS_REMAP`** (Shafeef is waiting for the URDF). Measure the
+   board's position relative to the hip-pitch axis, midway between the legs (x forward,
+   y left, z up, ±5 mm is plenty). Get the orientation from `imu_sniff.py --axes`. Then add
+   `imu_link` + fixed `imu_joint` to `description/urdf/dodo_daimao.urdf` (the rotation must
+   equal `AXIS_REMAP`), fill the IMU table in `description/README.md`, and paste
+   `AXIS_REMAP` into `imu_protocol.py`.
+2. **Commit `99-dodo-can.rules`** from the robot PC. Optionally also its MJCF
+   `dodo_daimao.xml` (the meshed model `visualize_motor_state.py` used to load).
+3. **Knee/ankle gear ratio.** A nameplate, CAD or WS25 number beats inference. Otherwise
+   go limp, rotate an ankle through a known angle and read the turn delta:
+   `ratio = turns × 2π ÷ angle`. Wire it into `fleet_config.py` as a per-joint ratio, used
+   by every rad ↔ turns conversion (`_JointAdapter` in `motor_service`,
+   `to_rad`/`to_native` in `calibrate_joints.py`).
+4. **Redo the calibration** (README bring-up step 3). Delete the July `joint_calib.py`
+   first. Record the `--check-persistence` verdict here.
+5. **Wire the calibration into `motor_service`:** a per-joint sign and the measured
+   motor → joint mapping in `_JointAdapter`, and `BOOT_POSE_RAD` ← the measured stops. Mind
+   which stop each joint is folded against: knees at `sim_lo`, ankles at `sim_hi`, while
+   `calibrate_joints.py --home` uses `sim_hi` for every joint.
+6. **First motion** (bring-up steps 5–6), then the Damiao gains toward the trained
+   kp 32 / kd 3 behavior (MIT units ≠ Isaac Lab units: match the step response, don't copy).
+7. **Shafeef's policy:** adapt `rl_env.py` to its contract, add the run to `policies/`,
+   rehearse on `sim_service`, then the gantry.
 
 ---
 
-## 3. SHORT-TERM PLAN — CAN migration (APPROVED, IN PROGRESS)
-Full approved plan file: `/home/dodo/.claude/plans/ethereal-wondering-horizon.md`
+## 3. Decisions (don't re-ask)
+- Transport → **ZMQ, not ROS2** (2026-07-06). The ROS2 nodes were deleted on 2026-10-30;
+  their last state is at `658874c`.
+- ODrive transport → **CAN Simple**. USB only for configuration and gain tuning
+  (gains can't be set over CAN).
+- CAN → **two buses**, one adapter each, pinned by serial to `can_dm` / `can_od`.
+  ODrive nodes 3/4/7/8 (measured on the live bus).
+- **No powered homing, ever** (2026-07-06): it could overload the 3D-printed parts and
+  belts. Power on with the ODrive joints folded at their stops, then `dodo_ctl calibrate`.
+  `motor_service` never auto-enables.
+- Safety: `|torque| > 0.8 × rated` → that one motor IDLE (torque normalized 0–1 of rated);
+  full e-stop on fault, over-speed, over-travel, silent feedback or a stalled command
+  stream.
+- Deployment (professor, 2026-06-18): the policy must **not** observe `base_lin_vel`. The
+  first target is stand-and-balance (obs 30).
+- IMU → firmware **v2** (GAMERV fusion, no magnetometer) + `imu_protocol.py` (2026-10-30).
+  The streaming firmware from `zmq_dev` was dropped: it fused the magnetometer and was
+  never flashed.
+- `fleet_config.py` is the single source of truth for the robot; never copy it
+  (`test_fleet_config.py` enforces this).
+- The repo is self-contained (2026-10-30): robot description in `description/`, reference
+  policy in `policies/`. It is meant to move to an ATARI lab repo.
+- Policy training → **Shafeef trains it** (2026-10-30). This repo owns sim2real + hardware.
 
-**Goal of this milestone:** put BOTH motors on the same CAN bus (`can0`) behind one
-unified `MotorController`, and expose the `step(action)`/`get_observation()` skeleton.
+---
 
-### Key technical findings (already settled — don't re-litigate)
-- **One CAN bus works for both.** SocketCAN raw sockets each receive their *own copy* of
-  every frame. We give each motor type its **own filtered socket** so they don't cross-talk:
-  - `DaMiaoController.__init__` forwards `**kwargs` to `can.interface.Bus`
-    (`Damiao Control/python-damiao-driver/damiao_motor/core/controller.py:145-156`), so we
-    pass `can_filters=...` to it.
-  - The DM frame router (`controller.py:365`) dispatches 8-byte frames by `data[0] & 0x0F`
-    (NOT by arbitration id) → without a filter it could mis-ingest ODrive frames. The
-    per-socket filter prevents this. **No patching of `damiao_motor` needed.**
-- **ODrive over CAN ≠ the USB `odrive` library.** It uses the **"CAN Simple"** protocol via
-  raw `python-can`. Arbitration id encoding: `arb_id = (node_id << 5) | cmd_id`.
-- **Bus params:** `can0` @ **1 Mbit/s**. Bring up: `sudo ip link set can0 up type can bitrate 1000000`.
-- **ODrive gains cannot be set over CAN Simple** — gains/modes are USB config persisted on
-  the drive. Hence the USB file stays as the config tool; CAN is runtime-only.
-- **CAN Simple command IDs in use:** `0x07` Set_Axis_State, `0x0B` Set_Controller_Mode,
-  `0x0C` Set_Input_Pos, `0x01` Heartbeat (RX), `0x09` Get_Encoder_Estimates (RX),
-  `0x1C` Get_Torques (RX). Axis states: IDLE=1, CLOSED_LOOP_CONTROL=8.
-  Control mode: POSITION_CONTROL=3; input mode: PASSTHROUGH=1.
-- **Node-id allocation (avoid arb-id collisions):** keep ODrive **node_id 7** (and 8 later) —
-  windows `0xE0–0xFF` / `0x100–0x11F` don't collide with DM cmd `0x02`, fb `0x12`, or
-  register id `0x7FF`. Avoid node 0 (low DM ids) and node 63 (collides with `0x7FF`).
-- **Reference implementations already on disk (reuse these):**
-  - `/home/dodo/Downloads/can_simple_utils.py` — clean `CanSimpleNode` (arb-id encoding, state set).
-  - `/home/dodo/Desktop/dodo_ros2/dodo/dodo/odrive_interface.py` — raw python-can ODrive setup.
-  - `/home/dodo/Documents/ros_odrive-main/odrive_node/src/odrive_can_node.cpp` — full cmd-id table.
+## 4. Log (newest first)
 
-### Files to create / change (the actual work)
-1. **`odrive_can_setup.py`** (NEW, USB) — inspect + configure ODrive for CAN: print current
-   CAN config; set `axis.config.can.node_id=7`, `can.config.baud_rate=1_000_000`, enable
-   cyclic feedback (`heartbeat_msg_rate_ms`, `encoder_msg_rate_ms`, `torque_msg_rate_ms ≈ 10`),
-   ensure POSITION/PASSTHROUGH + gains, `save_configuration()`. *Verify exact attribute paths
-   against odrive 0.6.11 at implementation time.*
-2. **`odrive_can_joint.py`** (NEW) — `OdriveCanJoint` + `OdriveCanJointConfig`. Mirrors the
-   `OdriveJoint` interface but speaks CAN Simple via a **shared `can.Bus`** passed in.
-   `send_position` → Set_Input_Pos `struct.pack('<fhh', pos, 0, 0)`; `enable/disable` →
-   Set_Axis_State; `set_zero` → software offset; `process_frame(msg)` decodes Heartbeat
-   (`<IBBBB`), Encoder_Estimates (`<ff`), Torques (`<ff`) into cached state. Copy the
-   identical `_ramp_profile`/`goto`/`start_move`/`update` logic from `odrive_position_control.py:126-175`.
-3. **`motor_controller.py`** (NEW) — `MotorController`. DM via `DaMiaoController(..., can_filters=<DM fb ids + 0x7FF>)`
-   wrapped in `DamiaoJoint`; ODrive via a second `can.Bus(..., can_filters=[{"can_id": node_id<<5,
-   "can_mask": 0x7E0}])` + a small daemon reader thread that drains `bus.recv()` into
-   `OdriveCanJoint.process_frame`. Config-driven (lists of DM + ODrive configs). API:
-   `enable_all/disable_all/set_zero_all/shutdown`, plus `step(action)` and `get_observation()`.
-4. **`demo.py`** (UPDATE) — rebuild on `MotorController` (1 DM + 1 ODrive), zero/enable/sample
-   move via the shared loop, shutdown.
+### 2026-10-30 (b) — zmq_dev merged into main; repo made self-contained
+Branch `merge-zmq-dev` (local, not pushed). `zmq_dev` (2026-07-06) and main (to
+2026-07-17) had diverged, and the ZMQ services still carried their pre-07-16 config.
+- **Merge** of `zmq_dev` (`582c32e`). Textual conflicts only in the README and HANDOFF.
+- **`motor_service` ← `fleet_config`.** It hunted ODrive nodes 7–10 (the bus has 3/4/7/8),
+  defaulted both motor types onto one `can0` (the robot has `can_dm`/`can_od`), and clamped
+  the Damiao joints to URDF limits instead of the measured ranges. `BOOT_POSE_RAD` moved to
+  `fleet_config`. `sim_service` now clamps with the same limits as the robot.
+- **`imu_service` ← `imu_protocol`.** The ZMQ version couldn't read the flashed v2
+  firmware: it opened the port at 115200 instead of 921600, would have scaled v2's
+  ±4 g / ±1000 °/s counts with v1's ±8 g / ±2000 °/s (doubling `base_ang_vel`), and ignored
+  the quaternion. Now it auto-detects v1/v2, takes the ranges from `'V'`, and applies
+  `AXIS_REMAP` to accel, gyro and quaternion (a new test checks the quaternion-remap math
+  for non-identity mountings). Firmware v1/v2 moved under `firmware/`; `imu.cpp` (a copy of
+  v1) and `firmware/imu_stream_nicla` were dropped and remain on `zmq_dev`.
+- **ROS2 nodes deleted** (`motor_controller`, `observer`, `real_env`).
+- **Self-contained:** the robot description lives in `description/` (it was `../dodo_files`),
+  with its path spelled once (`sim_env.URDF_PATH`). `visualize_motor_state` now defaults
+  to the URDF. The reference stand policy is vendored in `policies/` (from `dodo_rl` @
+  `52b01db`), so the acceptance tests also run without `dodo_rl`; checked in a copy of the
+  repo with no sibling folders.
+- **Flaky test fixed:** `test_step_detects_dead_service` failed about 1 run in 6, also on
+  `zmq_dev`. After its 0.4 s pause a parked message legitimately delays detection by up to
+  `max_state_age_s`; the test allowed 3 steps.
+- **Docs:** README consolidated (main's measured hardware facts + the ZMQ architecture + one
+  bring-up sequence). `ZMQ_MIGRATION.md` → `docs/zmq.md` (spec only). `firmware/README.md`
+  rewritten.
+- **Found, not fixed:** `99-dodo-can.rules` was never committed; `odrive_can_scan.py`
+  defaults to `can0`; `joint_calib.py` is still the incomplete July run. The
+  `dodo_rl_hardware_S26 copy/` folder on the dev Mac is content-identical to `zmq_dev`
+  and can be deleted.
 
-### Verification (bench, user-run)
-1. `sudo ip link set can0 up type can bitrate 1000000`
-2. `python3 odrive_can_setup.py` (USB) → confirm node 7, 1M baud, feedback rates; let it save+reboot.
-3. `candump can0` → see DM feedback + ODrive heartbeat (`0xE1`) and encoder (`0xE9`) frames.
-4. Build `MotorController`, call `get_observation()` → positions read for both, no cross-talk.
-5. `python3 demo.py` → both motors move, `get_position()` tracks; watch ODrive heartbeat error field.
-
-### Progress / todo state — UPDATED 2026-06-18
-CAN migration is **implemented** (in the `dodo_rl_hardware_S26/` repo; py_compile-clean,
-**not yet hardware-tested**):
-1. ✅ `odrive_can_setup.py` (USB config tool) — created.
-2. ✅ `odrive_can_joint.py` (CAN Simple driver) — created.
-3. ✅ `motor_controller.py` (unified MotorController) — created, incl. `step()`/`get_observation()`.
-4. ✅ `demo_combined.py` — rebuilt on MotorController over CAN.
-5. ✅ Syntax-checked all files.
-6. ✅ `damiao_joint.py` — **recreated from this spec** (the uni original was never committed;
-   replace it when available and verify the `damiao_motor` calls / `get_states()` keys).
-7. ✅ Hardware README section written (motors, CAN architecture, setup, sim-to-real hook).
-
-**Still pending:** bench hardware-in-the-loop verification (user-run), then the safety layer (§4).
-
-### UPDATE 2026-07-01 (sim side verified; hardware bring-up prep)
-- **MuJoCo sim2sim now works** for the `dodo_stand` policy. Root cause of the earlier
-  fall/shake: `sim_env.py` PD gains were stale (KP 30 / KD 0.5) vs the trained policy's
-  actuator cfg (`params/env.yaml`: ImplicitActuator **stiffness 32 / damping 3.0**). Fixed
-  `sim_env.py` → KP=32, KD=3.0. Robot now stands stably. **The same mismatch exists on the
-  real side:** `DamiaoJoint` / `dm_position_control.py` default kp=30 kd=0.5 and `DM_JOINTS`
-  in `motor_controller.py` sets kp=30 kd=0.5 — the trained target is kp≈32 kd≈3.0 (Damiao MIT
-  units differ, so treat as a calibration target, not a literal copy). TODO before deploy.
-- **Added `read_motor_state.py`** — read-only bench diagnostic that connects to the whole
-  configured fleet (DAMIAO_MOTORS + ODRIVE_MOTORS, kept in sync with `DM_JOINTS`/`OD_JOINTS`),
-  marks each motor ONLINE/OFFLINE, and streams parameters + live pos/vel/torque. Damiao read
-  LIMP (kp=kd=0) by default so joints are backdrivable — use it to verify each joint's
-  direction/sign matches the sim's +angle convention. py_compile-clean, **not yet hardware-run.**
-- **Deployment gaps found (blockers for `--backend real`):**
-  1. **IMU/body-state module is a hard dependency.** `OBS_STAND` = base_ang_vel(3) +
-     projected_gravity(3) + joint terms; both IMU terms come only from `/imu_states`. Without
-     the IMU node ("Jim"), `RealEnv` publishes zeros → policy is blind to tilt → cannot balance.
-  2. **Per-joint zero/calibration** must map the real motor zeros to the sim default pose
-     (hip 0 / upper_leg 0.2 / lower_leg -0.5 / foot 0.3 rad) and confirm sign per joint.
-  3. **Doc/code reconciliation:** `motor_controller.py` already implements a safety skeleton
-     (SAFETY_FACTOR 0.9 pos/vel/torque + e-stop), but §4 below and the README still describe
-     the 0.8→IDLE spec as pending. Decide clamp-vs-IDLE and the 0.8-vs-0.9 threshold, then
-     make docs + code agree.
-
-### UPDATE 2026-07-01 (b) — safety layer implemented in motor_controller.py
-Reconciled the safety layer with §4.1 and the professor's spec. Now in `motor_controller.py`:
-- **Physical joint limits from the URDF** (`JOINT_LIMITS_RAD`, `RATED_TORQUE_NM`,
-  `JOINT_VEL_LIMIT_RAD=6`) are the single source of truth. `_JointAdapter` converts them to
-  each motor's native units, so position commands are clamped to the real leg/body range
-  (hip ±0.35, upper_leg ±1.57, knee -3.14..1.40, ankle -1.05..1.57 rad) with a 0.9 margin.
-- **Torque → IDLE (professor's spec):** `|torque| > 0.8 * rated` → that ONE motor is disabled
-  (`_idle_joint`), fleet keeps running. `TORQUE_IDLE_FACTOR=0.8`, separate from `SAFETY_FACTOR`.
-- **Full e-stop** (disable-all) on: motor fault, over-speed (>0.9×6 rad/s), measured position
-  past the hard mechanical limit (+0.10 rad margin), stalled command stream (`CMD_WATCHDOG_S=0.5`),
-  or a live joint going silent (`FB_WATCHDOG_S=0.5`).
-- **Caveat (biped):** IDLE-ing one leg motor will make the robot fall — run on a gantry.
-- **Caveat (ODrive gearing):** turns↔rad assumes direct drive (1 turn = 2π rad). If the
-  ODrive joints are geared, both commands AND these limits must be divided by the gear ratio —
-  VERIFY before trusting the ODrive clamps. (Same note in the code.)
-- `py_compile`-clean; **not yet hardware-tested.** Still TODO: match real motor gains to the
-  trained kp≈32/kd≈3.0, and the IMU node (both from update (a)).
-
-### UPDATE 2026-07-06 — height domain randomization added to the stand policy (sim only)
-`dodo_rl/.../stand_env_cfg.py` now randomizes standing height for robustness: initial
-crouch varied across a ~±5 cm band (`_HEIGHT_JOINT_SCALE=(0.7,1.3)`, STAGE 1) + relaxed
-leg-joint pose anchoring (new `joint_deviation_legs`, `joint_deviation_all` re-scoped to
-hips) so the policy tolerates small standing-height / zero-calibration offsets on the real
-robot. **Robustness only — height is NOT commanded or observed**, so obs stays **30-dim**
-and the hardware side (`rl_env.py` / `RealEnv` / `run_policy.py` / `sim_env.py`) is
-**unchanged**. Retrain STAGE 1 (or resume from a STAGE-0 checkpoint) to bake it in; verify
-in PLAY that base height holds across a ~10 cm spread without falling. Tuning: `REWARD_TUNING.md` §9.
-
-### UPDATE 2026-10-30 — hardware repaired; URDF restored for Shafeef's training
+### 2026-10-30 — hardware repaired; URDF restored for Shafeef
 - **Hardware (user report):** all motor drivers have power again and the CAN daisy chain
   has full continuity. No motor has been commanded since.
 - **New plan:** Shafeef Omar trains the next policy himself, so `dodo_rl` (Isaac Lab) is
   mostly set aside. Work here is sim2real + hardware. He needs an up-to-date URDF
   including the IMU.
-- **`../dodo_files/` restored** (it was never in a repo; `sim_env`/tests expect it as a
-  sibling). Source: `liambansbach/legged-robot_rl_genesis` @ `1cfa733`,
-  `ressources/robots/dodo_daimao` (urdf + STL meshes). `dodo_rl`'s USD is byte-identical
-  to the one stored there. On the dev Mac, `test_sim2sim_consistency.py` gives 17 pass /
-  1 fail / 1 skip with it, the same as recorded on the robot PC.
+- **URDF restored** (it was never in a repo; `sim_env`/tests expected it as a sibling
+  `../dodo_files`, since moved into `description/`). Source:
+  `liambansbach/legged-robot_rl_genesis` @ `1cfa733`, `ressources/robots/dodo_daimao`
+  (urdf + STL meshes). `dodo_rl`'s USD is byte-identical to the one stored there.
+  `test_sim2sim_consistency.py` gives 17 pass / 1 fail / 1 skip with it, the same as on the
+  robot PC.
 - **URDF changes:** added `<mujoco><compiler fusestatic="false"/>`. Without it, MuJoCo's
-  URDF import fuses fixed links and an `imu_link` silently vanishes. Tests are unchanged
-  with it. `imu_link`/`imu_joint` are **pending the measured IMU pose**: position relative
-  to the hip-pitch axis, and orientation via `imu_sniff.py --axes`. `AXIS_REMAP` must equal
-  the `imu_joint` rotation. Handout notes for the trainer: `../dodo_files/README.md`.
-- **Finding:** `dodo_rl`'s USD has `hip_left` mass 0 in its physics layer. PhysX falls
-  back to about 0.44 kg from the convex hull, so the impact on past training was small.
-  Don't reuse that USD; regenerate it from the URDF.
+  URDF import fuses fixed links and an `imu_link` silently vanishes. `imu_link`/`imu_joint`
+  are pending the measured IMU pose (§2).
+- **Finding:** `dodo_rl`'s USD has `hip_left` mass 0 in its physics layer. PhysX falls back
+  to about 0.44 kg from the convex hull, so the impact on past training was small. Don't
+  reuse that USD; regenerate it from the URDF.
 
-### Decisions captured from the user (don't re-ask)
-- ODrive transport → **move to CAN** (same `can0` bus as DM). Same interface, different ids.
-- ODrive CAN config state → **unknown** → include the USB inspect/config step.
-- Start order → **CAN migration first** (before safety layer).
-- Bench now → **1 DM + 1 ODrive**; classes must be config-driven for the full fleet.
-- Torque safety threshold "0.8" → **normalized 0–1 of rated torque** (for the later safety step).
-- Policy training → **Shafeef trains it** (2026-10-30). This repo owns sim2real + hardware.
+### 2026-07-16 — calibration tool; first (incomplete) run; the ODrive joints are geared
+`calibrate_joints.py` was written and works. The calibration itself is **not done**: the
+first run produced a `joint_calib.py` that is incomplete and must be redone (don't command
+motion from it).
+- **The knee/ankle drives are geared, not direct.** `foot_left` and `foot_right`
+  independently measured **13.402** and **13.346** motor turns between their hard stops
+  (agreeing to 0.4 %, so real, repeatable stops). As `1 turn = 2π rad` that would be an
+  84 rad ankle. Against the URDF's ankle range it is roughly **32:1**; `lower_leg_left`
+  implies ~19.7, likely because the knee's real stops sit outside its URDF limits, so the
+  ratio is not yet trustworthy. With the wrong conversion the ODrive joints under-travel
+  ~32× ("nothing moves", not "drives into the stop").
+- **Known bad in `joint_calib.py`:** `upper_leg_left`/`upper_leg_right` missing entirely;
+  `lower_leg_right` never moved (stops 0.03 turns apart); both hips under-measured on one
+  side; both hips came back `sign=+1` (no mirroring — contradicts the July 6 suspicion;
+  re-measure). The `--check-persistence` verdict was not recorded.
+- The calibration flow is zero-first (~17 prompts): pose the crouch once, nudge each joint;
+  `--verify` proves the signs; `--limits` is an opt-in stop-walking pass.
+- ODrive node ids measured off the live bus: 3/4/7/8 (the drives are still on WS25's ids;
+  the web GUI never reached them). `fleet_config.py` became the single source of truth.
+- IMU firmware v2 flashed and verified (`imu_check.py`: scale 0.5 % off 1 g, gyro bias
+  ~1 °/s, 60 Hz).
+
+### 2026-07-06 (b) — real IMU firmware wired in; homing replaced by boot-pose startup
+*(On `zmq_dev`. The IMU parts are superseded: since 2026-10-30, `imu_service` uses main's
+v2 firmware + `imu_protocol.py`, and `imu.cpp` / the streaming firmware are gone.)*
+- IMU firmware committed (`imu.cpp`, Nicla Sense ME, poll-based `'L'` → `ALL …` raw
+  int16 counts). `imu_service.py` converted raw → SI with guessed ±8 g / ±2000 °/s. A
+  streaming firmware (`firmware/imu_stream_nicla/`, fused quaternion) was provided as a
+  recommended upgrade.
+- **No homing routine, ever** (user decision: a homing drive could overload the 3D-printed
+  structure and belts). Startup convention: power on with the ODrive joints folded all the
+  way back against their stops, then `dodo_ctl calibrate` maps turns-since-boot onto
+  `BOOT_POSE_RAD` (knees −3.1416 / ankles +1.57 rad = placeholders until the stop angles
+  and signs are bench-verified). Supporting changes: the drivers' `set_zero(current=…)`
+  ("joint is AT angle X"); `DamiaoJoint.send_limp()` (zero-gain MIT frame, since Damiaos
+  only report while enabled); a bumpless fail-closed `enable` (refuses silent joints,
+  presets setpoints at the measured positions, unparks out-of-band joints to the
+  safety-band edge over 1.5 s); a pre-start ramp in `ZmqEnv` (`run_policy --startup-ramp`,
+  on by default for zmq); `ZmqEnv` disables on close; and `tools/dodo_startup.py`
+  rehearses the whole ritual, including folding back down on exit.
+
+### 2026-07-06 — ZMQ migration implemented (Phases 0–2); ROS2 retired
+*(On `zmq_dev`; merged 2026-10-30.)* The team chose **ZMQ, not ROS2** for the real-time
+framework, implemented and tested on the dev Mac. The spec is in `docs/zmq.md`.
+- `dodo_ipc.py` (topics/ports, binary schemas, canonical joint order, CONFLATE
+  latest-value subscriber, ctl REQ/REP, rate loop); `motor_service.py` (safety layer
+  carried over verbatim, no auto-enable, per-joint flags, keeps publishing while
+  e-stopped); `imu_service.py`; `zmq_env.py` + `run_policy.py --backend zmq`;
+  `sim_service.py` (MuJoCo as a real-time virtual robot, which fixes the instructor's
+  "sim2sim isn't real time"); `tools/` (`zmq_echo`, `zmq_hz`, `dodo_ctl`); tests
+  `test_ipc.py` + `test_e2e_zmq.py`.
+- Measured (dev, separate processes): states 200.0 Hz and IMU 100.0 Hz with 0 drops, the
+  policy loop at 50.0 Hz with 0 overruns, state age at read 0.21 ms on average.
+
+### 2026-07-06 — height domain randomization added to the stand policy (sim only)
+`dodo_rl/.../stand_env_cfg.py` now randomizes standing height for robustness: the initial
+crouch varies across a ~±5 cm band (`_HEIGHT_JOINT_SCALE=(0.7,1.3)`, STAGE 1), and the
+leg-joint pose anchoring is relaxed (new `joint_deviation_legs`; `joint_deviation_all`
+re-scoped to the hips), so the policy tolerates small standing-height / zero-calibration
+offsets on the real robot. Robustness only: height is not commanded or observed, so the obs
+stays 30-dim and the hardware side is unchanged. Retrain STAGE 1 (or resume from a STAGE-0
+checkpoint) to bake it in. Tuning: `REWARD_TUNING.md` §9 in `dodo_rl`.
+
+### 2026-07-01 (b) — safety layer implemented (then in motor_controller.py)
+- **Physical joint limits** (`JOINT_LIMITS_RAD`, `RATED_TORQUE_NM`, `JOINT_VEL_LIMIT_RAD=6`)
+  are the single source of truth; `_JointAdapter` converts them to each motor's native
+  units, and position commands are clamped with a 0.9 margin.
+- **Torque → IDLE (professor's spec):** `|torque| > 0.8 × rated` disables that ONE motor;
+  the fleet keeps running.
+- **Full e-stop** (disable all) on: motor fault, over-speed (> 0.9 × 6 rad/s), measured
+  position past the hard limit (+0.10 rad margin), a stalled command stream
+  (`CMD_WATCHDOG_S=0.5`), or a live joint going silent (`FB_WATCHDOG_S=0.5`).
+- Caveat (biped): IDLE-ing one leg motor makes the robot fall — run on a gantry.
+
+### 2026-07-01 — sim side verified; hardware bring-up prep
+- **MuJoCo sim2sim works** for `dodo_stand`. The root cause of the earlier fall/shake was
+  stale PD gains in `sim_env.py` (KP 30 / KD 0.5) vs the trained ImplicitActuator
+  (stiffness 32 / damping 3.0, see `params/env.yaml`). Fixed to KP=32, KD=3.0. The same
+  mismatch exists on the real side (Damiao kp=30 kd=0.5) — an open bench task.
+- **`read_motor_state.py` added:** read-only diagnostic, marks each motor ONLINE/OFFLINE
+  and streams pos/vel/torque; Damiao read LIMP so joints are backdrivable.
+- Deployment gaps identified then: the IMU module as a hard dependency (since solved),
+  per-joint zero/sign calibration (still open), doc/code reconciliation of the safety spec
+  (done the same day).
+
+### 2026-06-18 — CAN migration implemented
+Both motor types moved behind one config-driven controller over CAN, with the
+`step()`/`get_observation()` hook: `odrive_can_setup.py` (USB tool that puts a drive on
+CAN), `odrive_can_joint.py` (CAN Simple driver), the unified motor controller (later
+ported to `motor_service.py`), a CAN bench demo, and `damiao_joint.py` recreated from spec
+(the original was never committed). `odrive_position_control.py` stays the USB
+gain-tuning tool.
 
 ---
 
-## 4. LONG-TERM ROADMAP (sequenced, after CAN migration)
-These are the user's next steps in order. NOT part of the current approved plan; the
-`step()`/`get_observation()` skeleton from the CAN milestone is the hook they build on.
+## 5. Technical notes (settled — don't re-litigate)
+- **SocketCAN gives every open socket its own copy of every frame**, so two motor types can
+  share a bus with one filtered socket each. `damiao_motor` 1.0.6's
+  `DaMiaoController.__init__` doesn't accept `can_filters`; apply them afterwards with
+  `bus.set_filters(...)`. Its frame router dispatches 8-byte frames by `data[0] & 0x0F`,
+  not by arbitration id, so on a shared bus the filter is mandatory.
+- **CAN Simple:** `arb_id = (node_id << 5) | cmd_id`. In use: `0x07` Set_Axis_State, `0x0B`
+  Set_Controller_Mode, `0x0C` Set_Input_Pos, `0x01` Heartbeat (RX), `0x09`
+  Get_Encoder_Estimates (RX), `0x1C` Get_Torques (RX). Axis states IDLE=1,
+  CLOSED_LOOP_CONTROL=8; POSITION_CONTROL=3; input mode PASSTHROUGH=1.
+- **Node ids on a shared bus:** 3/4/7/8 are collision-safe; node 0 (`0x000–0x01F`) swallows
+  every Damiao id, and node 63 collides with `0x7FF`.
+- **ODrive tuning (USB):** a buzz means `vel_gain` too high; slow oscillation means
+  `pos_gain` too high. Recipe: zero `vel_integrator_gain`, raise `vel_gain` to just before
+  the buzz then halve it, raise `pos_gain` to just before overshoot then back off, restore
+  the integrator ≈ 0.5 × `vel_gain`. Starting point: `pos_gain≈15–20`, `vel_gain≈0.05`,
+  `vel_integrator_gain≈0.1`. `save_configuration()` reboots the drive and drops USB
+  (handled in `OdriveJoint.save()`).
+- **The ODrive web GUI can't use the USB-CAN adapters**: `gs_usb` owns them ("Could not
+  claim interface 0"), and the GUI defaults to 125 kbps anyway. Use SocketCAN.
+- **Nicla:** USB-CDC doesn't reset on port open, so the first command after opening is
+  reliably dropped (`query_version` retries). At 115200 baud the poll capped at ~41 Hz;
+  v2 runs at 921600.
+- References on the robot PC: `~/Downloads/can_simple_utils.py`,
+  `~/Desktop/dodo_ros2/dodo/dodo/odrive_interface.py`,
+  `~/Documents/ros_odrive-main/odrive_node/src/odrive_can_node.cpp` (full cmd-id table).
 
-1. **Safety layer** (into `MotorController`):
-   - Joint position limits (already have `pos_min`/`pos_max` per joint).
-   - **Max joint torque threshold: 0.8 of rated torque reached → motor goes to IDLE.**
-     (Normalized 0–1 of each motor's rated torque. ODrive torque via Get_Torques `0x1C`;
-     DM torque via `get_states()["torq"]`.)
-   - **Max velocity** limit (ODrive has `vel_limit` config; DM needs a software check).
-   - General safety functions / e-stop → disable-all.
-2. **CAN connection to both motors + the input/output function** — largely the current
-   milestone; finalize the unified `step(action) -> observation` once safety is in.
-3. **IMU / body-state module (colleague "Jim")** — a Python module producing body
-   velocity, acceleration, raw pitch and yaw. Integrates into the FeedbackAggregator.
-4. **Two-class consolidation:** finalize **1 class for motor control** + **1 class for
-   feedback** (feedback comprehends both motor feedback AND IMU sensor feedback).
-5. **Isaac Lab substitution (final step):** in the simulation repo, replace the Isaac Lab
-   env/classes so they match this real-hardware env + classes — i.e. point the trained
-   policy at `MotorController.step()` / `FeedbackAggregator.get_observation()`.
-   - Sim repo: `dodo_rl/` (sibling folder), IsaacLab manager-based, rsl_rl PPO.
-   - **DEPLOYMENT CONSTRAINT (professor, 2026-06-18):** the policy must NOT observe
-     `base_lin_vel` (unreliable from IMU without heavier state estimation), and the first
-     target is a **stand-and-balance** policy (no velocity, no commands; resist mild pushes).
-   - Target obs layout (sim AND real must match):
-     `[ base_ang_vel(3), projected_gravity(3), joint_pos_rel(n), joint_vel(n), last_action(n) ]`
-     — produced on hardware by `MotorController.to_policy_vector(base_ang_vel, projected_gravity)`.
-   - **Done in `dodo_rl`:** `tasks/locomotion/stand_env_cfg.py` (`DodoStandEnvCfg` from the flat
-     env, drops `base_lin_vel` + `velocity_commands`, balance rewards, push events) +
-     `DodoStandPPORunnerCfg` + registered `Dodo-Stand-v0` / `Dodo-Stand-Play-v0`. Syntax-checked
-     only — needs a real Isaac Sim run; confirm `mdp.is_alive` / `mdp.push_by_setting_velocity`.
-
----
-
-## 5. Environment / gotchas
-- Python: system `python3` (3.10) uses `~/.local/lib/python3.10/site-packages`. Installed:
-  `odrive` 0.6.11.post0, `python-can`, `damiao_motor` 1.0.6. (There's also an editable
-  `damiao_motor` 1.0.7b2 in the uv cache — the regular 1.0.6 is what `python3` imports.)
-- `damiao_motor` editable source (for reading internals):
-  `/home/dodo/Documents/dodo/Damiao Control/python-damiao-driver/damiao_motor/`
-- Damiao units = **radians**; ODrive units = **turns** (1 turn = 2π rad). Keep native per
-  joint for now; the rad/turns convention for the *policy vector* gets fixed in the Isaac Lab step.
-- `can0` bitrate is set at OS level (`ip link`), NOT by python-can, for socketcan.
-- The user separately asked about turning these files into a standalone git repo — answer was
-  yes, the 4 files are self-contained (only cross-import by name + pip deps); just copy them
-  into one folder and `git init`. requirements: `odrive==0.6.11.post0`, `python-can`, `damiao_motor==1.0.6`.
-
----
-
-## 6. How to continue (for the next Claude)
-1. Read the approved plan: `/home/dodo/.claude/plans/ethereal-wondering-horizon.md`.
-2. Skim the existing classes (`damiao_joint.py`, `odrive_position_control.py`) to match style/interface.
-3. Skim the references in §3 (`can_simple_utils.py`, `odrive_interface.py`, `odrive_can_node.cpp`).
-4. Implement files 1→4 from §3 (CAN migration), syntax-check, then hand the bench
-   verification steps to the user (hardware-in-the-loop, they run them).
-5. Keep both motor types on the **identical interface** — that's the load-bearing principle.
+## 6. Environment / gotchas
+- Robot PC: system `python3` (3.10). `pip install -r requirements.txt` (pyzmq, mujoco,
+  onnxruntime, python-can, `damiao_motor==1.0.6`, pyserial). `odrive==0.6.11.post0` only
+  for the USB tools. There is also an editable `damiao_motor` 1.0.7b2 in the uv cache; the
+  regular 1.0.6 is what `python3` imports. Its source, for reading internals:
+  `/home/dodo/Documents/dodo/Damiao Control/python-damiao-driver/damiao_motor/`.
+- CAN bitrates are set at OS level (`ip link`), never by python-can.
+- `can0`/`can1` are enumeration order, not identity: use the udev names
+  `can_dm`/`can_od`.
+- The direct-CAN tools (`read_motor_state`, `calibrate_joints`, `visualize_motor_state`,
+  `odrive_can_scan`) and `motor_service` all open the buses: run one at a time.
+- Pausing the policy runner (a debugger, a viewer) stops the command stream, and
+  `motor_service` e-stops after 0.5 s by design. `dodo_ctl estop_reset` recovers.
