@@ -21,8 +21,8 @@ pre-merge ROS2 stack and its old docs, so work from the branch:
 git clone git@github.com:cecimaltese/dodo_rl_hardware_S26.git && cd dodo_rl_hardware_S26
 git switch merge-zmq-dev
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # Python >= 3.10
-.venv/bin/python -m pytest   # 62 passed, 1 known failure, 1 skip
-                             # (59 passed, 4 skips without dodo_rl next to the repo)
+.venv/bin/python -m pytest   # 140 passed, 1 known failure, 1 skip
+                             # (137 passed, 4 skips without dodo_rl next to the repo)
 ```
 Then read §2. A Claude session's local memory doesn't travel between machines; this file
 does.
@@ -38,31 +38,28 @@ contract it was trained with. `motor_service` + `imu_service` are the robot,
 
 ---
 
-## 2. Current state (2026-10-30)
+## 2. Current state (2026-11-01)
 The subsystem table is in the README (*Status*). In short: everything is verified in sim,
 and nothing has been commanded on the robot yet.
 - **Verified:** the stand policy in MuJoCo (30 s+ lockstep; 10 s through the full ZMQ
   stack), the IMU on the bench, and power + CAN continuity on the repaired robot. The test
-  suite runs anywhere: 62 passed, 1 known failure (the joint-order guard), 1 skip (stale
-  flat run); without `dodo_rl` beside the repo, 59 passed and 4 training-side skips. Also
+  suite runs anywhere: 140 passed, 1 known failure (the joint-order guard), 1 skip (stale
+  flat run); without `dodo_rl` beside the repo, 137 passed and 4 training-side skips. Also
   checked from a clean export in a fresh Python 3.10 venv built from `requirements.txt`
-  (3.10 is the robot PC's version).
-- **Never run on hardware:** `motor_service`, the safety layer, any commanded motion.
+  (3.10 is the robot PC's version). `imu_locate.py` was rehearsed end to end against a
+  simulated IMU (2026-11-01 log).
+- **Never run on hardware:** `motor_service`, the safety layer, any commanded motion,
+  `imu_locate.py`.
 
 **Next steps, in order:**
-1. **IMU pose → URDF + `AXIS_REMAP`** (Shafeef is waiting for the URDF). Measure the
-   board's position relative to the hip-pitch axis, midway between the legs (x forward,
-   y left, z up, ±5 mm is plenty). Get the orientation from `imu_sniff.py --axes` and paste
-   its `AXIS_REMAP` into `imu_protocol.py`. Then, in `description/urdf/dodo_daimao.urdf`:
-   - add an `imu_link` with a small explicit inertial (the Nicla is a 23 × 23 mm board of
-     a few grams), so no importer that keeps fixed links has to invent a mass;
-   - add a fixed `imu_joint` from `body` at the measured position. Its rotation must equal
-     `AXIS_REMAP`: the rows are body axes in board terms, so `v_body = R · v_board`, which
-     is exactly what a URDF joint rotation means. URDF `rpy` is extrinsic xyz:
-     `scipy.spatial.transform.Rotation.from_matrix(R).as_euler("xyz")`;
-   - verify by loading the URDF in MuJoCo (the `<mujoco>` block keeps `imu_link`) and
-     comparing `imu_link`'s `body_quat` with `AXIS_REMAP`;
-   - fill the IMU table in `description/README.md`.
+1. **IMU pose → URDF + `AXIS_REMAP`** (Shafeef is waiting for the URDF). Robot PC, motor
+   power off, legs hanging straight, `imu_service` stopped:
+   `python3 imu_locate.py measure`. That's three resting poses plus four ruler readings
+   from the hip-pitch axis, and it writes `description/imu_mount.json`, the URDF's
+   `imu_link`/`imu_joint`, `AXIS_REMAP` and the README's IMU table, then checks them and
+   runs a live tilt test. Procedure, diagrams and troubleshooting: **`docs/imu_locate.md`**.
+   Commit those four files, send Shafeef `description/`, and record the three quality
+   numbers it prints in the log here.
 
    Optional: weigh the robot (the CAD says 4.72 kg).
 2. **Merge `merge-zmq-dev` into `main`** once the team has looked at it (it's on origin).
@@ -110,10 +107,46 @@ and nothing has been commanded on the robot yet.
 - The repo is self-contained (2026-10-30): robot description in `description/`, reference
   policy in `policies/`. It is meant to move to an ATARI lab repo.
 - Policy training → **Shafeef trains it** (2026-10-30). This repo owns sim2real + hardware.
+- IMU pose → **one record, `description/imu_mount.json`** (2026-11-01). `imu_locate.py`
+  generates the URDF's `imu_link`/`imu_joint`, `AXIS_REMAP` and the README's IMU table
+  from it; never edit those by hand. Orientation is snapped to the nearest square
+  mounting unless `--exact`. Position is measured by hand, since it only affects raw
+  accelerometer readings, which the policy doesn't observe.
 
 ---
 
 ## 4. Log (newest first)
+
+### 2026-11-01 — `imu_locate.py`: measure the IMU pose and write it everywhere
+Prep for the bench session on 2026-11-02. Not run on the real IMU yet.
+- **Why:** the IMU pose was a manual recipe (`imu_sniff --axes` → paste `AXIS_REMAP` →
+  hand-write `imu_link`/`imu_joint` → convert to rpy → check in MuJoCo → README). That is
+  five places to get a sign wrong, two of which must agree exactly.
+- **What:** `imu_locate.py measure | apply | check [--live]`. The record
+  `description/imu_mount.json` is the single source; the URDF block (between
+  `BEGIN/END imu_locate.py` markers), `AXIS_REMAP` and the README rows are generated from
+  it.
+  - Orientation from three resting poses. Level gives z. Nose-down and left-side-down each
+    give the heading, and their disagreement is a cross-check that catches a pose done
+    the wrong way round. The result is snapped to the nearest square mounting; it refuses
+    above 10° (`--exact` keeps the fit).
+  - Position from four ruler readings: offsets from the hip-pitch axis, whose x/z come
+    from the URDF, and a left/right mirror pair for y.
+  - `check` compares the record, URDF, `AXIS_REMAP`, MuJoCo's import and `sim_env`'s
+    model. `--live` tilts the robot through the deployment path (`imu_protocol` →
+    `imu_service` scales → `ZmqEnv` projected gravity).
+- **`imu_sniff.py --axes`** now runs `imu_locate`'s solver (read-only), so there is one
+  implementation.
+- **Tests:** `test_imu_locate.py`, against a fake Nicla, covers all 24 square mountings
+  including gimbal lock, wrong-way and skipped poses, an angled board, the files,
+  MuJoCo, and the live check. Mutating the solver signs, the y formula, the URDF rotation
+  or the live-check signs makes it fail. Suite: 140 passed, 1 known failure, 1 skip.
+- **Rehearsed:** the full `measure` CLI against a fake Nicla on a pty, plus the partial
+  re-measures, `apply`/`check`, hand-edit detection and `imu_sniff --axes`. With a
+  measured, gimbal-locked mounting written into a repo copy (no `dodo_rl`), the whole
+  suite still passed (137 passed, 4 skips): the stack accepts a non-identity
+  `AXIS_REMAP` and an `imu_link`.
+- **Open:** the IMU mass (5 g) is a guess. Untested against real-sensor noise.
 
 ### 2026-10-30 (b) — zmq_dev and main merged; repo made self-contained
 On branch `merge-zmq-dev`, pushed to origin, not yet merged into `main`. `zmq_dev`

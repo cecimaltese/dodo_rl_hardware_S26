@@ -30,7 +30,7 @@ decisions behind it.
 | **Hardware** | ✅ Every motor driver powered, CAN daisy chain continuous (repaired 2026-10-30). |
 | **ZMQ stack** | ✅ Reconciled with main's July work 2026-10-30. In sim, the stand policy balances 10 s through `sim_service` + `ZmqEnv`. ⚠️ Never run against `motor_service` on the robot. |
 | **Sim → sim (MuJoCo)** | ✅ The `dodo_stand` policy stands 30 s+. |
-| **IMU** | ✅ Verified on hardware (firmware v2): scale 0.5 % off 1 g, gyro bias ~1 °/s, ~60 Hz. Now mounted on the robot; its pose (`AXIS_REMAP`, URDF `imu_link`) is not measured yet. |
+| **IMU** | ✅ Verified on hardware (firmware v2): scale 0.5 % off 1 g, gyro bias ~1 °/s, ~60 Hz. Now mounted on the robot; its pose (`AXIS_REMAP`, URDF `imu_link`) is not measured yet: `imu_locate.py` ([docs/imu_locate.md](docs/imu_locate.md)). |
 | **Safety layer** | ✅ In `motor_service`: position/velocity clamps, 0.8 × rated torque → that motor IDLE, e-stop. ⚠️ Never exercised on hardware. |
 | **Motor control** | ⚠️ Never run on a motor. |
 | **Sign / zero calibration** | ❌ **The blocker.** `calibrate_joints.py` works; the July run is incomplete and must be redone, and `motor_service` doesn't apply measured signs or stops yet. |
@@ -108,8 +108,9 @@ identity: a replug can silently swap them. A udev rule pins each adapter by seri
 gyro, accelerometer and an on-chip accel+gyro fusion quaternion (no magnetometer next to
 eight motors). It supplies 6 of the 30 policy inputs, so `ZmqEnv` refuses to run on a
 missing or stale IMU stream. `AXIS_REMAP` in `imu_protocol.py` rotates the board axes into
-the body frame and must match the URDF's IMU pose; both are still unmeasured. Flashing:
-`firmware/README.md`.
+the body frame and must match the URDF's IMU pose. `imu_locate.py` measures both on the
+robot and writes them from one record, `description/imu_mount.json`
+([docs/imu_locate.md](docs/imu_locate.md)); not measured yet. Flashing: `firmware/README.md`.
 
 ## Bring-up
 
@@ -135,7 +136,7 @@ python3 calibrate_joints.py                      # pose the crouch once, nudge e
 python3 calibrate_joints.py --verify             # prove the signs by hand
 python3 calibrate_joints.py --limits             # hard stops -> sim_lo/sim_hi
 python3 visualize_motor_state.py                 # optional: the model follows your hands
-python3 imu_sniff.py --axes                      # IMU mounted -> AXIS_REMAP
+python3 imu_locate.py measure                    # IMU mounted -> URDF imu_link + AXIS_REMAP
 
 # 4) Services. Power on with knees and ankles folded back against their stops.
 python3 motor_service.py                         # starts DISABLED
@@ -219,11 +220,13 @@ the robot.
 | `read_motor_state.py`, `visualize_motor_state.py` | Read-only fleet diagnostics: a live table, or a MuJoCo model that follows the robot. |
 | `odrive_can_scan.py`, `odrive_can_setup.py`, `odrive_position_control.py` | ODrive: find nodes on a bus; put a drive on CAN (USB, once per drive); tune gains (USB). |
 | `imu_check.py`, `imu_sniff.py` | IMU acceptance test; raw dump, range cross-check, `--axes`. |
+| `imu_locate.py` | Measures the IMU mount (three poses + a ruler) and writes the URDF's `imu_link`, `AXIS_REMAP` and the IMU table from `description/imu_mount.json`; `check --live` verifies on the robot. |
 | `tools/` | `dodo_ctl.py` (ctl CLI), `dodo_startup.py` (power-on ritual without a policy), `zmq_echo.py` and `zmq_hz.py` (topic echo and rate). |
 | `demo_combined.py` | Sine-drive any joints through the full service stack. |
 | `description/` | URDF + meshes of the robot as built, with a README for whoever trains on it. |
 | `policies/` | The reference `dodo_stand` run the tests use. |
 | `docs/zmq.md` | ZMQ topic and schema spec. |
+| `docs/imu_locate.md` | Bench procedure for measuring the IMU pose. |
 | `HANDOFF.md` | Current state, decisions, history. |
 | `dm_position_control.py`, `odrive_joint.py` | Early single-motor scripts, kept for reference; unused. |
 
@@ -236,15 +239,17 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # any OS, P
 
 Everything runs on any machine without hardware: the message layer (`test_ipc.py`), the
 service stack against a synthetic robot plus the stand policy through it
-(`test_e2e_zmq.py`), boot-calibration math, IMU parsing, the fleet config, and the
-Isaac Lab ↔ MuJoCo contract (`test_sim2sim_consistency.py`). There is one known failure:
+(`test_e2e_zmq.py`), boot-calibration math, IMU parsing, the IMU mount measurement
+against a simulated IMU (`test_imu_locate.py`), the fleet config, and the Isaac Lab ↔
+MuJoCo contract (`test_sim2sim_consistency.py`). There is one known failure:
 `test_behavior_wrong_order_falls`. The stand policy also stands with left and right swapped,
 so that guard can't detect a joint-order regression.
 
 ## Next steps
 
-1. Measure the IMU pose on the robot: `imu_link` in the URDF, and `AXIS_REMAP`. Shafeef
-   needs the URDF.
+1. Measure the IMU pose on the robot: `python3 imu_locate.py measure`
+   ([docs/imu_locate.md](docs/imu_locate.md)) writes `imu_link` into the URDF and
+   `AXIS_REMAP`. Shafeef needs the URDF.
 2. Commit `99-dodo-can.rules` from the robot PC (and its MJCF `dodo_daimao.xml`, if the
    meshed view in `visualize_motor_state.py` is wanted).
 3. Measure the knee/ankle gear ratio and put it into `fleet_config.py` and every rad ↔ turns

@@ -23,7 +23,7 @@ Checks, in order — each prints PASS/FAIL and the number it judged on:
 Exit 0 = every check passed (or skipped). Exit 1 = something is wrong.
 
 NOT checked here: whether AXIS_REMAP matches the robot. That needs the IMU bolted to
-the frame -- use `imu_sniff.py --axes`. This tool only proves the IMU itself is sane.
+the frame -- use `imu_locate.py measure`. This tool only proves the IMU itself is sane.
 """
 
 import argparse
@@ -161,7 +161,7 @@ def main():
               f"projected_gravity z = {pg_a[2]:+.3f} (want -1.0 when level and z-up)")
         if abs(pg_a[2] + 1.0) >= 0.1:
             print("           -> board is not level, OR its axes don't match the base")
-            print("              frame yet. Once mounted: `imu_sniff.py --axes`.")
+            print("              frame yet. Once mounted: `imu_locate.py measure`.")
 
     # ---- 7. RATE --------------------------------------------------------------
     hz = len(samples) / elapsed
@@ -178,7 +178,7 @@ def main():
         print(f"  RESULT: FAIL — {', '.join(_fails)}\n")
         return 1
     print("  RESULT: PASS — IMU is sane and delivering what the policy needs.")
-    print("          (AXIS_REMAP still unverified — needs the robot: imu_sniff.py --axes)\n")
+    print("          (AXIS_REMAP vs the robot: `imu_locate.py check --live`)\n")
     return 0
 
 

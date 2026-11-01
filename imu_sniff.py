@@ -10,18 +10,20 @@ Answers the three questions imu_service.py cannot answer from source alone:
                      the LSB-per-g scale — that pins the accel range directly.
                      --gyro-cal pins the gyro range (the one that actually matters:
                      it feeds base_ang_vel, where an error does NOT cancel).
-  3. AXIS FRAME    — --axes builds the board -> robot-base remap from three poses.
+  3. AXIS FRAME    — --axes prints the board -> robot-base remap from three poses
+                     (read-only; imu_locate.py measures it and writes it everywhere).
 
 Usage:
     python3 imu_sniff.py                       # dump + verdict on the format & accel range
     python3 imu_sniff.py --port /dev/ttyACM0   # Nicla usually enumerates as ttyACM*
     python3 imu_sniff.py --gyro-cal            # pin the gyro range (do this one!)
-    python3 imu_sniff.py --axes                # build AXIS_REMAP for imu_protocol.py
+    python3 imu_sniff.py --axes                # print AXIS_REMAP (imu_locate.py writes it)
 
 Firmware v2 self-reports its ranges over 'V', so the range checks here are an
 INDEPENDENT cross-check of the chip rather than the source of truth. On v2 the only
-thing you must still set by hand is AXIS_REMAP (in imu_protocol.py) — and that needs
-the IMU bolted to the robot. On v1, --gyro-cal IS the source of truth.
+thing left to measure is the mounting (AXIS_REMAP + the URDF's imu_link), which needs
+the IMU bolted to the robot: `imu_locate.py measure`. On v1, --gyro-cal IS the source
+of truth.
 """
 
 import argparse
@@ -267,61 +269,20 @@ def cmd_gyro_cal(ser, ver=None):
 
 
 # ---------------------------------------------------------------------------
-def cmd_axes(ser):
-    """Build AXIS_REMAP: IMU board frame -> robot base frame (x fwd, y left, z up).
+def cmd_axes(ser, ver=None):
+    """Print AXIS_REMAP (IMU board frame -> robot base frame) from three poses.
 
-    At rest the accelerometer reads +1 g along whichever board axis points UP (it
-    measures proper acceleration, not gravity). So each pose reveals one base axis.
+    The pose logic lives in imu_locate.py, which also writes the result into
+    imu_protocol.py and the URDF. This stays as a read-only shortcut and imports it
+    lazily, so the plain dump keeps needing nothing but pyserial.
     """
-    print("\n=== AXIS REMAP ===")
-    print("Robot base frame = x FORWARD, y LEFT, z UP (URDF convention).")
-    print("At rest the accelerometer reads +1 g along the board axis pointing UP.\n")
+    import imu_locate
 
-    def pose(prompt):
-        input(f"  {prompt}\n    press Enter when held steady... ")
-        a = mean_axis(collect(ser, 30, "reading:"), 0)
-        mag = math.sqrt(sum(c * c for c in a)) or 1.0
-        unit = [c / mag for c in a]
-        i = max(range(3), key=lambda k: abs(unit[k]))
-        print(f"    accel unit = ({unit[0]:+.2f}, {unit[1]:+.2f}, {unit[2]:+.2f})"
-              f"  -> dominant board axis {AXES[i]}{'+' if unit[i] > 0 else '-'}"
-              f" ({abs(unit[i]) * 100:.0f}%)")
-        if abs(unit[i]) < 0.8:
-            print("    WARNING: no axis clearly dominant — the pose is off, or the board")
-            print("             is mounted at an angle (a pure remap can't fix that).")
-        return i, (1 if unit[i] > 0 else -1)
-
-    print("POSE 1/3 — identifies base +Z (up)")
-    zi, zs = pose("Stand the robot LEVEL, in its normal standing pose.")
-
-    print("\nPOSE 2/3 — identifies base +X (forward)")
-    print("  Nose-down tips base +x downward, so gravity gains a +x component and")
-    print("  the accelerometer's x reads NEGATIVE. The sign is handled for you.")
-    xi, xs = pose("Pitch the robot NOSE-DOWN ~90 deg (front face toward the floor).")
-    xs = -xs
-
-    print("\nPOSE 3/3 — identifies base +Y (left)")
-    print("  Same logic: roll left-side-down -> accel reads negative along base y.")
-    yi, ys = pose("Roll the robot LEFT-SIDE-DOWN ~90 deg.")
-    ys = -ys
-
-    print("\n=== RESULT ===")
-    if len({xi, yi, zi}) != 3:
-        print("  FAIL — two poses picked the SAME board axis. The poses were ambiguous")
-        print("  or the board is mounted skew. Repeat with cleaner 90 deg poses.")
+    got = imu_locate.measure_orientation(ser, ver)
+    if got is None:
         return
-
-    rows = [[0, 0, 0] for _ in range(3)]
-    rows[0][xi], rows[1][yi], rows[2][zi] = xs, ys, zs
-    print("  base_x <- board", f"{'+-'[xs < 0]}{AXES[xi]}")
-    print("  base_y <- board", f"{'+-'[ys < 0]}{AXES[yi]}")
-    print("  base_z <- board", f"{'+-'[zs < 0]}{AXES[zi]}")
-    print("\n  PASTE INTO imu_protocol.py:\n")
-    print("AXIS_REMAP = ((%2d, %2d, %2d)," % tuple(rows[0]))
-    print("              (%2d, %2d, %2d)," % tuple(rows[1]))
-    print("              (%2d, %2d, %2d))" % tuple(rows[2]))
-    print("\n  Then verify: level robot -> imu_service publishes accel ~ (0, 0, +9.81)")
-    print("  and ZmqEnv's projected_gravity ~ (0, 0, -1). That is the acceptance test.")
+    print("\n  Nothing written. To put this into imu_protocol.py AND the URDF, run")
+    print("  `python3 imu_locate.py measure` (docs/imu_locate.md).")
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +320,7 @@ def main():
         if args.gyro_cal:
             cmd_gyro_cal(ser, ver)
         elif args.axes:
-            cmd_axes(ser)
+            cmd_axes(ser, ver)
         else:
             cmd_dump(ser, args.count, ver)
     except KeyboardInterrupt:

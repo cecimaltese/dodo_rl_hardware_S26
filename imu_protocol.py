@@ -88,8 +88,10 @@ ACCEL_LSB_TO_M_S2 = (ACCEL_RANGE_G / 32768.0) * 9.80665
 # Axis remap: IMU board frame -> robot base frame (x forward, y left, z up).
 # Identity until measured on the assembled robot. A wrong remap is SILENT and has
 # the same character as the L/R motor mirroring: the policy gets plausible-looking
-# numbers that mean the wrong thing. Verify with `imu_sniff.py --axes` before any
-# real run, then encode the permutation/signs here (rows = base axes in IMU terms).
+# numbers that mean the wrong thing. Rows = base axes in IMU terms, so
+# v_base = AXIS_REMAP @ v_board; the URDF's imu_joint carries the same rotation.
+# WRITTEN BY `imu_locate.py` from description/imu_mount.json, together with the
+# URDF: measure with `imu_locate.py measure`, don't edit by hand (`check` would flag it).
 AXIS_REMAP = ((1, 0, 0),
               (0, 1, 0),
               (0, 0, 1))
