@@ -59,8 +59,8 @@ reads what the real chip reads.
 
 | | |
 |---|---|
-| Position in `body` frame | _pending: measured on the robot_ |
-| Orientation (`imu_joint` rpy) | _pending: measured on the robot_ |
+| Position in `body` frame | x +14.2, y +0.0, z +95.0 mm (measured 2026-11-02) |
+| Orientation (`imu_joint` rpy) | 3.1416 0 1.5708 rad: chip +x -> left, chip +y -> forward, chip +z -> down |
 | Gyro | ±1000 °/s |
 | Accelerometer | ±4 g |
 | Orientation | on-chip accel+gyro fusion quaternion (no magnetometer): roll/pitch are gravity-referenced, yaw drifts |

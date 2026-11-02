@@ -92,9 +92,9 @@ ACCEL_LSB_TO_M_S2 = (ACCEL_RANGE_G / 32768.0) * 9.80665
 # v_base = AXIS_REMAP @ v_board; the URDF's imu_joint carries the same rotation.
 # WRITTEN BY `imu_locate.py` from description/imu_mount.json, together with the
 # URDF: measure with `imu_locate.py measure`, don't edit by hand (`check` would flag it).
-AXIS_REMAP = ((1, 0, 0),
-              (0, 1, 0),
-              (0, 0, 1))
+AXIS_REMAP = (( 0,  1,  0),
+              ( 1,  0,  0),
+              ( 0,  0, -1))
 
 
 def _remap(x: float, y: float, z: float) -> Tuple[float, float, float]:

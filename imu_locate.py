@@ -18,7 +18,8 @@ they can't drift apart.
                direction are the same everywhere on a rigid body. Only raw
                accelerometer readings depend on where the chip sits.
 
-Usage — robot PC, IMU on USB, motors unpowered. Step by step: docs/imu_locate.md.
+Usage — robot PC or a Mac (then --port /dev/cu.usbmodem*), IMU on USB, motors unpowered.
+Step by step: docs/imu_locate.md.
     python3 imu_locate.py measure                    # poses + tape measure -> write -> check
     python3 imu_locate.py measure --skip-position    # redo only the orientation
     python3 imu_locate.py measure --skip-orientation # redo only the position
@@ -691,7 +692,7 @@ def _open(args):
         ser, _, ver = proto.open_imu(args.port, args.baud)
     except (RuntimeError, AttributeError) as e:   # AttributeError: pyserial missing
         sys.exit(f"{e}\n  Is imu_service.py (or a serial monitor) holding the port? "
-                 f"`ls /dev/ttyACM*` to find it.")
+                 f"`ls /dev/ttyACM*` (Linux) or `ls /dev/cu.usbmodem*` (Mac) to find it.")
     ser.timeout = 0.2
     return ser, ver
 

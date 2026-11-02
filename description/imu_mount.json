@@ -1,0 +1,35 @@
+{
+  "_comment": "IMU mount on `body`. Written by imu_locate.py measure; imu_locate.py apply turns it into the URDF, AXIS_REMAP and README.",
+  "axis_remap": [
+    [0, 1, 0],
+    [1, 0, 0],
+    [0, 0, -1]
+  ],
+  "xyz_m": [0.0142, 0.0, 0.095],
+  "mass_kg": 0.005,
+  "box_m": [0.023, 0.023, 0.005],
+  "note": "",
+  "orientation": {
+    "mode": "snapped",
+    "snap_gap_deg": 4.73,
+    "crosscheck_deg": 0.43,
+    "level_tilt_deg": 4.44,
+    "up_board": {
+      "level": [0.0449, -0.063, -0.997],
+      "nose_down": [0.0309, -0.9973, 0.0664],
+      "left_down": [-0.9983, -0.0268, -0.052]
+    },
+    "measured": "2026-11-02",
+    "firmware": 2
+  },
+  "position": {
+    "method": "hand",
+    "measured": "2026-11-02",
+    "inputs_mm": {
+      "forward": 15.0,
+      "up": 95.0,
+      "left": 150.0,
+      "right": 150.0
+    }
+  }
+}

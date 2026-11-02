@@ -29,6 +29,21 @@ git pull
 python3 -m pytest test_imu_locate.py -q          # all pass, no hardware needed
 ```
 
+**Or on a Mac.** `imu_locate.py` only needs the IMU's serial port, the files and MuJoCo,
+so any machine with the repo works: move the Nicla's USB cable from the robot PC to the
+Mac (make sure it's long enough for the robot to lie on its front and side). Checked on
+2026-11-02: the full suite and a complete `measure` run against a fake Nicla on a macOS
+pseudo-terminal pass.
+```bash
+git switch merge-zmq-dev && git pull
+python3.10 -m venv .venv && .venv/bin/pip install -r requirements.txt   # once
+.venv/bin/python -m pytest test_imu_locate.py -q
+ls /dev/cu.usbmodem*        # the Nicla. Use cu.*, not tty.* (tty.* blocks on open)
+```
+Then run every command below as `.venv/bin/python …` instead of `python3 …`, with
+`--port /dev/cu.usbmodemXXXX` added (the default port, `/dev/ttyACM0`, only exists on
+Linux). Commit and push from the Mac; the robot PC just pulls later.
+
 **Bring:**
 - a steel rule (a caliper with a depth rod is nicer);
 - something with a right angle: a square, or a sturdy box;
@@ -41,7 +56,8 @@ python3 -m pytest test_imu_locate.py -q          # all pass, no hardware needed
   be enabled, so don't run `motor_service`.
 - **Legs hanging straight down, not splayed** (hip roll ≈ 0). The position is measured
   from the hip-pitch axis, and that axis only sits at its URDF place with hip roll at 0.
-- IMU on USB to the robot PC. **Stop `imu_service.py`**: it holds the serial port.
+- IMU on USB to the machine you run from. On the robot PC, **stop `imu_service.py`**: it
+  holds the serial port.
 
 ---
 
@@ -114,7 +130,7 @@ origin lies on it, midway between the legs. The tool takes its exact place from 
 (x = −0.75 mm, z = 0).
 
 ```
-SIDE VIEW, from the robot's left (nose pointing right →)
+SIDE VIEW, standing at the robot's RIGHT side (nose pointing right →)
 
                                  ● chip
                                  ┆
@@ -227,7 +243,7 @@ measure again.
 
 | Symptom | Cause → fix |
 |---|---|
-| `no IMU response on /dev/ttyACM0` | `imu_service` or a serial monitor holds the port, or it's another port: stop it; `ls /dev/ttyACM*`; `--port`. |
+| `no IMU response on /dev/ttyACM0` | `imu_service` or a serial monitor holds the port, or it's another port: stop it; `ls /dev/ttyACM*` (Linux) or `ls /dev/cu.usbmodem*` (Mac); `--port`. |
 | "it was moving" over and over | Rest the robot on the table instead of holding it. |
 | "… readings are N deg apart; they should be ~90" | A pose was skipped, or the robot wasn't turned far enough. |
 | "disagree by ~180 deg about which way is forward" | Nose-*up* instead of nose-down, or *right* side down instead of left. Answer Y to redo. |

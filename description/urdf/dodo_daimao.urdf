@@ -424,4 +424,24 @@
     <child link="foot_sole_left" />
   </joint>
 
+  <!-- BEGIN imu_locate.py: generated from ../imu_mount.json. Edit the record and run
+       `python3 imu_locate.py apply`, not this block. -->
+  <!-- IMU: Arduino Nicla Sense ME (Bosch BHI260AP). imu_link's axes are the
+       chip's own axes; the joint rotation equals imu_protocol.AXIS_REMAP
+       (v_body = R v_imu). Its inertial is board + mount, a few grams. -->
+  <link name="imu_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <mass value="0.005" />
+      <inertia ixx="2.308e-07" ixy="0" ixz="0" iyy="2.308e-07" iyz="0" izz="4.408e-07" />
+    </inertial>
+  </link>
+
+  <joint name="imu_joint" type="fixed">
+    <origin xyz="0.0142 0 0.095" rpy="3.141592654 0 1.570796327" />
+    <parent link="body" />
+    <child link="imu_link" />
+  </joint>
+  <!-- END imu_locate.py -->
+
 </robot>

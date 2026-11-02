@@ -13,7 +13,9 @@ by reading these. Keep §2 and the log honest (mark what's done, note what's unt
 record decisions). If you change code, reflect it here in the same turn.
 
 Machines: the robot is driven from an Ubuntu PC (repo under `/home/dodo/Documents/dodo/`);
-development happens on Macs. Anything touching hardware can only run on the robot PC.
+development happens on Macs. Anything touching the motors/CAN can only run on the robot PC.
+The IMU is plain USB serial, so `imu_check.py` and `imu_locate.py` also run from a Mac
+with the Nicla plugged into it (`--port /dev/cu.usbmodem*`).
 
 **Resuming on any machine.** Until `merge-zmq-dev` is merged, `main` still has the
 pre-merge ROS2 stack and its old docs, so work from the branch:
@@ -52,9 +54,10 @@ and nothing has been commanded on the robot yet.
   `imu_locate.py`.
 
 **Next steps, in order:**
-1. **IMU pose → URDF + `AXIS_REMAP`** (Shafeef is waiting for the URDF). Robot PC, motor
-   power off, legs hanging straight, `imu_service` stopped:
-   `python3 imu_locate.py measure`. That's three resting poses plus four ruler readings
+1. **IMU pose → URDF + `AXIS_REMAP`** (Shafeef is waiting for the URDF). Robot PC or a
+   Mac (Nicla's USB moved to it), motor power off, legs hanging straight, `imu_service`
+   stopped: `python3 imu_locate.py measure` (Mac: `.venv/bin/python imu_locate.py measure
+   --port /dev/cu.usbmodem…`). That's three resting poses plus four ruler readings
    from the hip-pitch axis, and it writes `description/imu_mount.json`, the URDF's
    `imu_link`/`imu_joint`, `AXIS_REMAP` and the README's IMU table, then checks them and
    runs a live tilt test. Procedure, diagrams and troubleshooting: **`docs/imu_locate.md`**.
@@ -116,6 +119,15 @@ and nothing has been commanded on the robot yet.
 ---
 
 ## 4. Log (newest first)
+
+### 2026-11-02 — `imu_locate.py` cleared to run from the Mac
+The robot PC had an issue, so the IMU session moves to the dev Mac. Nothing in the tool
+is Linux-specific (pyserial, file edits, MuJoCo). Checked on the Mac in a fresh
+Python 3.10 `.venv`: full suite 140 passed, 1 known failure, 1 skip; a complete
+`measure` (poses, position, write, static + live check) against a fake Nicla on a macOS
+pty passed. Not checked: macOS at 921600 baud with the real board (a pty can't set custom
+bauds; `open_imu` falls back to 115200 if it fails). Docs: "Or on a Mac" in
+`docs/imu_locate.md`; the port hint now names `/dev/cu.usbmodem*`.
 
 ### 2026-11-01 — `imu_locate.py`: measure the IMU pose and write it everywhere
 Prep for the bench session on 2026-11-02. Not run on the real IMU yet.
