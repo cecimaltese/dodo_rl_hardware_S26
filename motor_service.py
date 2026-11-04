@@ -45,6 +45,13 @@ Safety layer:
   * motor fault / over-speed / measured over-travel / silent feedback /
     stalled command stream → full e-stop (all motors disabled, latched until
     ctl estop_reset)
+  * "feedback" always means FRESH feedback (younger than FEEDBACK_FRESH_S):
+    both drivers cache their last frame forever, so a joint that stopped
+    talking would otherwise look alive with frozen numbers. Silent means: an
+    ODrive that has ever streamed (they stream whether enabled or not), or a
+    Damiao while the fleet is enabled (they only answer the frames the loop
+    sends every tick). A silent ODrive also loses its calibration — if it
+    rebooted, its encoder re-zeroed.
 
 Fleet, buses, limits and the boot pose all come from fleet_config.py — the
 single source of truth; nothing about the robot is configured here.
@@ -53,7 +60,8 @@ CAN topology: two buses, one USB-CAN adapter each (Damiao on DM_CHANNEL, ODrive
 on OD_CHANNEL; stable names from the udev rule, see fleet_config.py). Both types
 can share one bus (pass the same channel twice) — then the Damiao socket gets
 filtered, and the ODrive node ids must stay out of the Damiao id windows.
-Bring the buses up first (Ubuntu robot box):
+The buses come up at 1 Mbit when the adapters appear (setup/99-dodo-can.rules);
+by hand:
     sudo ip link set can_dm up type can bitrate 1000000
     sudo ip link set can_od up type can bitrate 1000000
 
@@ -79,7 +87,7 @@ from damiao_joint import DamiaoJoint
 from odrive_can_joint import OdriveCanJoint
 from fleet_config import (DM_JOINTS, OD_JOINTS, DM_CHANNEL, OD_CHANNEL, BUSTYPE,
                           JOINT_LIMITS_RAD, RATED_TORQUE_NM, JOINT_VEL_LIMIT_RAD,
-                          BOOT_POSE_RAD)
+                          BOOT_POSE_RAD, FEEDBACK_FRESH_S)
 
 log = logging.getLogger("motor_service")
 
@@ -90,7 +98,7 @@ DM_REGISTER_ID = 0x7FF  # Damiao register read/write reply arbitration id
 SAFETY_FACTOR = 0.9          # margin applied to position-clamp + velocity limit
 TORQUE_IDLE_FACTOR = 0.8     # |torque| > 0.8 * rated  ->  that motor goes to IDLE
 CMD_WATCHDOG_S = 0.5         # once commands stream (while enabled), a gap -> e-stop
-FB_WATCHDOG_S = 0.5          # a joint that WAS reporting goes silent -> e-stop
+FB_WATCHDOG_S = 0.5          # a joint that should be reporting goes silent -> e-stop
 POS_OVERTRAVEL_MARGIN = 0.10 # rad past the hard URDF limit (measured) -> e-stop
 STARTUP_GRACE_S = 1.0        # ignore safety trips for the first second
 UNPARK_DURATION_S = 1.5      # slow move from the stop to the safety-band edge at enable
@@ -120,7 +128,6 @@ class _JointAdapter:
         # ODrive reports turns-since-boot -> needs ctl `calibrate` (powered on
         # in the boot pose, legs at the stops) or `set_zero` (jig).
         self.calibrated = not self.is_odrive
-        self._last_fb_time: Optional[float] = None
 
         cfg = joint.cfg
         lo_rad, hi_rad = JOINT_LIMITS_RAD.get(self.name, (None, None))
@@ -161,11 +168,12 @@ class _JointAdapter:
         vel_native = float(st.get("vel", 0.0))
         torque = float(st.get("torque", st.get("torq", 0.0)))
 
-        # Honest has_feedback (the old node's bool(st) was always True):
-        if self.is_odrive:
-            has_fb = st.get("fb_age") is not None
-        else:
-            has_fb = bool(self.joint.motor.get_states())
+        # FRESH feedback only. "Has ever reported" (what this used to check) stays
+        # true forever after the first frame, which turned a dead joint, bus or
+        # polling thread into frozen numbers that looked live and kept the
+        # feedback watchdog from ever firing.
+        fb_age = self.joint.feedback_age()
+        has_fb = fb_age is not None and fb_age < FEEDBACK_FRESH_S
 
         fault = None
         if self.is_odrive:
@@ -184,6 +192,7 @@ class _JointAdapter:
             "torque": torque,
             "fault": fault,
             "has_feedback": has_fb,
+            "fb_age": fb_age,
         }
 
 
@@ -214,8 +223,10 @@ class MotorService:
         self._estopped = False
         self._estop_reason = ""
         self._enabled = False
+        self._enabled_at = 0.0          # time.monotonic() of the last enable
         self._stop = threading.Event()
-        self._start_time = time.time()
+        # All watchdog/grace timing is on the monotonic clock (immune to NTP steps).
+        self._start_time = time.monotonic()
         self._got_cmd = False
         self._last_cmd_time = 0.0
         self._last_cmd_seq: Optional[int] = None
@@ -323,6 +334,8 @@ class MotorService:
                 "vel_rad": round(st["vel_rad"], 4),
                 "torque_nm": round(st["torque"], 3),
                 "has_feedback": st["has_feedback"],
+                "feedback_age_s": (None if st["fb_age"] is None
+                                   else round(st["fb_age"], 3)),
                 "calibrated": a.calibrated,
                 "idled": a.idled,
                 "fault": st["fault"],
@@ -405,6 +418,7 @@ class MotorService:
             else:
                 a.joint.send_position(pos)
         self._enabled = True
+        self._enabled_at = time.monotonic()   # Damiao silence is counted from here
         # Re-arm the command watchdog for the new session.
         self._got_cmd = False
         if unparking:
@@ -484,10 +498,11 @@ class MotorService:
         self._estopped = False
         self._estop_reason = ""
         self._got_cmd = False
-        self._start_time = time.time()          # fresh startup grace
+        self._start_time = time.monotonic()     # fresh startup grace
         for a in self.adapters.values():
             a.idled = False
-            a._last_fb_time = None
+        # A joint that is still silent trips the watchdog again after the grace:
+        # resetting doesn't make a dead bus alive.
         log.warning("e-stop RESET — motors remain disabled; 'enable' to resume")
         return {"was_estopped": True, "enabled": self._enabled}
 
@@ -502,7 +517,7 @@ class MotorService:
             self._last_cmd_seq = cmd.seq
             return
         self._got_cmd = True
-        self._last_cmd_time = time.time()
+        self._last_cmd_time = time.monotonic()
         self._last_cmd_seq = cmd.seq
 
         for name, a in self.adapters.items():
@@ -550,13 +565,12 @@ class MotorService:
 
     # ── safety ────────────────────────────────────────────────────
     def _safety_check(self, states: Dict[str, dict]):
-        if time.time() - self._start_time < STARTUP_GRACE_S:
+        if time.monotonic() - self._start_time < STARTUP_GRACE_S:
             return
         for name, st in states.items():
             if not st["has_feedback"]:
-                continue
+                continue        # stale numbers aren't judged; _watchdog_check owns silence
             a = self.adapters[name]
-            a._last_fb_time = time.time()
             if a.idled:
                 continue
             if st["fault"]:
@@ -578,10 +592,27 @@ class MotorService:
                                        f"{a.torque_idle_limit:.2f} Nm "
                                        f"(0.8 x {a.rated_torque:.0f} Nm rated)")
 
+    def _silent_for(self, a: _JointAdapter, now: float) -> Optional[float]:
+        """How long a joint has been silent while it SHOULD be talking, or None
+        if it isn't expected to talk right now."""
+        age = a.joint.feedback_age()
+        if a.is_odrive:
+            # ODrives stream cyclic feedback whether enabled or not, so once heard
+            # they must keep talking. Never heard = not expected (and `enable` /
+            # `calibrate` refuse a joint without fresh feedback).
+            return age
+        # A Damiao only answers frames, which the main loop sends every tick
+        # while enabled. Disabled, silence is normal. Count from the enable so
+        # a reply from before it doesn't make a fresh session look silent.
+        if not self._enabled:
+            return None
+        since_enable = now - self._enabled_at
+        return since_enable if age is None else min(age, since_enable)
+
     def _watchdog_check(self):
-        if time.time() - self._start_time < STARTUP_GRACE_S or self._estopped:
+        now = time.monotonic()
+        if now - self._start_time < STARTUP_GRACE_S or self._estopped:
             return
-        now = time.time()
         # Command watchdog: only while enabled and once the stream has started.
         if self._enabled and self._got_cmd and (now - self._last_cmd_time) > CMD_WATCHDOG_S:
             self._estop(f"no motor_commands for {now - self._last_cmd_time:.2f}s "
@@ -590,10 +621,19 @@ class MotorService:
         for name, a in self.adapters.items():
             if a.idled:
                 continue
-            if a._last_fb_time is not None and (now - a._last_fb_time) > FB_WATCHDOG_S:
-                self._estop(f"{name} feedback silent for {now - a._last_fb_time:.2f}s "
-                            f"(> {FB_WATCHDOG_S}s watchdog)")
-                return
+            silent = self._silent_for(a, now)
+            if silent is None or silent <= FB_WATCHDOG_S:
+                continue
+            note = ""
+            if a.is_odrive and a.calibrated:
+                # We can't tell a bus glitch from a reboot, and a rebooted ODrive
+                # re-zeroes its encoder: the boot-pose mapping is void either way.
+                a.calibrated = False
+                note = (" — its calibration is void (a rebooted ODrive re-zeroes its "
+                        "encoder): fold it to its stop and ctl `calibrate` again")
+            self._estop(f"{name} feedback silent for {silent:.2f}s "
+                        f"(> {FB_WATCHDOG_S}s watchdog){note}")
+            return
 
     def _idle_joint(self, name: str, reason: str):
         a = self.adapters[name]

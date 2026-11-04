@@ -91,7 +91,8 @@ from damiao_motor import DaMiaoController
 
 from damiao_joint import DamiaoJoint
 from odrive_can_joint import OdriveCanJoint
-from fleet_config import DM_JOINTS, OD_JOINTS, DM_CHANNEL, OD_CHANNEL, BUSTYPE
+from fleet_config import (DM_JOINTS, OD_JOINTS, DM_CHANNEL, OD_CHANNEL, BUSTYPE,
+                          FEEDBACK_FRESH_S)
 from rl_env import DEFAULT_JOINT_POS, POLICY_JOINT_ORDER
 
 TWO_PI = 2.0 * math.pi
@@ -119,6 +120,7 @@ DOMINANCE = 3.0          # winner must move >= 3x the runner-up, else it's ambig
 # Both thresholds are compared in RADIANS, after to_rad(). Never against native units:
 # the two buses report different ones and the comparison would be nonsense.
 SETTLE_S = 0.3
+POKE_WAIT_S = 0.005      # after poking every motor, let the replies land before reading
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +142,7 @@ class Fleet:
         for cfg in DM_JOINTS:
             limp = dataclasses.replace(cfg, kp=0.0, kd=0.0)
             j = DamiaoJoint(self.dm_ctl, limp)
-            j.enable()
+            j.enable()           # needed to get replies; read() only ever sends kp=kd=0
             self.dm[cfg.name] = j
 
         # ODrive — filtered socket + reader thread. Never commanded closed-loop.
@@ -163,21 +165,35 @@ class Fleet:
                     j.process_frame(msg)
 
     def read(self) -> Dict[str, Optional[float]]:
-        """Every motor's position in ITS OWN native units (Damiao rad, ODrive turns)."""
+        """Every motor's position in ITS OWN native units (Damiao rad, ODrive turns),
+        or None for a motor that isn't answering.
+
+        Pokes first, like read_motor_state.py: a zero-gain MIT frame to each Damiao
+        (kp=kd=torque=0, so no torque; a Damiao only reports in reply to a frame) and
+        an RTR encoder query to each ODrive (harmless if cyclic feedback is on).
+        Without the poke the Damiao numbers would be frozen at the enable reply;
+        without the freshness check a silent motor would read as a steady 0.0 —
+        "online", and never moving.
+        """
         if self.dry:
             return dict(self.pos)
+        # A TX error is just "no answer" below, so it isn't raised here.
+        for j in self.dm.values():
+            try:
+                j.send_limp()
+            except Exception:
+                pass
+        for j in self.od.values():
+            try:
+                j.request_feedback()
+            except Exception:
+                pass
+        time.sleep(POKE_WAIT_S)
         out = {}
-        for n, j in self.dm.items():
-            try:
-                out[n] = float(j.get_position())
-            except Exception:
-                out[n] = None
-        for n, j in self.od.items():
-            try:
-                p = j.get_position()
-                out[n] = float(p) if p is not None else None
-            except Exception:
-                out[n] = None
+        for n, j in (*self.dm.items(), *self.od.items()):
+            age = j.feedback_age()
+            out[n] = (float(j.get_position())
+                      if age is not None and age < FEEDBACK_FRESH_S else None)
         return out
 
     def online(self):

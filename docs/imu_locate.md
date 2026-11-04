@@ -16,8 +16,14 @@ right thing when you tilt the robot.
 | **Orientation** | The IMU measures it: three resting poses of the robot. | At rest the accelerometer reads +1 g along whichever chip axis points up, so each pose shows where one body axis lies in chip terms. |
 | **Position** | You measure it: four ruler readings. | A single IMU can't find its own lever arm without a rotation rig. The policy doesn't need it precisely: angular velocity and the gravity direction are the same everywhere on a rigid body, so only raw accelerometer readings depend on it. ±5 mm is plenty. |
 
-Status (2026-11-01): written and rehearsed end to end against a simulated IMU (see
-[How it was tested](#how-it-was-tested)), but **never run against the real board**.
+Status (2026-11-04): run on the robot on 2026-11-02, snapped. Quality: level vs z axis
+**4.44°**, snapped vs exact **4.73°**, cross-check 0.43° (all kept in the record). The
+first two say the board sits ~4.4° off square on its mount (it looks tilted, too), and
+a snapped remap hands that tilt to the policy: a level robot would read ~3.6° nose-down
+and ~2.6° right-side-down. The record is now `refit --exact`. The first live check with
+it (2026-11-04) still read 3.8° nose-down: that day's phone-levelled pose and 11-02's
+differ by 3.8° in pitch (roll agrees), so the pitch is open. Settle it with
+`imu_locate.py level` while levelling carefully (HANDOFF §2 step 1).
 
 ---
 
@@ -47,7 +53,10 @@ Linux). Commit and push from the Mac; the robot PC just pulls later.
 **Bring:**
 - a steel rule (a caliper with a depth rod is nicer);
 - something with a right angle: a square, or a sturdy box;
-- a phone with a spirit-level app;
+- a phone with a spirit-level app. Use the **top plate** as the reference: in the CAD
+  it is exactly parallel to the body frame (0.00° both ways). A phone on its back sits
+  on its camera bump and case, which can tilt it by a degree or more, so read it, turn
+  it 180° in place, read again, and use the average;
 - a towel or foam to lay the robot on;
 - paper for the four numbers (the record keeps them too).
 
@@ -114,7 +123,7 @@ within a degree or two; hand-held poses are not that good. How to read the quali
 
 | Line | Typical | Meaning if large |
 |---|---|---|
-| level vs z axis | < 3° | The body wasn't level (check with the phone), or the board is tilted on its mount. The snapped result is still right if the gap below is small. |
+| level vs z axis | < 3° | The body wasn't level (check with the phone), or the board is tilted on its mount. If the body WAS level, snapping hands this tilt to the policy as a standing error: use `--exact` (or `refit --exact` afterwards). The live check's level step tells the two apart. |
 | snapped vs exact | < 5° | > 10° and the tool refuses: either a pose was far off (redo it lying on the table), or the board **really is mounted at an angle**. Look at it. If it is, re-run with `--exact`, which keeps the fitted rotation instead of snapping. |
 | nose-down vs left-side-down | < 10° | > 20° and the tool refuses: ~180° means a pose went the wrong way; anything else means a sloppy pose. |
 
@@ -193,7 +202,7 @@ scales → `ZmqEnv`'s projected gravity):
 
 | Move | PASS when |
 |---|---|
-| 1. robot level, still | `projected_gravity` ≈ (0, 0, −1) |
+| 1. robot level (spirit level ~0° both ways), still | `projected_gravity` within 2° of (0, 0, −1). It prints the tilt the policy would see, split into nose-down and right-side-down. |
 | 2. from level, tilt nose-down ~45° and hold | gravity x > +0.5, and the gyro saw a turn mostly about **+y** |
 | 3. from level, tilt left-side-down ~45° and hold | gravity y > +0.5, and the turn was mostly about **−x** |
 
@@ -228,9 +237,11 @@ git push
 | Position wrong, orientation fine (no IMU needed) | `python3 imu_locate.py measure --skip-orientation` |
 | You already know the position (body frame, mm) | `python3 imu_locate.py measure --xyz-mm 30 -2 110` (combine with `--skip-orientation`) |
 | Board really is mounted at an angle | `python3 imu_locate.py measure --exact` |
+| Same, but the poses you already took were fine | `python3 imu_locate.py refit --exact`: re-solves from the readings stored in the record, no IMU needed. `refit` without `--exact` snaps again. Then `check --live`. |
 | You edited the record by hand (e.g. a weighed mass) | `python3 imu_locate.py apply` |
 | Just verify (any machine) | `python3 imu_locate.py check` |
 | Verify against the robot again (e.g. after remounting) | `python3 imu_locate.py check --live` |
+| Level the robot, or see what the policy reads right now | `python3 imu_locate.py level`: a live tilt readout (nose-down / right-down), Ctrl-C to stop. A phone level has its own bias: read it, turn the phone 180°, read again, use the average. |
 | Only see the remap, write nothing | `python3 imu_sniff.py --axes` |
 
 **Don't hand-edit** `AXIS_REMAP` or the generated URDF block: `check` flags any
@@ -251,8 +262,9 @@ measure again.
 | WARNING "… outside the body's CAD outline" | A sign is flipped in the position prompts. Check them against the diagram, then `measure --skip-orientation`. |
 | `has a hand-written imu_link/imu_joint` | Someone added one by hand: delete it from the URDF, then `apply`. |
 | Static check FAIL on AXIS_REMAP | `imu_protocol.py` was edited or merged by hand: `python3 imu_locate.py apply`. |
-| Live check FAIL on "level" | The robot wasn't level, or the orientation is wrong: `measure --skip-position`. |
-| Live check FAIL on a tilt | The tilt went the other way (re-run `check --live`), or the orientation is wrong (`measure --skip-position`). |
+| Live check FAIL on "level" | The robot wasn't level (check it with the phone), or the remap is off by the printed tilt. A snapped remap on a board tilted on its mount: `refit --exact`. Otherwise `measure --skip-position`. |
+| Live check FAIL on a tilt, "it never got there" | Not tilted far or soon enough (20 s per step): re-run `check --live`. Not a remap problem. |
+| Live check FAIL on a tilt, "it went the other way" | You tilted the wrong way (re-run), or the orientation is wrong (`measure --skip-position`). |
 
 ---
 
@@ -300,5 +312,8 @@ gyro and gravity direction don't depend on where on the body the sensor sits.
   `--xyz-mm`, `apply`, `check` and `imu_sniff --axes`. With a measured, gimbal-locked
   mounting written into a copy of the repo, the whole suite still passed (the stack
   accepts a non-identity `AXIS_REMAP` and an `imu_link`).
-- **Not yet:** a real Nicla. The fake can't reproduce noise, the CDC first-command drop
-  (`open_imu` handles that), or a robot that won't sit still.
+- 2026-11-04: `refit` (a board 4.4° off square comes back from its stored poses and
+  through the files) and the stricter live level step (the snapped remap of such a board
+  now FAILS it; with the old `g_z < −0.97` test, ~14°, it passed).
+- **Real board:** one run, 2026-11-02 (see Status). The fake can't reproduce noise, the
+  CDC first-command drop (`open_imu` handles that), or a robot that won't sit still.

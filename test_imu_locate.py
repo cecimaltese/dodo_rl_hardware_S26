@@ -361,3 +361,109 @@ class TestLiveCheck:
     def test_fails_with_a_wrong_remap(self, monkeypatch):
         use_remap(monkeypatch, np.eye(3))
         assert not self.drive(monkeypatch, PERMS[6])
+
+    def test_level_catches_a_board_tilted_on_its_mount(self, monkeypatch):
+        """The 2026-11-02 case: a board ~4.4 deg off square, snapped to the nearest
+        square mount. The tilts still pass; only a strict level test can see that a
+        level robot reads as tilted. (The old g_z < -0.97 test passed it.)"""
+        snapped = PERMS[6]
+        mount = snapped @ rot_x(3.0) @ rot_y(-3.2)
+        use_remap(monkeypatch, snapped)
+        assert not self.drive(monkeypatch, mount)
+        use_remap(monkeypatch, mount)                  # the exact fit
+        assert self.drive(monkeypatch, mount)
+
+
+    def test_a_slow_tilt_says_rerun_not_remeasure(self, monkeypatch, capsys):
+        """2026-11-04 on the robot: step 3 timed out with the robot barely rolled, and
+        the tool said to re-measure the orientation. A tilt that never gets there is a
+        re-run; only one that goes the wrong way points at the remap."""
+        use_remap(monkeypatch, PERMS[6])
+        imu = FakeNicla(PERMS[6])
+
+        def level():
+            imu.world, imu.omega, imu.step = np.eye(3), np.zeros(3), None
+
+        def nose_down():
+            level()
+            imu.step = self.motion(rot_y, np.array([0.0, 1.0, 0.0]))
+        scripted_input(monkeypatch, [level, nose_down, level])   # step 3: never rolled
+        assert not loc.live_check(imu, V2, timeout_s=0.3)
+        out = capsys.readouterr().out
+        assert "it never got there" in out and "Re-run `imu_locate.py check --live`" in out
+        assert "measure --skip-position" not in out
+
+    @pytest.mark.parametrize("deg", [-6.0, 3.0])
+    def test_tilt_parts_signs(self, deg):
+        g_nose = rot_y(deg).T @ np.array([0.0, 0.0, -1.0])    # +y rotation: nose down
+        g_right = rot_x(deg).T @ np.array([0.0, 0.0, -1.0])   # +x rotation: right down
+        assert loc.tilt_parts(g_nose) == pytest.approx((abs(deg), deg, 0.0), abs=1e-6)
+        assert loc.tilt_parts(g_right) == pytest.approx((abs(deg), 0.0, deg), abs=1e-6)
+
+    def test_level_readout_shows_the_phantom_tilt(self, monkeypatch, capsys):
+        """`level` prints what the policy sees: a level robot with a board ~4 deg off
+        square reads that tilt under the snapped remap, and ~0 under the exact fit."""
+        mount = PERMS[6] @ rot_x(3.0) @ rot_y(-3.2)
+        down = np.array([0.0, 0.0, -1.0])
+        phantom = loc.angle_deg(PERMS[6] @ mount.T @ down, down)   # what snapping leaves
+        assert phantom > 2.0
+        for remap, want in ((PERMS[6], phantom), (mount, 0.0)):
+            use_remap(monkeypatch, remap)
+            imu, polls = FakeNicla(mount), {"n": 0}
+
+            def stop_after_a_while(_imu):
+                polls["n"] += 1
+                if polls["n"] > 40:
+                    raise KeyboardInterrupt
+            imu.step = stop_after_a_while
+            monkeypatch.setattr(loc, "_open", lambda args: (imu, V2))
+            assert loc.cmd_level(None) == 0
+            last = capsys.readouterr().out.strip().split("\r")[-1]
+            tilt = float(last.split("tilt")[1].split("deg")[0])
+            assert tilt == pytest.approx(want, abs=0.1), last
+
+
+class TestRefit:
+    """`refit` re-solves from the record's stored poses: no IMU, no turning the robot."""
+    MOUNT = PERMS[6] @ rot_x(3.0) @ rot_y(-3.2)        # ~4.4 deg off square
+
+    def snapped_record(self):
+        ups = {k: board_up(self.MOUNT, np.eye(3) if k == "level" else POSE_WORLD[k])
+               for k in POSE_WORLD}
+        r, info, problems = loc.solve_orientation(ups)
+        assert not problems
+        info.update(measured="2026-11-02", firmware=2)
+        rec = loc.make_record(r, info, (0.0142, 0.0, 0.095),
+                              {"method": "hand", "measured": "2026-11-02"},
+                              note="steel rule", mass_kg=0.007)
+        rec["_comment"] = "IMU mount on body."            # hand-edited, must survive
+        return rec
+
+    def test_exact_recovers_the_tilted_board(self):
+        old = self.snapped_record()
+        assert old["axis_remap"] == PERMS[6].astype(int).tolist()
+        rec, problems = loc.refit_record(old, exact=True)
+        assert not problems
+        r = np.array(rec["axis_remap"])
+        # Body z comes from the level pose alone (exact here); the heading from the
+        # tilted poses, which POSE_WORLD leans sideways a few degrees on purpose.
+        assert r[2] == pytest.approx(self.MOUNT[2], abs=1e-3)
+        assert loc.rotation_deg(r, self.MOUNT) < 1.0
+        o = rec["orientation"]
+        assert o["mode"] == "exact" and o["level_tilt_deg"] == pytest.approx(0, abs=0.05)
+        assert o["up_board"] == old["orientation"]["up_board"]     # raw data kept
+        assert o["measured"] == "2026-11-02" and o["refit"]
+        for k in ("_comment", "xyz_m", "position", "note", "mass_kg", "box_m"):
+            assert rec[k] == old[k], k
+        assert list(rec) == list(old)                     # same layout on disk
+        back, _ = loc.refit_record(rec, exact=False)
+        assert back["axis_remap"] == old["axis_remap"]
+
+    def test_refit_record_goes_through_the_files(self, tmp_path):
+        f = files(tmp_path)
+        rec, _ = loc.refit_record(self.snapped_record(), exact=True)
+        loc.save_record(rec, f["record_path"])
+        loc.apply_record(rec, f["urdf_path"], f["protocol_path"], f["readme_path"])
+        assert loc.read_axis_remap(f["protocol_path"]) == pytest.approx(
+            np.array(rec["axis_remap"]), abs=1e-8)
+        assert loc.run_checks(f["record_path"], f["urdf_path"], f["protocol_path"]) == []

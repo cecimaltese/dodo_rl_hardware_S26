@@ -1,0 +1,27 @@
+# 99-dodo-can.rules — stable names for the Dodo's two USB-CAN adapters
+# (ODrive Robotics "USB to CAN Adapter", gs_usb driver, USB 1d50:606f).
+#
+# can0/can1 are enumeration order, not identity: plugging the adapters in another order
+# silently swaps the Damiao and ODrive buses. These rules name each adapter by its USB
+# serial — the names fleet_config.py uses — and bring its bus up at 1 Mbit/s. Bringing
+# a bus up sends nothing, and motor_service never auto-enables a motor.
+#
+# Install (README "Machine setup"):
+#   sudo cp setup/99-dodo-can.rules /etc/udev/rules.d/ && sudo udevadm control --reload
+#   then replug both adapters (or reboot)
+# Check:  ip -details link show can_dm     # UP, bitrate 1000000; same for can_od
+#
+# Which serial is which bus is a WIRING fact. Check after any rewiring: the ODrives
+# stream cyclic frames on can_od (`candump can_od`); the Damiaos stay silent until
+# spoken to, and answer a register read on can_dm (read MST_ID of motor 1, no motion:
+# `cansend can_dm 7FF#0100330700000000` -> reply on 0x011). VERIFIED 2026-11-04 on
+# TUM770035243-11: ODrive nodes 3/4/7/8 on can_od, Damiao 1/2/5/6 answering on can_dm.
+# A replaced adapter: udevadm info -q property /sys/class/net/can0 | grep SERIAL_SHORT
+#
+# "99-" so it runs after systemd's 80-net-setup-link.rules and its NAME wins.
+
+# Damiao hips (roll + pitch)
+SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="606f", ATTRS{serial}=="0027002F4858530731303438", NAME="can_dm", RUN+="/usr/sbin/ip link set can_dm up type can bitrate 1000000"
+
+# ODrive knees + ankles
+SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="606f", ATTRS{serial}=="003800224858530731303438", NAME="can_od", RUN+="/usr/sbin/ip link set can_od up type can bitrate 1000000"

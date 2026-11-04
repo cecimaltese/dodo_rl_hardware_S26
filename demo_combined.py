@@ -56,8 +56,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--joints", default=None,
-                    help="comma-separated subset (default: every joint that has "
-                         "feedback per ctl status)")
+                    help="comma-separated subset (default: every joint the "
+                         "service runs, per ctl status)")
     ap.add_argument("--amp", type=float, default=0.3, help="sine amplitude [rad]")
     ap.add_argument("--freq", type=float, default=0.25, help="sine frequency [Hz]")
     ap.add_argument("--secs", type=float, default=10.0, help="run time [s]")
@@ -76,7 +76,6 @@ def main():
         print(f"ERROR: {e}")
         sys.exit(2)
     joints_info = status.get("joints", {})
-    online = [n for n, j in joints_info.items() if j.get("has_feedback")]
     print(f"service: enabled={status.get('enabled')} estopped={status.get('estopped')} "
           f"all_calibrated={status.get('all_calibrated')}")
     for n, j in sorted(joints_info.items()):
@@ -95,9 +94,12 @@ def main():
             print(f"ERROR: unknown joints {unknown}; known: {ipc.JOINT_ORDER}")
             sys.exit(1)
     else:
-        selected = online or list(joints_info)
+        # Every joint the service runs. Not "those with feedback": a disabled
+        # Damiao is silent by design (it only answers frames), and `enable`
+        # refuses any joint that doesn't answer, so that check happens there.
+        selected = list(joints_info)
     if not selected:
-        print("no joints to drive (nothing online?) — aborting.")
+        print("no joints to drive (the service reports none) — aborting.")
         sys.exit(1)
     print(f"\ndriving {selected} : ±{args.amp} rad @ {args.freq} Hz for {args.secs}s "
           f"(center={args.center})")

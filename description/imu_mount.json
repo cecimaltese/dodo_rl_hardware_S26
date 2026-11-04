@@ -1,26 +1,27 @@
 {
   "_comment": "IMU mount on body.",
   "axis_remap": [
-    [0, 1, 0],
-    [1, 0, 0],
-    [0, 0, -1]
+    [-0.027217111, 0.997561889, -0.064261231],
+    [0.998620652, 0.030020879, 0.04307598],
+    [0.044900134, -0.063000189, -0.997002986]
   ],
   "xyz_m": [0.0142, 0.0, 0.095],
   "mass_kg": 0.005,
   "box_m": [0.023, 0.023, 0.005],
   "note": "",
   "orientation": {
-    "mode": "snapped",
+    "mode": "exact",
     "snap_gap_deg": 4.73,
     "crosscheck_deg": 0.43,
-    "level_tilt_deg": 4.44,
+    "level_tilt_deg": 0.0,
     "up_board": {
       "level": [0.0449, -0.063, -0.997],
       "nose_down": [0.0309, -0.9973, 0.0664],
       "left_down": [-0.9983, -0.0268, -0.052]
     },
     "measured": "2026-11-02",
-    "firmware": 2
+    "firmware": 2,
+    "refit": "2026-11-04"
   },
   "position": {
     "method": "hand",

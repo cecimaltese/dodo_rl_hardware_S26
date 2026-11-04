@@ -23,28 +23,29 @@ decisions behind it.
 | Hip roll + pitch | Damiao DM4340P, 27 Nm |
 | Knee + ankle | T-Motor MN4004 via ODrive, geared, 9 Nm in sim |
 
-## Status (2026-10-30)
+## Status (2026-11-04)
 
 | Subsystem | State |
 |---|---|
 | **Hardware** | ✅ Every motor driver powered, CAN daisy chain continuous (repaired 2026-10-30). |
 | **ZMQ stack** | ✅ Reconciled with main's July work 2026-10-30. In sim, the stand policy balances 10 s through `sim_service` + `ZmqEnv`. ⚠️ Never run against `motor_service` on the robot. |
 | **Sim → sim (MuJoCo)** | ✅ The `dodo_stand` policy stands 30 s+. |
-| **IMU** | ✅ Verified on hardware (firmware v2): scale 0.5 % off 1 g, gyro bias ~1 °/s, ~60 Hz. Now mounted on the robot; its pose (`AXIS_REMAP`, URDF `imu_link`) is not measured yet: `imu_locate.py` ([docs/imu_locate.md](docs/imu_locate.md)). |
-| **Safety layer** | ✅ In `motor_service`: position/velocity clamps, 0.8 × rated torque → that motor IDLE, e-stop. ⚠️ Never exercised on hardware. |
+| **IMU** | ✅ Verified on hardware (firmware v2): scale 0.5 % off 1 g, gyro bias ~1 °/s, ~60 Hz. ✅ Pose measured on the robot 2026-11-02 (`description/imu_mount.json` → URDF `imu_link`, `AXIS_REMAP`). The board sits off square, so the record is the exact fit (2026-11-04). ⚠️ The first live check still read 3.8° nose-down on a phone-levelled robot: pitch unresolved (HANDOFF §2 step 1, `imu_locate.py level`). |
+| **Safety layer** | ✅ In `motor_service`: position/velocity clamps, 0.8 × rated torque → that motor IDLE, e-stop, and a silent-joint watchdog that works (it couldn't fire before 2026-11-04). ⚠️ Never exercised on hardware. |
 | **Motor control** | ⚠️ Never run on a motor. |
 | **Sign / zero calibration** | ❌ **The blocker.** `calibrate_joints.py` works; the July run is incomplete and must be redone, and `motor_service` doesn't apply measured signs or stops yet. |
 | **ODrive gear ratio** | ❌ Unknown (~32:1 inferred). Blocks every knee/ankle number. |
-| **CAN udev rule** | ❌ `99-dodo-can.rules` (creates `can_dm`/`can_od`) is on the robot PC only. Commit it. |
+| **CAN udev rule** | ✅ `setup/99-dodo-can.rules` names the adapters `can_dm`/`can_od` by serial and brings them up at 1 Mbit (2026-11-04, *Machine setup*). |
 
 > ### ⛔ Do not run a policy on the robot yet
 > `motor_service` has no sign or zero-offset layer: `_JointAdapter` only converts
-> rad ↔ turns. In July the Damiao hips measured left/right mirrored relative to the URDF
-> (`hip_left (-0.966, 0.641)` vs `hip_right (-0.544, 1.104)`), and the first calibration run
-> then found sign +1 on both, but that run was incomplete. The knee/ankle gear ratio is also
-> unknown. Until calibration is done and wired in, a policy can drive a joint the wrong way
-> into its hard stop under a 27 Nm motor. A gantry stops the robot falling; it does not
-> stop it breaking.
+> rad ↔ turns. The measured hip-pitch ranges are left/right mirrored
+> (`upper_leg_left (-0.32, 2.38)` vs `upper_leg_right (-2.30, 0.29)`), which points to one
+> hip-pitch motor reading inverted relative to the URDF, and July's incomplete calibration
+> never measured that pair. (The hip-roll ranges look mirrored too, but that's expected:
+> see `fleet_config.py`.) The knee/ankle gear ratio is also unknown. Until calibration is
+> done and wired in, a policy can drive a joint the wrong way into its hard stop under a
+> 27 Nm motor. A gantry stops the robot falling; it does not stop it breaking.
 
 ## Architecture
 
@@ -95,8 +96,8 @@ unchanged, and made the real-time sim stand-in on the same topics possible.
 
 **CAN.** Two buses, one USB-CAN adapter each. `can0`/`can1` are enumeration order, not
 identity: a replug can silently swap them. A udev rule pins each adapter by serial to
-`can_dm` / `can_od`, the names `fleet_config.py` uses. That rule file
-(`99-dodo-can.rules`) exists only on the robot PC so far.
+`can_dm` / `can_od`, the names `fleet_config.py` uses, and brings both up at 1 Mbit:
+`setup/99-dodo-can.rules` (install: *Machine setup*).
 - The node → joint assignment for the ODrives is a placeholder; `calibrate_joints.py`
   measures the real one.
 - Both motor types can share one bus (pass the same channel twice). Nodes 3/4/7/8 stay
@@ -112,21 +113,41 @@ the body frame and must match the URDF's IMU pose. `imu_locate.py` measures both
 robot and writes them from one record, `description/imu_mount.json`
 ([docs/imu_locate.md](docs/imu_locate.md)); not measured yet. Flashing: `firmware/README.md`.
 
+## Machine setup
+
+Once per robot machine (Ubuntu). Everything after this runs as your normal user.
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # Python >= 3.10
+
+# CAN: stable names can_dm / can_od, up at 1 Mbit whenever the adapters are plugged in
+sudo cp setup/99-dodo-can.rules /etc/udev/rules.d/
+sudo udevadm control --reload
+# then unplug + replug both USB-CAN adapters (or reboot)
+ip -details link show can_dm    # UP, "bitrate 1000000"; same for can_od
+
+# IMU: the Nicla is /dev/ttyACM0, group dialout
+sudo usermod -aG dialout $USER  # log out and back in to take effect
+```
+
+The rule matches each adapter by its USB serial. A new or swapped adapter needs its
+serial in the rule: `udevadm info -q property /sys/class/net/can0 | grep SERIAL_SHORT`.
+Which bus is which is a wiring fact: the ODrives stream cyclic frames on theirs, the
+Damiaos stay silent until spoken to (`candump can_od` vs `candump can_dm`).
+
 ## Bring-up
 
 In order: each step is a prerequisite for the next. Robot on the gantry from step 4.
+`python3` below means the repo's venv (`source .venv/bin/activate`).
 
 ```bash
-pip install -r requirements.txt
-
 # 1) IMU (bench, no robot needed)
 python3 imu_check.py                             # must print RESULT: PASS
 
-# 2) CAN: buses up, every motor answers
-sudo ip link set can_dm up type can bitrate 1000000
-sudo ip link set can_od up type can bitrate 1000000
-python3 odrive_can_scan.py --channel can_od      # nodes 3/4/7/8 alive? (its default is can0)
-candump can_dm                                   # Damiao feedback frames
+# 2) CAN: buses up (the udev rule does it), every motor answers
+ip -details link show can_dm                     # and can_od: UP, bitrate 1000000
+python3 odrive_can_scan.py                       # nodes 3/4/7/8 alive on can_od?
+candump can_od                                   # ODrive cyclic frames, ~100 Hz each
 # a drive not on CAN yet: python3 odrive_can_setup.py --node-id N   (USB, one drive at a time)
 
 # 3) Measure, motors LIMP. These tools open the buses directly: stop motor_service first.
@@ -220,7 +241,8 @@ the robot.
 | `read_motor_state.py`, `visualize_motor_state.py` | Read-only fleet diagnostics: a live table, or a MuJoCo model that follows the robot. |
 | `odrive_can_scan.py`, `odrive_can_setup.py`, `odrive_position_control.py` | ODrive: find nodes on a bus; put a drive on CAN (USB, once per drive); tune gains (USB). |
 | `imu_check.py`, `imu_sniff.py` | IMU acceptance test; raw dump, range cross-check, `--axes`. |
-| `imu_locate.py` | Measures the IMU mount (three poses + a ruler) and writes the URDF's `imu_link`, `AXIS_REMAP` and the IMU table from `description/imu_mount.json`; `check --live` verifies on the robot. |
+| `imu_locate.py` | Measures the IMU mount (three poses + a ruler) and writes the URDF's `imu_link`, `AXIS_REMAP` and the IMU table from `description/imu_mount.json`; `refit [--exact]` re-solves from the stored poses; `check --live` verifies on the robot. |
+| `setup/99-dodo-can.rules` | udev rule: the two USB-CAN adapters → `can_dm` / `can_od` by serial, up at 1 Mbit. |
 | `tools/` | `dodo_ctl.py` (ctl CLI), `dodo_startup.py` (power-on ritual without a policy), `zmq_echo.py` and `zmq_hz.py` (topic echo and rate). |
 | `demo_combined.py` | Sine-drive any joints through the full service stack. |
 | `description/` | URDF + meshes of the robot as built, with a README for whoever trains on it. |
@@ -239,19 +261,19 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # any OS, P
 
 Everything runs on any machine without hardware: the message layer (`test_ipc.py`), the
 service stack against a synthetic robot plus the stand policy through it
-(`test_e2e_zmq.py`), boot-calibration math, IMU parsing, the IMU mount measurement
-against a simulated IMU (`test_imu_locate.py`), the fleet config, and the Isaac Lab ↔
-MuJoCo contract (`test_sim2sim_consistency.py`). There is one known failure:
+(`test_e2e_zmq.py`), `motor_service`'s silent-joint watchdog with the real drivers on
+python-can's virtual bus against a fake fleet (`test_motor_watchdog.py`),
+boot-calibration math, IMU parsing, the IMU mount measurement against a simulated IMU
+(`test_imu_locate.py`), the fleet config, and the Isaac Lab ↔ MuJoCo contract
+(`test_sim2sim_consistency.py`). There is one known failure:
 `test_behavior_wrong_order_falls`. The stand policy also stands with left and right swapped,
 so that guard can't detect a joint-order regression.
 
 ## Next steps
 
-1. Measure the IMU pose on the robot: `python3 imu_locate.py measure`
-   ([docs/imu_locate.md](docs/imu_locate.md)) writes `imu_link` into the URDF and
-   `AXIS_REMAP`. Shafeef needs the URDF.
-2. Commit `99-dodo-can.rules` from the robot PC (and its MJCF `dodo_daimao.xml`, if the
-   meshed view in `visualize_motor_state.py` is wanted).
+1. Settle the IMU's pitch (`python3 imu_locate.py level` while levelling carefully,
+   then `check --live`; HANDOFF §2 step 1), then send Shafeef `description/`.
+2. Merge `merge-zmq-dev` into `main`.
 3. Measure the knee/ankle gear ratio and put it into `fleet_config.py` and every rad ↔ turns
    conversion.
 4. Redo the calibration (bring-up step 3), then wire the signs, measured stops and motor

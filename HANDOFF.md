@@ -12,10 +12,13 @@ sessions, so the repo files are the *only* shared memory — a new chat gets its
 by reading these. Keep §2 and the log honest (mark what's done, note what's untested,
 record decisions). If you change code, reflect it here in the same turn.
 
-Machines: the robot is driven from an Ubuntu PC (repo under `/home/dodo/Documents/dodo/`);
-development happens on Macs. Anything touching the motors/CAN can only run on the robot PC.
-The IMU is plain USB serial, so `imu_check.py` and `imu_locate.py` also run from a Mac
-with the Nicla plugged into it (`--port /dev/cu.usbmodem*`).
+Machines: since 2026-11-04 the robot is driven from **`TUM770035243-11`** (Ubuntu 24.04,
+Python 3.12, RTX 3090; repos in `/home/dodo/git/`). It replaced the old robot PC
+(`/home/dodo/Documents/dodo/`, Python 3.10), which had an issue. Development also
+happens on Macs. Anything touching the motors/CAN runs on the robot machine. The IMU is
+plain USB serial, so `imu_check.py` and `imu_locate.py` also run from a Mac with the
+Nicla plugged into it (`--port /dev/cu.usbmodem*`). Setting up a machine: README
+*Machine setup*.
 
 **Resuming on any machine.** Until `merge-zmq-dev` is merged, `main` still has the
 pre-merge ROS2 stack and its old docs, so work from the branch:
@@ -23,8 +26,8 @@ pre-merge ROS2 stack and its old docs, so work from the branch:
 git clone git@github.com:cecimaltese/dodo_rl_hardware_S26.git && cd dodo_rl_hardware_S26
 git switch merge-zmq-dev
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # Python >= 3.10
-.venv/bin/python -m pytest   # 140 passed, 1 known failure, 1 skip
-                             # (137 passed, 4 skips without dodo_rl next to the repo)
+.venv/bin/python -m pytest   # 153 passed, 1 known failure, 1 skip (2026-11-04)
+                             # (3 more skips without dodo_rl next to the repo)
 ```
 Then read §2. A Claude session's local memory doesn't travel between machines; this file
 does.
@@ -40,42 +43,54 @@ contract it was trained with. `motor_service` + `imu_service` are the robot,
 
 ---
 
-## 2. Current state (2026-11-01)
+## 2. Current state (2026-11-04)
 The subsystem table is in the README (*Status*). In short: everything is verified in sim,
-and nothing has been commanded on the robot yet.
+the IMU pose is measured, and nothing has been commanded on the robot yet.
 - **Verified:** the stand policy in MuJoCo (30 s+ lockstep; 10 s through the full ZMQ
-  stack), the IMU on the bench, and power + CAN continuity on the repaired robot. The test
-  suite runs anywhere: 140 passed, 1 known failure (the joint-order guard), 1 skip (stale
-  flat run); without `dodo_rl` beside the repo, 137 passed and 4 training-side skips. Also
-  checked from a clean export in a fresh Python 3.10 venv built from `requirements.txt`
-  (3.10 is the robot PC's version). `imu_locate.py` was rehearsed end to end against a
-  simulated IMU (2026-11-01 log).
-- **Never run on hardware:** `motor_service`, the safety layer, any commanded motion,
-  `imu_locate.py`.
+  stack), the IMU on the bench, power + CAN continuity on the repaired robot, and the IMU
+  pose on the robot (2026-11-02, refit exact 2026-11-04, see log). The test suite runs
+  anywhere: 153 passed, 1 known failure (the joint-order guard), 1 skip (stale flat run);
+  without `dodo_rl` beside the repo, 3 more training-side skips. Checked on Python 3.12
+  (new robot machine) and, before 2026-11-04, 3.10.
+- **Never run on hardware:** `motor_service`, the safety layer (including the silent-joint
+  watchdog, fixed 2026-11-04), any commanded motion.
 
 **Next steps, in order:**
-1. **IMU pose → URDF + `AXIS_REMAP`** (Shafeef is waiting for the URDF). Robot PC or a
-   Mac (Nicla's USB moved to it), motor power off, legs hanging straight, `imu_service`
-   stopped: `python3 imu_locate.py measure` (Mac: `.venv/bin/python imu_locate.py measure
-   --port /dev/cu.usbmodem…`). That's three resting poses plus four ruler readings
-   from the hip-pitch axis, and it writes `description/imu_mount.json`, the URDF's
-   `imu_link`/`imu_joint`, `AXIS_REMAP` and the README's IMU table, then checks them and
-   runs a live tilt test. Procedure, diagrams and troubleshooting: **`docs/imu_locate.md`**.
-   Commit those four files, send Shafeef `description/`, and record the three quality
-   numbers it prints in the log here.
-
-   Optional: weigh the robot (the CAD says 4.72 kg).
-2. **Merge `merge-zmq-dev` into `main`** once the team has looked at it (it's on origin).
-   Until then, fresh clones land on the old docs.
-3. **Commit `99-dodo-can.rules`** from the robot PC. Optionally also its MJCF
-   `dodo_daimao.xml` (the meshed model `visualize_motor_state.py` used to load).
+1. **IMU: settle the pitch, then hand over the URDF.** The board sits off square on its
+   mount; the record is the exact fit (`refit --exact`), which beats the snapped one on
+   every reading so far. But the first live check (2026-11-04 log) read 3.9° of tilt
+   (3.8° nose-down, 0.6° right-down) on a phone-levelled robot, while 11-02's
+   phone-levelled pose 1 reads 0°: the two "level" placements differ by 3.8° in PITCH
+   and agree in roll. So one of them was pitched, or the board moved in between.
+   - Done: the Nicla is firm in its housing (< 1° of play); the axes and signs are
+     verified (second live check, both tilts PASS).
+   - Left: level the body properly once. Phone on the **top plate** (exactly parallel to
+     the body frame in the CAD). Read it, turn it 180° in place, read again; the
+     average cancels the phone's own bias (camera bump, case). Adjust the support until
+     the average is 0°/0°, with `python3 imu_locate.py level` running the whole time,
+     and read its line then.
+   - `level` < ~1°: the exact fit stands; one more `check --live` to have the PASS on
+     record. ~3° nose-down: 11-02's level pose was the off one; re-measure the
+     orientation with this careful level pose: `measure --skip-position --exact` (the
+     two tilted poses only need ~10°; lying the robot on its front / left side is fine).
+   Then send Shafeef `description/`. Optional: weigh the robot (the CAD says 4.72 kg).
+2. **Merge `merge-zmq-dev` into `main`** once the team has looked at it (it's on origin;
+   a fast-forward). Until then, fresh clones land on the old docs.
+3. ~~CAN udev rule~~ — done 2026-11-04 (`setup/99-dodo-can.rules`, verified on the
+   robot). Optional: an MJCF `dodo_daimao.xml` (the meshed model `visualize_motor_state.py`
+   used to load; it was on the old robot PC and may be lost).
 4. **Knee/ankle gear ratio.** A nameplate, CAD or WS25 number beats inference. Otherwise
    go limp, rotate an ankle through a known angle and read the turn delta:
-   `ratio = turns × 2π ÷ angle`. Wire it into `fleet_config.py` as a per-joint ratio, used
-   by every rad ↔ turns conversion (`_JointAdapter` in `motor_service`,
-   `to_rad`/`to_native` in `calibrate_joints.py`).
+   `ratio = turns × 2π ÷ angle`. Measure the knee on its own: if the ankles' ~32:1
+   holds for it too, the knee's real stops sit INSIDE its URDF range (2026-07-16 log).
+   Wire it into `fleet_config.py` as a per-joint ratio, used by every rad ↔ turns
+   conversion (`_JointAdapter` in `motor_service`, `to_rad`/`to_native` in
+   `calibrate_joints.py`).
 5. **Redo the calibration** (README bring-up step 3). Delete the July `joint_calib.py`
-   first. Record the `--check-persistence` verdict here.
+   first. Record the `--check-persistence` verdict here. `calibrate_joints.py` now polls
+   every motor and calls a silent one OFFLINE (2026-11-04 log); July's run did neither,
+   which may explain part of what went wrong. Watch the hip pitch (`upper_leg_*`) signs
+   in particular: their measured ranges are the mirror evidence (`fleet_config.py`).
 6. **Wire the calibration into `motor_service`:** a per-joint sign and the measured
    motor → joint mapping in `_JointAdapter`, and `BOOT_POSE_RAD` ← the measured stops. Mind
    which stop each joint is folded against: knees at `sim_lo`, ankles at `sim_hi`, while
@@ -119,6 +134,85 @@ and nothing has been commanded on the robot yet.
 ---
 
 ## 4. Log (newest first)
+
+### 2026-11-04 — new robot machine; silent-joint watchdog fixed; IMU refit exact
+Moved to `TUM770035243-11` (§0). Full review of both repos; no motor was enabled.
+- **Hardware (user): node 7's driver (`lower_leg_right`, per the config) had loose
+  cables and connector. Refitted and re-soldered; a major issue, fixed.** That likely
+  explains July's `lower_leg_right` "never moved" (stops 0.03 turns apart), and it is
+  exactly the failure the old watchdog would have missed. The node → joint mapping is
+  still the July calibration's word only (it agreed with `fleet_config.py` for all four
+  ODrives); a hand-move check against `candump` would settle it in minutes.
+- **First IMU live check (user, phone level), exact fit:** level step 3.9° (3.8°
+  nose-down, 0.6° right-down) — FAIL; nose-down PASS (+55° about +y); left-down FAIL
+  only because the robot wasn't rolled in time (+3° about x). The snapped remap would
+  have read 7.7° on the same data. Today's and 11-02's phone-levelled poses differ by
+  3.8° in pitch and agree in roll: open question, §2 step 1. Tooling: `imu_locate.py
+  level` (live tilt readout while levelling), and the live check now says "re-run" for a
+  tilt that never got there, keeping "re-measure" for one that went the wrong way.
+- **Second live check:** nose-down PASS, left-down PASS (the first had been rolled to
+  the user's left, i.e. the robot's right; the gantry cable under the hip makes a clean
+  sideways tilt awkward). With a proper rotation, x and y right means all three axes
+  right: signs/axes are verified. Level 3.2° (2.9° nose-down, 1.3° right-down), against
+  3.9° (3.8°/0.6°) the first time. The Nicla is firm in its housing (< 1° of play). CAD
+  check: the top plate and base plates of `body.STL` are exactly parallel to the body
+  frame, so the top plate is the right phone reference; the remaining suspect is the
+  phone's own bias, which differs with how it lies (§2 step 1).
+- **Safety bug, fixed: the per-joint feedback watchdog could never fire.** `has_feedback`
+  meant "has ever reported": the ODrive driver keeps its last encoder frame, `damiao_motor`
+  1.0.6 never clears or timestamps its state (and its polling thread exits *silently* on any
+  bus error), and `_safety_check` refreshed the watchdog timestamp every tick. A dead
+  joint, bus or polling thread would have kept publishing frozen numbers flagged as live.
+  Now both drivers have `feedback_age()` (DamiaoJoint timestamps the library's
+  `decode_sensor_feedback`), `has_feedback` means younger than
+  `fleet_config.FEEDBACK_FRESH_S` (0.1 s), and the watchdog e-stops when an ODrive that
+  has streamed, or a Damiao while enabled, is silent for > `FB_WATCHDOG_S`. A silent
+  ODrive also loses its calibration: a rebooted drive re-zeroes its encoder. Disabled
+  Damiaos are silent by design and now show `has_feedback: false`; `demo_combined`'s
+  default joint list no longer depends on it. Watchdog timing moved to the monotonic
+  clock. `test_motor_watchdog.py` runs the real service, drivers and `damiao_motor` on
+  python-can's `virtual` bus against a fake fleet; mutating any of the four pieces makes
+  it fail.
+- **`calibrate_joints.py` couldn't see a silent motor, and never polled.** `Fleet.read()`
+  returned the cached value (0.0 before any frame), so `online()` always said 8/8 and
+  `--check-persistence` would have called an offline drive "BOOT-RELATIVE". It also sent
+  nothing, so the Damiaos (which only answer frames) were frozen at their enable reply
+  unless they stream on their own. Unknown which, but it may explain part of the July
+  run. It now pokes every motor before reading (zero-gain MIT frame / RTR, like
+  `read_motor_state.py`) and returns None for one without fresh feedback.
+  `read_motor_state.py`'s Damiao ONLINE uses freshness too.
+- **IMU: 2026-11-02 quality numbers** (they are in `imu_mount.json`, never logged): level
+  vs z axis 4.44°, snapped vs exact 4.73°, cross-check 0.43°. The level pose says the
+  board sits ~4.4° off square, and it looks tilted. Snapped, a level robot would have read
+  3.6° nose-down and 2.6° right-side-down, and the live check's level test
+  (`g_z < −0.97`, ~14°) let it through. Now: `imu_locate.py refit [--exact]` re-solves
+  from the record's stored poses (no IMU), and the live level step fails above 2°. The
+  record is refit **exact** (chip x→left 3.0°, y→forward 4.0°, z→down 4.4° off square;
+  `imu_joint` rpy −3.0785 −0.0449 1.5980). Not yet confirmed by a live check (§2 step 1).
+  The two files not pushed on 11-02 came in as `1c826a4`.
+- **Sign evidence re-read** (`fleet_config.py`, README): mirrored hip-ROLL ranges are
+  expected (both hips share +x, so + is outward on the left and inward on the right),
+  which fits July's +1/+1. The hip-PITCH pair is the real evidence of an inverted motor,
+  and July never measured it. The 2026-07-16 knee-ratio remark was backwards (corrected
+  there).
+- **CAN udev rule committed as `setup/99-dodo-can.rules`** (the old robot PC's was never
+  committed): adapter `0027…3438` → `can_dm`, `0038…3438` → `can_od`, each brought up at
+  1 Mbit by the rule. Verified on the robot, motors powered, nothing enabled: ODrive
+  nodes 3/4/7/8 stream on `can_od` (all IDLE, axis_error 0, encoder estimates at
+  100 Hz); Damiao 1/2/5/6 answer a register read (MST_ID) on `can_dm` with feedback ids
+  0x11/0x12/0x15/0x16, as in `fleet_config.py`. `odrive_can_scan.py` now defaults to
+  `can_od`.
+- **The ODrives aren't configured alike.** Node 7 streams exactly what
+  `odrive_can_setup.py` sets (heartbeat, encoder, torques at 100 Hz). Nodes 3/4/8 send
+  heartbeats at 10 Hz plus motor_error, iq, bus_v_i, torques and powers (node 8 also
+  temperature) at 100 Hz each, presumably WS25's config. That's ~2200 frames/s, ~28 % of
+  the 1 Mbit bus, before `motor_service`'s 4 × 200 Hz commands. Fine for now; if the bus
+  gets tight, run `odrive_can_setup.py` (USB) on 3/4/8. Only encoder estimates and
+  torques are read; heartbeats (axis state/error) are too.
+- Small: `rl_env.py` / `dodo_rl` `dodo.py` said +0.2 `upper_leg` = "thigh forward"; it's
+  back. `dodo.py` claimed kp 30 / kd 0.5; the actuator is 32 / 3. `read_motor_state.py`
+  docs said can0/can1.
+- Suite on Python 3.12: 153 passed, 1 known failure, 1 skip.
 
 ### 2026-11-02 — `imu_locate.py` cleared to run from the Mac
 The robot PC had an issue, so the IMU session moves to the dev Mac. Nothing in the tool
@@ -220,8 +314,11 @@ motion from it).
   independently measured **13.402** and **13.346** motor turns between their hard stops
   (agreeing to 0.4 %, so real, repeatable stops). As `1 turn = 2π rad` that would be an
   84 rad ankle. Against the URDF's ankle range it is roughly **32:1**; `lower_leg_left`
-  implies ~19.7, likely because the knee's real stops sit outside its URDF limits, so the
-  ratio is not yet trustworthy. With the wrong conversion the ODrive joints under-travel
+  implies ~19.7, so the ratio is not yet trustworthy. *(Corrected 2026-11-04: this said
+  "likely because the knee's real stops sit outside its URDF limits", which is backwards.
+  inferred = true ratio × real range ÷ URDF range, so 19.7 against a true 32:1 means the
+  knee's real travel is ~2.8 rad, INSIDE the URDF's 4.54 rad; or the knee has its own
+  ratio.)* With the wrong conversion the ODrive joints under-travel
   ~32× ("nothing moves", not "drives into the stop").
 - **Known bad in `joint_calib.py`:** `upper_leg_left`/`upper_leg_right` missing entirely;
   `lower_leg_right` never moved (stops 0.03 turns apart); both hips under-measured on one
@@ -330,17 +427,25 @@ gain-tuning tool.
 - **Nicla:** USB-CDC doesn't reset on port open, so the first command after opening is
   reliably dropped (`query_version` retries). At 115200 baud the poll capped at ~41 Hz;
   v2 runs at 921600.
-- References on the robot PC: `~/Downloads/can_simple_utils.py`,
-  `~/Desktop/dodo_ros2/dodo/dodo/odrive_interface.py`,
+- **Feedback is only as good as its age.** Both drivers cache their last frame forever;
+  check `feedback_age()` against `fleet_config.FEEDBACK_FRESH_S`, never the cached
+  numbers alone. A Damiao only answers frames (enable, MIT command, limp probe, register
+  read), so it is silent while disabled by design. `damiao_motor`'s polling thread exits
+  silently on any bus exception. ODrives stream cyclic frames whether enabled or not.
+- References that were on the OLD robot PC (not on `TUM770035243-11`):
+  `~/Downloads/can_simple_utils.py`, `~/Desktop/dodo_ros2/dodo/dodo/odrive_interface.py`,
   `~/Documents/ros_odrive-main/odrive_node/src/odrive_can_node.cpp` (full cmd-id table).
 
 ## 6. Environment / gotchas
-- Robot PC: system `python3` (3.10). `pip install -r requirements.txt` (pyzmq, mujoco,
-  onnxruntime, python-can, `damiao_motor==1.0.6`, pyserial). `odrive==0.6.11.post0` only
-  for the USB tools. There is also an editable `damiao_motor` 1.0.7b2 in the uv cache; the
-  regular 1.0.6 is what `python3` imports. Its source, for reading internals:
-  `/home/dodo/Documents/dodo/Damiao Control/python-damiao-driver/damiao_motor/`.
-- CAN bitrates are set at OS level (`ip link`), never by python-can.
+- Robot machine (`TUM770035243-11`): Python 3.12, repo `.venv` from `requirements.txt`
+  (pyzmq, mujoco, onnxruntime, python-can, `damiao_motor==1.0.6`, pyserial).
+  `odrive==0.6.11.post0` only for the USB tools. `damiao_motor`'s source, for reading its
+  internals: `.venv/lib/python3.12/site-packages/damiao_motor/core/`. The user needs to be
+  in `dialout` for the Nicla (README *Machine setup*).
+- Old robot PC, for the record: system `python3` 3.10, an editable `damiao_motor` 1.0.7b2
+  in the uv cache next to the regular 1.0.6.
+- CAN bitrates are set at OS level, never by python-can: `setup/99-dodo-can.rules`
+  brings both buses up at 1 Mbit when the adapters appear (by hand: `ip link`).
 - `can0`/`can1` are enumeration order, not identity: use the udev names
   `can_dm`/`can_od`.
 - The direct-CAN tools (`read_motor_state`, `calibrate_joints`, `visualize_motor_state`,

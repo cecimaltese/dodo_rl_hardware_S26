@@ -95,12 +95,20 @@ OD_JOINTS = [
 # Mechanical range of each joint, in RADIANS — the single source of truth for position
 # safety. _JointAdapter converts to each motor's native units (Damiao=rad, ODrive=turns).
 #
-# The Damiao rows are REAL MEASURED ranges (2026-07-06), NOT the URDF's. They are
-# asymmetric and left/right MIRRORED, while the URDF gives both sides identical
-# symmetric limits (hip +/-0.35, upper_leg +/-1.57) and the same axis. That mismatch is
-# an open BLOCKER: it implies the real motor frames are mirrored vs the sim, and there is
-# NO per-joint sign/zero layer in the control path. Calibrate with read_motor_state.py
-# (LIMP) before commanding motion. The ODrive rows are still the URDF values = UNMEASURED.
+# The Damiao rows are REAL MEASURED ranges (2026-07-06), NOT the URDF's (which gives
+# both sides identical symmetric limits, hip +/-0.35 and upper_leg +/-1.57, on the same
+# axis). They are asymmetric and left/right mirrored, which means different things for
+# the two pairs (2026-11-04):
+#   * hip roll: mirrored is EXPECTED. Both hips share the +x axis, so +roll swings
+#     EITHER foot toward the robot's left: outward for the left leg, inward for the
+#     right. Symmetric stops therefore read (-in, +out) on the left and (-out, +in) on
+#     the right. Consistent with July's calibration, which found sign +1 on both.
+#   * hip pitch: mirrored is NOT expected (it is the same motion on both legs), so
+#     (-0.32, 2.38) vs (-2.30, 0.29) points to ONE upper_leg motor reading inverted
+#     vs the URDF. July's calibration never measured this pair.
+# Either way there is NO per-joint sign/zero layer in the control path yet: calibrate
+# (calibrate_joints.py) before commanding motion. The ODrive rows are still the URDF
+# values = UNMEASURED.
 JOINT_LIMITS_RAD = {
     # Damiao — measured on the robot
     "hip_left":        (-0.966,  0.641),  "hip_right":       (-0.544, 1.104),   # hip roll
@@ -132,6 +140,13 @@ RATED_TORQUE_NM = {
 }
 
 JOINT_VEL_LIMIT_RAD = 6.0    # URDF velocity limit (rad/s), same for all joints.
+
+# Feedback older than this is not "current". Both drivers cache their last frame
+# forever, so every consumer must check feedback_age() against this instead of
+# trusting the cached numbers. Healthy rates: ODrive cyclic encoder frames every 10 ms
+# (odrive_can_setup.py), a Damiao reply to every command (200 Hz from motor_service).
+# 0.1 s = ~10 missed frames. Silence beyond motor_service.FB_WATCHDOG_S is an e-stop.
+FEEDBACK_FRESH_S = 0.1
 
 # NOTE (ODrive gearing): unit conversion assumes 1 motor turn == 2*pi rad at the joint
 # (direct drive). If the T-Motor/ODrive joints are geared, this scaling — and therefore

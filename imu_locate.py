@@ -25,8 +25,10 @@ Step by step: docs/imu_locate.md.
     python3 imu_locate.py measure --skip-orientation # redo only the position
     python3 imu_locate.py measure --xyz-mm 12 0 110  # position already known (body frame)
     python3 imu_locate.py apply                      # record -> URDF, AXIS_REMAP, README
+    python3 imu_locate.py refit --exact              # re-solve from the recorded poses (no IMU)
     python3 imu_locate.py check                      # do all of them agree, MuJoCo too?
     python3 imu_locate.py check --live               # + tilt the robot, watch the policy's view
+    python3 imu_locate.py level                      # live tilt readout, for levelling
 """
 
 from __future__ import annotations
@@ -73,6 +75,10 @@ POSE_UP = {name: np.array(up) for name, up, _ in POSES}
 STILL_DPS = 8.0            # mean rotation rate above which a pose reading is redone
 SNAP_LIMIT_DEG = 10.0      # max snapped-vs-exact gap still treated as a square mount
 CROSSCHECK_LIMIT_DEG = 20.0
+# Live check, robot level: the policy may see at most this much tilt. It used to be
+# g_z < -0.97 (~14 deg), which let the 2026-11-02 snapped mount through with ~4.4 deg
+# of phantom tilt. A phone spirit level is good to ~0.5 deg.
+LIVE_LEVEL_DEG = 2.0
 
 # Nicla Sense ME: a 22.86 x 22.86 mm board. The mass (board + mount) is a guess; at a
 # few grams on a 4.7 kg robot it only exists so importers that keep fixed links don't
@@ -625,8 +631,8 @@ def run_checks(record_path=RECORD_PATH, urdf_path=URDF_PATH,
     return fails
 
 
-def live_check(ser, ver, timeout_s: float = 20.0) -> bool:
-    """Tilt the robot and watch what the policy would see, through the deployment path
+def policy_view(ser, ver):
+    """A read() -> (projected_gravity, gyro) or None, through the deployment path
     (imu_protocol's AXIS_REMAP, imu_service's scales, ZmqEnv's projected gravity)."""
     from imu_service import sensor_scales
     from rl_env import projected_gravity_from_quat
@@ -644,19 +650,43 @@ def live_check(ser, ver, timeout_s: float = 20.0) -> bool:
         else:
             g = -_unit(r["accel"])
         return g, np.asarray(r["gyro"], dtype=float)
+    return read
+
+
+def tilt_parts(g) -> tuple:
+    """(tilt, nose_down, right_down) in degrees for a body-frame gravity vector, i.e.
+    how tilted the policy thinks the body is. Level = (0, 0, -1) = no tilt."""
+    g = _unit(g)
+    return (angle_deg(g, (0.0, 0.0, -1.0)),
+            math.degrees(math.asin(float(np.clip(g[0], -1, 1)))),
+            math.degrees(math.asin(float(np.clip(-g[1], -1, 1)))))
+
+
+def live_check(ser, ver, timeout_s: float = 20.0) -> bool:
+    """Tilt the robot and watch what the policy would see, through the deployment path."""
+    read = policy_view(ser, ver)
 
     print("\n=== LIVE CHECK: what the policy will see ===")
     print("projected_gravity is gravity in the body frame (level = (0, 0, -1)).")
-    input("\n  1. Robot LEVEL and still. Press Enter... ")
+    input("\n  1. Robot LEVEL (spirit level ~0 deg both ways) and still. Press Enter... ")
     gravity = [s[0] for s in (read() for _ in range(30)) if s is not None]
-    g = np.mean(gravity, axis=0) if gravity else np.zeros(3)
-    ok_level = g[2] < -0.97
+    g = np.mean(gravity, axis=0) if gravity else np.array([0.0, 0.0, 1.0])
+    tilt, nose, right = tilt_parts(g)
+    ok_level = tilt < LIVE_LEVEL_DEG
     print(f"  [{'PASS' if ok_level else 'FAIL'}] level      projected_gravity = "
-          f"({g[0]:+.2f}, {g[1]:+.2f}, {g[2]:+.2f})   want (0, 0, -1)")
+          f"({g[0]:+.3f}, {g[1]:+.3f}, {g[2]:+.3f})   want (0, 0, -1)")
+    print(f"             the policy reads {tilt:.1f} deg of tilt ({nose:+.1f} nose-down, "
+          f"{right:+.1f} right-down); limit {LIVE_LEVEL_DEG:.0f}")
+    if not ok_level:
+        print("             Either the robot isn't level (watch `imu_locate.py level` while "
+              "you level it), or AXIS_REMAP is off by that much.")
 
-    def motion(step, what, g_axis, w_axis, w_sign):
-        input(f"\n  {step}. From level, press Enter, then slowly tilt {what} ~45 deg and hold... ")
+    def motion(step, what, g_axis, w_axis, w_sign) -> str:
+        """'ok', 'short' (never got there: a re-run, not a remap problem) or 'wrong'."""
+        input(f"\n  {step}. From level, press Enter, then within {timeout_s:.0f} s tilt "
+              f"{what} ~45 deg and hold... ")
         turned, held, t_prev = np.zeros(3), 0, time.monotonic()
+        lo, hi = 0.0, 0.0
         t_end = t_prev + timeout_s
         while time.monotonic() < t_end and held < 10:
             s = read()
@@ -666,23 +696,69 @@ def live_check(ser, ver, timeout_s: float = 20.0) -> bool:
                 continue
             g, w = s
             turned += w * dt
+            lo, hi = min(lo, g[g_axis]), max(hi, g[g_axis])
             held = held + 1 if g[g_axis] > 0.5 else 0
             print(f"\r     projected_gravity = ({g[0]:+.2f}, {g[1]:+.2f}, {g[2]:+.2f})   "
                   f"turned = ({', '.join(f'{math.degrees(v):+4.0f}' for v in turned)}) deg ",
                   end="", flush=True)
         print()
         dom = int(np.argmax(np.abs(turned)))
-        ok = held >= 10 and dom == w_axis and np.sign(turned[dom]) == w_sign
-        print(f"  [{'PASS' if ok else 'FAIL'}] {what:10s} want gravity {'xyz'[g_axis]} > +0.5 "
-              f"and the turn mostly about {'+' if w_sign > 0 else '-'}{'xyz'[w_axis]}")
-        return ok
+        axis = "xyz"[g_axis]
+        want = (f"want gravity {axis} > +0.5 and the turn mostly about "
+                f"{'+' if w_sign > 0 else '-'}{'xyz'[w_axis]}")
+        if held >= 10 and dom == w_axis and np.sign(turned[dom]) == w_sign:
+            print(f"  [PASS] {what:10s} {want}")
+            return "ok"
+        if held < 10 and lo > -0.5:
+            print(f"  [FAIL] {what:10s} {want}\n"
+                  f"         it never got there: gravity {axis} peaked at {hi:+.2f} in "
+                  f"{timeout_s:.0f} s. Tilt further or sooner and re-run; this is NOT a "
+                  f"remap problem.")
+            return "short"
+        print(f"  [FAIL] {what:10s} {want}\n"
+              f"         it went the other way (gravity {axis} reached {lo:+.2f}, turn "
+              f"{math.degrees(turned[dom]):+.0f} deg about {'xyz'[dom]}). If you really "
+              f"tilted {what}, the remap is wrong.")
+        return "wrong"
 
-    ok_x = motion(2, "nose-down", 0, 1, +1)    # +y rotation pitches the nose down
-    ok_y = motion(3, "left-down", 1, 0, -1)    # -x rotation drops the left side
-    ok = ok_level and ok_x and ok_y
-    print(f"\n  LIVE: {'PASS' if ok else 'FAIL'}" + ("" if ok else
-          " — AXIS_REMAP or a pose is wrong. Re-run `imu_locate.py measure --skip-position`."))
+    res = [motion(2, "nose-down", 0, 1, +1),    # +y rotation pitches the nose down
+           motion(3, "left-down", 1, 0, -1)]    # -x rotation drops the left side
+    ok = ok_level and res == ["ok", "ok"]
+    if ok:
+        print("\n  LIVE: PASS")
+    elif "wrong" in res:
+        print("\n  LIVE: FAIL — AXIS_REMAP or a pose is wrong. Re-run "
+              "`imu_locate.py measure --skip-position`.")
+    elif "short" in res:
+        print("\n  LIVE: FAIL — a tilt didn't get there in time. Re-run "
+              "`imu_locate.py check --live`" + ("." if ok_level else
+                                                 "; and see the level step above."))
+    else:
+        print("\n  LIVE: FAIL — only the level step: see above.")
     return ok
+
+
+def cmd_level(args) -> int:
+    """Live readout for levelling: the tilt the policy sees, a few times a second.
+    Level the body with a spirit level and compare. Ctrl-C to stop."""
+    ser, ver = _open(args)
+    read = policy_view(ser, ver)
+    print("What the policy sees, live. Level the body with a spirit level on a flat body "
+          "face and compare. Ctrl-C to stop.")
+    try:
+        while True:
+            gs = [s[0] for s in (read() for _ in range(15)) if s is not None]
+            if not gs:
+                print("\r  (no reading)" + " " * 60, end="", flush=True)
+                continue
+            g = np.mean(gs, axis=0)
+            tilt, nose, right = tilt_parts(g)
+            print(f"\r  projected_gravity ({g[0]:+.3f}, {g[1]:+.3f}, {g[2]:+.3f})   "
+                  f"tilt {tilt:4.1f} deg: {nose:+5.1f} nose-down, {right:+5.1f} right-down ",
+                  end="", flush=True)
+    except KeyboardInterrupt:
+        print()
+        return 0
 
 
 # --- CLI ----------------------------------------------------------------------------
@@ -753,6 +829,56 @@ def cmd_measure(args) -> int:
     return 0 if live_check(ser, ver) else 1
 
 
+def refit_record(old: dict, exact: bool):
+    """The record re-solved from its own stored pose readings: (record, problems).
+    The record is None when there are problems. Only `axis_remap` and `orientation`
+    change (the raw readings and measurement date stay; `orientation.refit` notes
+    when this happened); everything else is kept as it was, comment included."""
+    o = old["orientation"]
+    ups = {k: np.asarray(v, dtype=float) for k, v in o["up_board"].items()}
+    r, info, problems = solve_orientation(ups, exact=exact)
+    if r is not None:
+        report_orientation(r, info)
+    if problems:
+        return None, problems
+    info["measured"] = o.get("measured")
+    info["firmware"] = o.get("firmware")
+    info["refit"] = datetime.date.today().isoformat()
+    fresh = make_record(r, info, old["xyz_m"], old["position"])
+    return {**old, "axis_remap": fresh["axis_remap"], "orientation": info}, []
+
+
+def cmd_refit(args) -> int:
+    """Re-solve the orientation from the poses stored in the record. No IMU needed.
+
+    The record keeps the raw up-vector of each pose, so switching between the snapped
+    mount and the exact fit (`--exact`) doesn't need the robot turned over again. Use
+    it when the level pose WAS level but the board sits tilted on its mount (the
+    2026-11-02 case: snapped left ~4.4 deg of phantom tilt).
+    """
+    old = load_record(args.record)
+    rec, problems = refit_record(old, args.exact)
+    if problems:
+        print("\n  PROBLEMS:")
+        for p in problems:
+            print(f"   * {p}")
+        return 1
+    print(f"\n  was: {old['orientation'].get('mode', '?')}, now: "
+          f"{rec['orientation']['mode']} "
+          f"({rotation_deg(old['axis_remap'], rec['axis_remap']):.2f} deg apart)")
+    if not args.yes and input(f"\n  Write {args.record.name}, the URDF, AXIS_REMAP and the "
+                              f"README? [Y/n] ").strip().lower().startswith("n"):
+        return 1
+    save_record(rec, args.record)
+    print(f"  wrote the record             -> {args.record}")
+    apply_record(rec, args.urdf)
+    print("\n=== STATIC CHECK ===")
+    fails = run_checks(args.record, args.urdf)
+    if not fails:
+        print("\n  Verify on the robot: python3 imu_locate.py check --live")
+    return 1 if fails else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -778,9 +904,19 @@ def main() -> int:
 
     sub.add_parser("apply", help="regenerate URDF, AXIS_REMAP and README from the record")
 
+    f = sub.add_parser("refit", help="re-solve the orientation from the recorded poses "
+                                     "(no IMU), e.g. snapped -> --exact")
+    f.add_argument("--exact", action="store_true",
+                   help="keep the fitted rotation instead of snapping to a square mount")
+    f.add_argument("--yes", action="store_true", help="write without asking")
+
     c = sub.add_parser("check", help="verify record, URDF, AXIS_REMAP and MuJoCo agree")
     serial_args(c)
     c.add_argument("--live", action="store_true", help="also tilt the robot and watch")
+
+    lv = sub.add_parser("level", help="live readout of the tilt the policy sees, for "
+                                      "levelling the robot (Ctrl-C to stop)")
+    serial_args(lv)
 
     args = ap.parse_args()
     if args.cmd != "measure" and not args.record.exists():
@@ -788,6 +924,10 @@ def main() -> int:
     try:
         if args.cmd == "measure":
             return cmd_measure(args)
+        if args.cmd == "refit":
+            return cmd_refit(args)
+        if args.cmd == "level":
+            return cmd_level(args)
         if args.cmd == "apply":
             apply_record(load_record(args.record), args.urdf)
             return 1 if run_checks(args.record, args.urdf) else 0

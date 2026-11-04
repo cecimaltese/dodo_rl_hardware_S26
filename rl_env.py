@@ -66,9 +66,9 @@ if _os.environ.get("DODO_JOINT_ORDER"):
 # MuJoCo at ~0.44 m base height.
 _DEFAULT_POS_PATTERNS = {
     "hip_": 0.0,         # hip roll neutral
-    "upper_leg_": 0.20,  # hip pitch (thigh forward)
-    "lower_leg_": -0.50, # knee folds backward (bird-like)
-    "foot_": 0.30,       # ankle keeps the sole flat
+    "upper_leg_": 0.20,  # hip pitch: + swings the thigh BACK (URDF axis +y)
+    "lower_leg_": -0.50, # knee: - swings the shank forward, knee points back (bird-like)
+    "foot_": 0.30,       # ankle: + toes down; 0.2 - 0.5 + 0.3 = 0 keeps the sole flat
 }
 
 

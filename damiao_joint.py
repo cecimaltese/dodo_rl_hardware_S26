@@ -56,6 +56,7 @@ class DamiaoJoint:
             feedback_id=config.feedback_id,
             motor_type=config.motor_type,
         )
+        self._stamp_feedback()
         self.motor.ensure_control_mode("MIT")
 
         # Software zero offset (rad), so set_zero() can be re-applied at runtime
@@ -70,6 +71,38 @@ class DamiaoJoint:
         self._move_t0: float = 0.0
         self._move_duration: float = 0.0
         self._move_ramp: float = 0.0
+
+    def _stamp_feedback(self) -> None:
+        """Timestamp every sensor-feedback frame this motor receives.
+
+        damiao_motor (1.0.6, pinned) keeps the last feedback frame forever and never
+        says how old it is, so a motor that stopped answering — or the library's
+        polling thread, which exits SILENTLY on any bus error — would go on
+        "reporting" its last position. The library's poll loop calls
+        motor.process_feedback_frame(), which hands sensor frames to
+        self.decode_sensor_feedback(); wrapping that instance method sees exactly
+        the frames that update get_states(). Register replies don't count: they
+        carry no state. test_motor_watchdog.py fails if the library stops routing
+        frames this way.
+        """
+        self._last_fb_time: Optional[float] = None
+        decode = self.motor.decode_sensor_feedback
+
+        def stamped(data, arbitration_id=None):
+            out = decode(data, arbitration_id=arbitration_id)
+            self._last_fb_time = time.monotonic()
+            return out
+
+        self.motor.decode_sensor_feedback = stamped
+
+    def feedback_age(self) -> Optional[float]:
+        """Seconds since the last sensor-feedback frame, or None if none arrived.
+
+        A Damiao only answers frames (enable, MIT commands, the limp probe), so
+        while nothing is sent to it this grows by design.
+        """
+        t = self._last_fb_time
+        return None if t is None else time.monotonic() - t
 
     # ── enable / disable ──────────────────────────────────────────
     def enable(self) -> None:

@@ -15,14 +15,14 @@ Motors are read LIMP by default:
   * ODrive — pure listen (+ optional RTR polling). Never commanded closed-loop.
 Pass --hold to read Damiao with its configured kp/kd instead (it will resist).
 
-Prereqs (TWO buses -- can0 = Damiao, can1 = ODrive; see fleet_config.py):
-  sudo ip link set can0 up type can bitrate 1000000
-  sudo ip link set can1 up type can bitrate 1000000
-  python3 odrive_can_setup.py --node-id N               # once PER DRIVE, over USB
+Prereqs (TWO buses -- can_dm = Damiao, can_od = ODrive, named by
+setup/99-dodo-can.rules; see fleet_config.py):
+  ip -details link show can_dm                     # UP, bitrate 1000000 (the rule does it)
+  python3 odrive_can_setup.py --node-id N          # once PER DRIVE, over USB
 Then:
   python3 read_motor_state.py                      # whole fleet, both buses
   python3 read_motor_state.py --damiao-only --hz 20 # just the Damiao motors, faster
-  python3 read_motor_state.py --odrive-only        # just the ODrives (can1)
+  python3 read_motor_state.py --odrive-only        # just the ODrives (can_od)
   python3 read_motor_state.py --hold               # Damiao with real gains (RESISTS)
 
 NOTE (verify against your damiao_motor version): DamiaoJoint.get_state() returns
@@ -188,7 +188,9 @@ def main():
                     raw = j.motor.get_states() or {}
                 except Exception:
                     pass
-                online = bool(raw)
+                # Fresh, not "ever": damiao_motor keeps the last frame forever.
+                age = j.feedback_age()
+                online = age is not None and age < FRESH_S
                 if online:
                     last_seen[name] = now
                 st = j.get_state() if online else {}

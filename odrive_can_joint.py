@@ -71,7 +71,9 @@ class OdriveCanJoint:
         self._torque_est: float = 0.0   # Nm
         self._axis_error: int = 0
         self._axis_state: int = AXIS_STATE_IDLE
-        self._last_fb_time: float = 0.0
+        # time.monotonic() of the last encoder frame; None until one arrives. The
+        # cached pos/vel are only as current as this — see feedback_age().
+        self._last_fb_time: Optional[float] = None
 
         # Software zero offset (turns).
         self._zero_offset: float = 0.0
@@ -137,6 +139,20 @@ class OdriveCanJoint:
     def get_torque(self) -> float:
         return self._torque_est
 
+    def feedback_age(self) -> Optional[float]:
+        """Seconds since the last encoder frame, or None if none ever arrived.
+
+        The cached position/velocity never expire on their own: a drive that
+        stopped talking keeps "reporting" its last values. Anything that acts on
+        them must check this first.
+        """
+        t = self._last_fb_time
+        return None if t is None else time.monotonic() - t
+
+    def request_feedback(self) -> None:
+        """RTR-poll Get_Encoder_Estimates (harmless if cyclic feedback is on)."""
+        self._send(CMD_GET_ENCODER_ESTIMATES, b"", rtr=True)
+
     def get_state(self) -> dict:
         return {
             "pos": self.get_position(),
@@ -144,7 +160,7 @@ class OdriveCanJoint:
             "torque": self._torque_est,
             "axis_state": self._axis_state,
             "axis_error": self._axis_error,
-            "fb_age": time.time() - self._last_fb_time if self._last_fb_time else None,
+            "fb_age": self.feedback_age(),
         }
 
     # ── commands ──────────────────────────────────────────────────
@@ -233,7 +249,7 @@ class OdriveCanJoint:
             pos, vel = struct.unpack("<ff", msg.data[:8])
             self._raw_pos = pos
             self._raw_vel = vel
-            self._last_fb_time = time.time()
+            self._last_fb_time = time.monotonic()
 
         elif cmd_id == CMD_GET_TORQUES and len(msg.data) >= 8:
             _torque_target, torque_est = struct.unpack("<ff", msg.data[:8])

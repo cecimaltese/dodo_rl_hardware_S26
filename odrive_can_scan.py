@@ -13,8 +13,8 @@ CAN Simple arbitration id = (node_id << 5) | cmd_id  (11-bit standard frame),
 so node_id is 6 bits (0..63) and cmd_id is 5 bits (0..31).
 
 Usage:
-    python3 odrive_can_scan.py                 # scan can0
-    python3 odrive_can_scan.py --channel can0 --listen 3.0
+    python3 odrive_can_scan.py                 # scan can_od (fleet_config.OD_CHANNEL)
+    python3 odrive_can_scan.py --channel can_dm --listen 3.0   # any other bus
 
 If NOTHING responds in either phase, the problem is physical (power, 120 Ohm
 termination, CAN_H/CAN_L swap/break) or a bitrate mismatch — not software.
@@ -26,6 +26,8 @@ import time
 from collections import defaultdict
 
 import can
+
+from fleet_config import OD_CHANNEL
 
 CMD_HEARTBEAT = 0x01
 CMD_GET_ENCODER_ESTIMATES = 0x09
@@ -110,7 +112,7 @@ def active_sweep(bus: can.BusABC, per_node_wait: float) -> list:
 
 def main():
     ap = argparse.ArgumentParser(description="Scan a CAN bus for live ODrive nodes.")
-    ap.add_argument("--channel", default="can0")
+    ap.add_argument("--channel", default=OD_CHANNEL)
     ap.add_argument("--bustype", default="socketcan")
     ap.add_argument("--listen", type=float, default=2.0, help="passive listen seconds")
     ap.add_argument("--wait", type=float, default=0.03, help="per-node reply wait (s)")
