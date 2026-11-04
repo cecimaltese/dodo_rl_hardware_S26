@@ -74,7 +74,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import math
 import threading
 import time
 from typing import Dict, List, Optional, Union
@@ -83,6 +82,7 @@ import can
 from damiao_motor import DaMiaoController
 
 import dodo_ipc as ipc
+import real2sim
 from damiao_joint import DamiaoJoint
 from odrive_can_joint import OdriveCanJoint
 from fleet_config import (DM_JOINTS, OD_JOINTS, DM_CHANNEL, OD_CHANNEL, BUSTYPE,
@@ -91,7 +91,6 @@ from fleet_config import (DM_JOINTS, OD_JOINTS, DM_CHANNEL, OD_CHANNEL, BUSTYPE,
 
 log = logging.getLogger("motor_service")
 
-TWO_PI = 2.0 * math.pi
 DM_REGISTER_ID = 0x7FF  # Damiao register read/write reply arbitration id
 
 # --- Safety factors / thresholds -----------------------------------------------
@@ -147,12 +146,15 @@ class _JointAdapter:
             self.name, getattr(cfg, "rated_torque", None) or 9.0)
         self.torque_idle_limit = TORQUE_IDLE_FACTOR * self.rated_torque
 
-    # ── unit conversion (native is turns for ODrive, rad for Damiao) ──
+    # ── unit conversion (native is MOTOR turns for ODrive, rad for Damiao) ──
+    # real2sim's scale: ODrive 2*pi / fleet_config.GEAR_RATIO (1 while unmeasured),
+    # Damiao 1. Unit scale only: the measured sign/zero layer (joint_calib.py) is not
+    # wired into the service yet (HANDOFF §2).
     def to_native(self, rad: float) -> float:
-        return rad / TWO_PI if self.is_odrive else rad
+        return rad / real2sim.rad_per_native(self.name)
 
     def to_rad(self, native: float) -> float:
-        return native * TWO_PI if self.is_odrive else native
+        return native * real2sim.rad_per_native(self.name)
 
     def clamp_native(self, q: float) -> float:
         if self.pos_lo is not None:

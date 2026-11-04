@@ -41,64 +41,72 @@ contract it was trained with. `motor_service` + `imu_service` are the robot,
 `run_policy.py` drive either one. The policies so far come from the S26 Isaac Lab project
 `dodo_rl`. The next one is trained by Shafeef Omar from `description/`.
 
+**Roadmap (agreed with Shafeef, 2026-11-04):**
+1. Joints real → sim, accurately: mapping, sign, zero, gear ratio (`real2sim.py`; the
+   visualizer is the check).
+2. The real joint limits.
+3. A simple PD standing controller on the robot (joint-space PD to the default pose).
+4. Shafeef trains a standing policy; deploy it through `ZmqEnv`.
+5. Walking. Probably needs onboard compute (a Jetson) and a battery: later.
+
 ---
 
 ## 2. Current state (2026-11-04)
 The subsystem table is in the README (*Status*). In short: everything is verified in sim,
-the IMU pose is measured, and nothing has been commanded on the robot yet.
+the IMU pose is measured, CAN is up on the new machine, and nothing has been commanded on
+the robot yet.
 - **Verified:** the stand policy in MuJoCo (30 s+ lockstep; 10 s through the full ZMQ
-  stack), the IMU on the bench, power + CAN continuity on the repaired robot, and the IMU
-  pose on the robot (2026-11-02, refit exact 2026-11-04, see log). The test suite runs
-  anywhere: 153 passed, 1 known failure (the joint-order guard), 1 skip (stale flat run);
-  without `dodo_rl` beside the repo, 3 more training-side skips. Checked on Python 3.12
-  (new robot machine) and, before 2026-11-04, 3.10.
+  stack), the IMU on the bench and its pose on the robot (axes/signs by live check), power +
+  CAN on the repaired robot (all 8 motors answer), the visualizer reading the live
+  ODrives. The test suite runs anywhere: 168 passed, 1 known failure (the joint-order
+  guard), 1 skip (stale flat run); without `dodo_rl` beside the repo, 3 more
+  training-side skips. Python 3.12 (new robot machine); before 2026-11-04, 3.10.
 - **Never run on hardware:** `motor_service`, the safety layer (including the silent-joint
   watchdog, fixed 2026-11-04), any commanded motion.
 
-**Next steps, in order:**
-1. **IMU: settle the pitch, then hand over the URDF.** The board sits off square on its
-   mount; the record is the exact fit (`refit --exact`), which beats the snapped one on
-   every reading so far. But the first live check (2026-11-04 log) read 3.9° of tilt
-   (3.8° nose-down, 0.6° right-down) on a phone-levelled robot, while 11-02's
-   phone-levelled pose 1 reads 0°: the two "level" placements differ by 3.8° in PITCH
-   and agree in roll. So one of them was pitched, or the board moved in between.
-   - Done: the Nicla is firm in its housing (< 1° of play); the axes and signs are
-     verified (second live check, both tilts PASS).
-   - Left: level the body properly once. Phone on the **top plate** (exactly parallel to
-     the body frame in the CAD). Read it, turn it 180° in place, read again; the
-     average cancels the phone's own bias (camera bump, case). Adjust the support until
-     the average is 0°/0°, with `python3 imu_locate.py level` running the whole time,
-     and read its line then.
-   - `level` < ~1°: the exact fit stands; one more `check --live` to have the PASS on
-     record. ~3° nose-down: 11-02's level pose was the off one; re-measure the
-     orientation with this careful level pose: `measure --skip-position --exact` (the
-     two tilted poses only need ~10°; lying the robot on its front / left side is fine).
-   Then send Shafeef `description/`. Optional: weigh the robot (the CAD says 4.72 kg).
-2. **Merge `merge-zmq-dev` into `main`** once the team has looked at it (it's on origin;
-   a fast-forward). Until then, fresh clones land on the old docs.
-3. ~~CAN udev rule~~ — done 2026-11-04 (`setup/99-dodo-can.rules`, verified on the
-   robot). Optional: an MJCF `dodo_daimao.xml` (the meshed model `visualize_motor_state.py`
-   used to load; it was on the old robot PC and may be lost).
-4. **Knee/ankle gear ratio.** A nameplate, CAD or WS25 number beats inference. Otherwise
-   go limp, rotate an ankle through a known angle and read the turn delta:
-   `ratio = turns × 2π ÷ angle`. Measure the knee on its own: if the ankles' ~32:1
-   holds for it too, the knee's real stops sit INSIDE its URDF range (2026-07-16 log).
-   Wire it into `fleet_config.py` as a per-joint ratio, used by every rad ↔ turns
-   conversion (`_JointAdapter` in `motor_service`, `to_rad`/`to_native` in
-   `calibrate_joints.py`).
-5. **Redo the calibration** (README bring-up step 3). Delete the July `joint_calib.py`
-   first. Record the `--check-persistence` verdict here. `calibrate_joints.py` now polls
-   every motor and calls a silent one OFFLINE (2026-11-04 log); July's run did neither,
-   which may explain part of what went wrong. Watch the hip pitch (`upper_leg_*`) signs
-   in particular: their measured ranges are the mirror evidence (`fleet_config.py`).
-6. **Wire the calibration into `motor_service`:** a per-joint sign and the measured
-   motor → joint mapping in `_JointAdapter`, and `BOOT_POSE_RAD` ← the measured stops. Mind
-   which stop each joint is folded against: knees at `sim_lo`, ankles at `sim_hi`, while
-   `calibrate_joints.py --home` uses `sim_hi` for every joint.
-7. **First motion** (bring-up steps 5–6), then the Damiao gains toward the trained
-   kp 32 / kd 3 behavior (MIT units ≠ Isaac Lab units: match the step response, don't copy).
-8. **Shafeef's policy:** adapt `rl_env.py` to its contract, add the run to `policies/`,
-   rehearse on `sim_service`, then the gantry.
+**Next steps, in order** (roadmap step 1 is 1–4 here):
+1. **Knee/ankle gear ratios.** `python3 calibrate_joints.py --ratio <joint>` for each of
+   `lower_leg_left/right`, `foot_left/right`: hold the link above still, phone on its edge
+   on the moving link, turn the joint 40–80°, type the two angles; 2–3 turns each. A
+   nameplate/CAD/WS25 number beats this if anyone has one. Enter them in
+   `fleet_config.GEAR_RATIO`. Check: turn an ankle 90° with `visualize_motor_state.py`
+   running — the model must turn 90°. (If the ankles' ~32:1 holds for the knee too, its
+   real stops sit inside its URDF range: 2026-07-16 log.)
+2. **Persistence:** `calibrate_joints.py --check-persistence` (power-cycle the motors
+   without touching the robot). Record the verdict here: it decides whether the Damiao
+   zeros can be stored (assumed) and confirms the ODrives are boot-relative.
+3. **Calibrate** (README bring-up step 3): the main pass at the zero pose (the default:
+   legs hanging straight down, soles level, body level by `imu_locate.py level`), then
+   `--verify`, then the visualizer as the acceptance check: every joint follows your
+   hands the right way and by the right amount. The July `joint_calib.py` was deleted
+   2026-11-04 (git: `0ecb5c7`). `calibrate_joints.py` now polls every motor and calls a
+   silent one OFFLINE; July's did neither. Watch the hip pitch (`upper_leg_*`) signs: their
+   measured ranges are the mirror evidence (`fleet_config.py`).
+4. **Limits** (roadmap 2): `calibrate_joints.py --limits` (both hard stops per joint, in
+   sim radians); the visualizer's exit table shows the reached range too. Then
+   `fleet_config.JOINT_LIMITS_RAD` ← the measured stops (all 8, in the sim frame) and
+   `BOOT_POSE_RAD` ← the stops the ODrive joints are folded against at power-on (knees at
+   `sim_lo`, ankles at `sim_hi`; `--home` uses `sim_hi` for every joint).
+5. **Wire the calibration into `motor_service`:** `_JointAdapter` through
+   `real2sim.JointCal` (sign, mapping; the ratio already goes through it). Damiao zero
+   from `joint_calib.py` if the persistence test allows; ODrive zero from the boot pose.
+6. **PD standing controller** (roadmap 3), on the gantry: bring-up steps 5–6 first (one
+   joint, a few degrees; then `tools/dodo_startup.py`, which already enables, ramps to the
+   default crouch and holds it — that IS a joint-space PD stand). Then the gains toward the
+   trained kp 32 / kd 3 behavior (MIT units ≠ Isaac Lab units: match the step response).
+7. **Shafeef's standing policy** (roadmap 4): adapt `rl_env.py` to its contract, add the
+   run to `policies/`, rehearse on `sim_service`, then the gantry. Before it runs on the
+   robot, settle the IMU's pitch (below).
+8. **Merge `merge-zmq-dev` into `main`** once the team has looked at it (on origin; a
+   fast-forward). Until then, fresh clones land on the old docs.
+
+**IMU, for step 7:** `description/` (exact-fit `imu_joint`) went to Shafeef 2026-11-04.
+Two phone-levelled placements still disagree by ~3° in pitch (11-02 reads 0°, today's
+3.2°/3.9° nose-down; the phone lay on its edge, so not the camera bump). It doesn't touch
+training (the policy observes the body frame, so the mount rotation cancels in sim) and
+the PD stand doesn't use the IMU. It matters only through `AXIS_REMAP` on the robot: one
+careful level with `imu_locate.py level` running, then `measure --skip-position --exact`
+if it still reads ~3°. Optional: weigh the robot (the CAD says 4.72 kg).
 
 ---
 
@@ -134,6 +142,41 @@ the IMU pose is measured, and nothing has been commanded on the robot yet.
 ---
 
 ## 4. Log (newest first)
+
+### 2026-11-04 (b) — real2sim: one reading→angle map, gear ratio, meshed visualizer
+Roadmap step 1 tooling (§1). Software only; the visualizer was smoke-tested on the real
+ODrive bus (listen + RTR, nothing enabled).
+- **`real2sim.py`**: `q = sign·(raw − zero)·scale`, scale 1 (Damiao) or 2π/ratio
+  (ODrive), as `JointCal`. `load()` builds every joint's map from `joint_calib.py` +
+  `fleet_config.GEAR_RATIO`, identity where there's no usable entry, never a guess.
+  `calibrate_joints.py`, `visualize_motor_state.py` and `motor_service.py` (unit scale
+  only, so far) all go through it; before, each had its own copy and none knew the ratio.
+- **`fleet_config.GEAR_RATIO`** per knee/ankle, `None` = unmeasured = treated as 1 (same
+  behavior as before) with a warning everywhere. Each `joint_calib.py` entry now records
+  the ratio it was made with, and is refused once `GEAR_RATIO` differs.
+- **`calibrate_joints.py --ratio <joint>`**: the ratio measured with a phone on the
+  moving link (|Δturns|·360/|Δdeg|), also re-checking which node moved.
+  **`--pose zero`** (now the default): the main pass's reference is the URDF zero, legs
+  hanging straight down and soles level, which a phone / plumb line / `imu_locate.py
+  level` can check, instead of an all-joints crouch by eye (`--pose crouch` keeps July's
+  way). `--out` defaults to the repo's `joint_calib.py`, the one `real2sim` reads.
+- **The July `joint_calib.py` is deleted** (in git at `0ecb5c7`): its ODrive zeros were
+  boot-relative and stale, upper_leg missing, `lower_leg_right` broken (node 7's loose
+  connector). With `GEAR_RATIO` unset its entries still "matched", so the visualizer was
+  quietly applying them. `real2sim` now also warns that an ODrive zero only holds until
+  the next power cycle.
+- **Visualizer**: the URDF's STL meshes (parsed in memory with
+  `discardvisual="false"`; the file and the physics models are untouched, so no lost
+  MJCF needed), collision boxes hidden (`--boxes`, or geom group 3 in the viewer), fresh
+  feedback only, short labels in policy order, ! past the URDF range, and on exit the
+  range each joint reached next to the URDF and `fleet_config` limits. Clean shutdown (it
+  raced the reader thread, then core-dumped in GLFW teardown).
+- **Live readings (motors powered, idle, not calibrated):** knee_L −0.094, knee_R +1.845,
+  ankle_L 0.000, ankle_R −0.514 motor turns since power-up. ankle_L at exactly 0 is fine
+  if nobody moved it since power-up; check it moves.
+- Tests: `test_real2sim.py` (the map, ratio refusal, `--ratio` maths, write/read round
+  trip, `motor_service`'s scale, the meshed model). Suite: 168 passed, 1 known failure,
+  1 skip.
 
 ### 2026-11-04 — new robot machine; silent-joint watchdog fixed; IMU refit exact
 Moved to `TUM770035243-11` (§0). Full review of both repos; no motor was enabled.

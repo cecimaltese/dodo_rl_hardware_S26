@@ -148,7 +148,14 @@ JOINT_VEL_LIMIT_RAD = 6.0    # URDF velocity limit (rad/s), same for all joints.
 # 0.1 s = ~10 missed frames. Silence beyond motor_service.FB_WATCHDOG_S is an e-stop.
 FEEDBACK_FRESH_S = 0.1
 
-# NOTE (ODrive gearing): unit conversion assumes 1 motor turn == 2*pi rad at the joint
-# (direct drive). If the T-Motor/ODrive joints are geared, this scaling — and therefore
-# BOTH the commands and the limits above — must be divided by the gear ratio. VERIFY the
-# real ratio before trusting the ODrive position clamps.
+# ODrive gearing: MOTOR turns per JOINT turn, per joint. Every rad <-> turns conversion
+# (real2sim.py, used by motor_service, calibrate_joints and the visualizer) divides by
+# it. None = NOT MEASURED, treated as 1 (direct drive), which is wrong: in July both
+# ankles measured ~13.4 motor turns stop to stop, roughly 32:1 against the URDF's
+# ankle range. Measure each one (`calibrate_joints.py --ratio <joint>`) and enter it
+# here. A calibration (joint_calib.py) records the ratio it was made with, and the
+# tools refuse an entry whose ratio no longer matches.
+GEAR_RATIO = {
+    "lower_leg_left": None, "lower_leg_right": None,   # knee
+    "foot_left": None,      "foot_right": None,        # ankle
+}

@@ -2,7 +2,9 @@
 calibrate_joints.py — guided sign / zero / limit calibration for the whole fleet.
 READ-ONLY: never commands motion. You move the robot by hand; this only watches.
 
-    python3 calibrate_joints.py                 # main pass: pose the crouch, nudge each joint
+    python3 calibrate_joints.py --ratio foot_left  # knee/ankle gear ratio, with a phone (FIRST)
+    python3 calibrate_joints.py                 # main pass: pose zero, nudge each joint
+    python3 calibrate_joints.py --pose crouch   # ... from the default crouch instead
     python3 calibrate_joints.py --verify        # prove the signs before commanding anything
     python3 calibrate_joints.py --limits        # opt-in: hard stops -> clamps, enables --home
     python3 calibrate_joints.py --home          # re-zero at startup (see HOMING)
@@ -12,11 +14,16 @@ READ-ONLY: never commands motion. You move the robot by hand; this only watches.
 
 THE MAIN PASS, IN ORDER
 -----------------------
-  1. POSE the robot once at the sim's default crouch. One snapshot of all 8 motors. This
-     is taken FIRST, while you are careful — not last, when you are eight joints deep.
+  1. POSE the robot once at the reference pose: by default the URDF zero (legs hanging
+     straight down, soles level — checkable with a phone), or the default crouch
+     (--pose crouch). One snapshot of all 8 motors. This is taken FIRST, while you are
+     careful — not last, when you are eight joints deep.
   2. NUDGE each joint from there, one at a time, the sim's + way. Each nudge names its own
      motor (mapping) and its own direction (sign). Small moves; no hard stops.
-  3. zero = crouch_raw - sign * to_native(default) — it falls out of steps 1 and 2.
+  3. zero = pose_raw - sign * q_pose / scale — it falls out of steps 1 and 2.
+     The conversion (sign, zero, gear ratio) is real2sim.JointCal, shared with every
+     other tool. Knee/ankle angles are only right once their ratio is measured
+     (--ratio) and in fleet_config.GEAR_RATIO.
 
 The hard stops are NOT in the main pass. They are the slow, risky half (you are pushing a
 joint into metal, and a stop you ease off before is a stop you measured WRONG), and they
@@ -89,6 +96,7 @@ from typing import Dict, Optional
 import can
 from damiao_motor import DaMiaoController
 
+import real2sim
 from damiao_joint import DamiaoJoint
 from odrive_can_joint import OdriveCanJoint
 from fleet_config import (DM_JOINTS, OD_JOINTS, DM_CHANNEL, OD_CHANNEL, BUSTYPE,
@@ -259,61 +267,106 @@ def watch_move(fleet, prompt) -> Optional[tuple]:
     return win, dwin
 
 
-def is_odrive(motor):
-    return motor.startswith(("lower_leg", "foot"))
+is_odrive = real2sim.is_odrive
 
 
 def to_rad(motor, v):
-    """ODrive reports turns; the sim speaks radians."""
-    return v * TWO_PI if is_odrive(motor) else v
+    """A motor's native delta in joint radians: ODrive turns through the joint's gear
+    ratio (fleet_config.GEAR_RATIO), Damiao as is. Before the mapping is measured the
+    motor is assumed to drive the joint of the same name; that's only used to rank
+    which motor moved most, where a ratio error doesn't change the winner."""
+    return v * real2sim.rad_per_native(motor)
 
 
 def to_native_units(motor, rad):
-    """Inverse of to_rad: the sim's radians in the motor's own units."""
-    return rad / TWO_PI if is_odrive(motor) else rad
+    """Inverse of to_rad: joint radians in the motor's own units."""
+    return rad / real2sim.rad_per_native(motor)
+
+
+def _cal(c) -> real2sim.JointCal:
+    """A joint_calib entry as a JointCal, at the ratio the entry was MADE with."""
+    ratio = float(c.get("ratio", 1.0)) if is_odrive(c["motor"]) else 1.0
+    return real2sim.JointCal(c["motor"], c["motor"], int(c["sign"]), float(c["zero"]),
+                             ratio, True)
 
 
 def raw_to_sim(c, raw):
-    """q_sim = to_rad(raw - zero) * sign"""
-    return to_rad(c["motor"], raw - c["zero"]) * c["sign"]
+    """q_sim = sign * (raw - zero) * scale  (real2sim.JointCal.to_sim)"""
+    return _cal(c).to_sim(raw)
 
 
 def sim_to_raw(c, q):
-    """raw = zero + sign * to_native(q_sim)"""
-    return c["zero"] + c["sign"] * to_native_units(c["motor"], q)
+    """raw = zero + sign * q_sim / scale  (real2sim.JointCal.to_raw)"""
+    return _cal(c).to_raw(q)
+
+
+def usable(calib, joints, what):
+    """Joints whose entry exists, has a zero, and matches today's gear ratio."""
+    ok = []
+    for j in joints:
+        c = calib.get(j)
+        if c is None or c.get("zero") is None:
+            continue
+        problem = real2sim.entry_ratio_problem(j, c)
+        if problem:
+            print(f"  !! {problem} (skipped for {what})")
+            continue
+        ok.append(j)
+    return ok
 
 
 # ---------------------------------------------------------------------------
-def pose_home(fleet):
-    """Snapshot every motor at the sim's default crouch. The reference the run builds on.
+# The reference pose of the main pass and of --verify: its sim angles become the zeros.
+#   zero   — the URDF's q = 0: legs hanging straight down, soles level. Every joint is
+#            "plumb" or "level", which a phone or a plumb line checks to ~1 deg, and
+#            gravity holds the legs there. The default since 2026-11-04.
+#   crouch — the policy's default pose (rl_env.DEFAULT_JOINT_POS), posed by eye: all
+#            eight joints at once at angles nothing on the robot marks. July used it.
+POSES = {"zero": {j: 0.0 for j in POLICY_JOINT_ORDER}, "crouch": dict(DEFAULT_JOINT_POS)}
+POSE_HOWTO = {
+    "zero": """
+  The URDF ZERO: every joint at 0 rad. Robot hanging on the gantry, motors limp:
+    * body level: `python3 imu_locate.py level` in another terminal reads ~0
+    * hip roll 0: seen from the front, both legs vertical and parallel
+    * hip pitch + knee 0: hip, knee and ankle axes on ONE vertical line (a plumb
+      line through the axis centres, or the phone on its edge along thigh and shank)
+    * ankle 0: soles level (the phone on its edge across the sole reads 0)""",
+    "crouch": """
+  The policy's DEFAULT CROUCH, by eye — the gantry helps. Every joint at once:""",
+}
+
+
+def pose_home(fleet, pose_name="zero"):
+    """Snapshot every motor at the reference pose. The reference the run builds on.
 
     Taken FIRST, while the robot is posed and you are careful — not last, when you are
     eight joints deep and tired. It needs no sign: it is just the raw reading at a known
     sim pose. The signs come next, and `zero` falls out of the two.
     """
+    pose = POSES[pose_name]
     print("\n" + "=" * 72)
-    print("  STEP 1 — pose the robot at the SIM'S DEFAULT CROUCH:")
+    print(f"  STEP 1 — pose the robot: {pose_name.upper()}" + POSE_HOWTO[pose_name])
     for j in POLICY_JOINT_ORDER:
-        print(f"     {j:17s} = {DEFAULT_JOINT_POS[j]:+.2f} rad   ({PLUS_MEANS[j].split(' so ')[0]})")
-    print("\n  Get it as close as you can by eye — the gantry helps. Every joint at once.")
-    print("  (This is the offset between the motor's 0 and the sim's 0, so it only has")
+        print(f"     {j:17s} = {pose[j]:+.2f} rad   ({PLUS_MEANS[j].split(' so ')[0]})")
+    print("\n  (This is the offset between the motor's 0 and the sim's 0, so it only has")
     print("   to be as good as your pose. A few degrees of error = a few degrees of bias.)")
     print("=" * 72)
-    input("\n  press Enter when the robot is HELD in the default crouch... ")
+    input(f"\n  press Enter when the robot is HELD in the {pose_name} pose... ")
     time.sleep(SETTLE_S)
     snap = settle(fleet)
-    print(f"  captured {len(snap)} motors at the crouch")
+    print(f"  captured {len(snap)} motors at the {pose_name} pose")
     return snap
 
 
-def identify(fleet, joints, snap):
+def identify(fleet, joints, snap, pose_name="zero"):
     """From the crouch, nudge one joint at a time: mapping + sign, then zero.
 
     One move per joint, small, starting from a known safe pose. No hard stops — see
-    measure_limits() for those. The nudge need not START at the crouch (mapping and sign
+    measure_limits() for those. The nudge need not START at the pose (mapping and sign
     only care about the DELTA), but it is where you already are, and a small move from a
     known pose is the safest thing you can ask a human to do to a 27 Nm joint.
     """
+    pose = POSES[pose_name]
     calib = {}
     for j in joints:
         print("\n" + "=" * 72)
@@ -323,8 +376,8 @@ def identify(fleet, joints, snap):
 
         res = None
         while res is None:
-            res = watch_move(fleet, f"From the crouch, nudge ONLY {j} (a small move is "
-                                    f"plenty), so that: {PLUS_MEANS[j]}")
+            res = watch_move(fleet, f"From the {pose_name} pose, nudge ONLY {j} (a small "
+                                    f"move is plenty), so that: {PLUS_MEANS[j]}")
             if res is None and input("    retry? [Y/n] ").strip().lower() == "n":
                 break
         if res is None:
@@ -341,19 +394,23 @@ def identify(fleet, joints, snap):
         if sign < 0:
             print("           -> INVERTED vs the sim. The sign layer will negate it.")
 
+        # The joint's gear ratio applies to whichever motor actually drives it.
+        ratio = real2sim.gear_ratio(j) if is_odrive(motor) else 1.0
         raw = snap.get(motor)
         if raw is None:
-            print(f"  !! '{motor}' gave no reading at the crouch — zero NOT captured.")
+            print(f"  !! '{motor}' gave no reading at the {pose_name} pose — zero NOT "
+                  f"captured.")
             zero = None
         else:
-            # target_raw = zero + sign*q_sim  ->  zero = raw - sign*default
-            zero = raw - sign * to_native_units(motor, DEFAULT_JOINT_POS[j])
-            print(f"  ZERO:    {zero:+.4f}  (crouch raw {raw:+.4f} - sign*"
-                  f"{DEFAULT_JOINT_POS[j]:+.2f} rad)")
+            # raw = zero + sign * q / scale  ->  zero = raw - sign * q_pose / scale
+            cal = real2sim.JointCal(j, motor, sign, 0.0, ratio, True).zeroed_at(raw, pose[j])
+            zero = cal.zero
+            print(f"  ZERO:    {zero:+.4f}  ({pose_name} raw {raw:+.4f} at "
+                  f"{pose[j]:+.2f} rad, gear ratio {ratio:g})")
 
         # sim_lo/sim_hi are left alone: --limits measures them, and a merge-aware write
         # means an earlier --limits pass survives this run untouched.
-        calib[j] = {"motor": motor, "sign": sign, "zero": zero}
+        calib[j] = {"motor": motor, "sign": sign, "zero": zero, "ratio": ratio}
     return calib
 
 
@@ -365,7 +422,7 @@ def measure_limits(fleet, joints, path="joint_calib.py"):
     for position clamps and for --home, which back-solves the zero from sim_hi.
     """
     calib = read_calib(path)
-    todo = [j for j in joints if j in calib and calib[j].get("zero") is not None]
+    todo = usable(calib, joints, "--limits")
     missing = [j for j in joints if j not in todo]
     if missing:
         print(f"\n  !! no motor/sign/zero yet for: {', '.join(missing)}")
@@ -419,14 +476,15 @@ def measure_limits(fleet, joints, path="joint_calib.py"):
     return out
 
 
-def verify(fleet, joints, path="joint_calib.py"):
+def verify(fleet, joints, path="joint_calib.py", pose_name="zero"):
     """Read-only proof: move a joint by hand, see what the CALIBRATED layer thinks you did.
 
     Everything else in this file measures. This one CHECKS — it is the only place the
     calibration gets to be wrong out loud, before a motor is ever commanded from it.
     """
     calib = read_calib(path)
-    todo = [j for j in joints if j in calib and calib[j].get("zero") is not None]
+    todo = usable(calib, joints, "--verify")
+    pose = POSES[pose_name]
     if not todo:
         print(f"\n  !! nothing calibrated in {path} yet — run the main pass first.")
         return None
@@ -435,15 +493,16 @@ def verify(fleet, joints, path="joint_calib.py"):
     print("  VERIFY — does the calibration read back what you actually did?")
     print("=" * 72)
     print("""
-  Pose the crouch again. For each joint the script says what it BELIEVES you are at;
+  Pose the reference pose again. For each joint the script says what it BELIEVES you are at;
   then you move that joint the sim's + way and it says what it believes now. If the
   numbers disagree with your hands, the calibration is wrong — not your hands.
 """)
-    input("  press Enter when the robot is HELD in the default crouch... ")
+    print(POSE_HOWTO[pose_name])
+    input(f"  press Enter when the robot is HELD in the {pose_name} pose... ")
     time.sleep(SETTLE_S)
     snap = settle(fleet)
 
-    print(f"\n  {'joint':17s} {'reads':>9s} {'expected':>9s} {'error':>9s}   at the crouch")
+    print(f"\n  {'joint':17s} {'reads':>9s} {'expected':>9s} {'error':>9s}   at the {pose_name} pose")
     bad = []
     for j in todo:
         c = calib[j]
@@ -451,14 +510,14 @@ def verify(fleet, joints, path="joint_calib.py"):
         if raw is None:
             print(f"  {j:17s}        --  no reading")
             continue
-        q, want = raw_to_sim(c, raw), DEFAULT_JOINT_POS[j]
+        q, want = raw_to_sim(c, raw), pose[j]
         err = q - want
         mark = "  <-- OFF" if abs(err) > 0.15 else ""
         if mark:
             bad.append(j)
         print(f"  {j:17s} {q:+9.3f} {want:+9.3f} {err:+9.3f}{mark}")
     if bad:
-        print(f"\n  ** {', '.join(bad)} read >0.15 rad from the crouch you posed.")
+        print(f"\n  ** {', '.join(bad)} read >0.15 rad from the pose you held.")
         print("     Either the pose drifted, or that joint's zero is wrong. If it's ~2x the")
         print("     default, suspect the SIGN.")
 
@@ -505,6 +564,10 @@ def home(fleet, joints, path="joint_calib.py"):
         return None
 
     todo = [j for j in joints if j in calib]
+    stale = [j for j in todo if real2sim.entry_ratio_problem(j, calib[j])]
+    for j in stale:
+        print(f"  !! {real2sim.entry_ratio_problem(j, calib[j])}")
+    todo = [j for j in todo if j not in stale]
     unmeasured = [j for j in todo if calib[j].get("sim_hi") is None]
     if unmeasured:
         print(f"\n  !! no measured sim_hi for: {', '.join(unmeasured)}")
@@ -635,18 +698,92 @@ def check_persistence(fleet):
 
 
 def read_calib(path="joint_calib.py"):
-    """Load an existing joint_calib.py, or {} if there isn't one. Exec'd rather than
-    imported so --out can point anywhere and a stale sys.modules entry can't win."""
-    ns: dict = {}
+    """Load an existing joint_calib.py, or {} if there isn't one (real2sim.read_calib)."""
     try:
-        with open(path) as f:
-            exec(compile(f.read(), path, "exec"), ns)
-    except FileNotFoundError:
-        return {}
+        return real2sim.read_calib(path)
     except Exception as e:
         print(f"  !! {path} exists but won't parse ({e}); treating as empty.")
         return {}
-    return dict(ns.get("JOINT_CALIB", {}))
+
+
+# ---------------------------------------------------------------------------
+RATIO_MIN_DEG = 30.0     # the phone's ~0.5 deg is ~1.7 % of 30 deg; turn further if you can
+_RATIO_LINKS = {"lower_leg": ("the THIGH", "the SHANK"), "foot": ("the SHANK", "the FOOT")}
+
+
+def _ask_deg(prompt: str) -> float:
+    while True:
+        text = input(prompt).strip()
+        try:
+            return float(text)
+        except ValueError:
+            print(f"    '{text}' isn't a number of degrees; again.")
+
+
+def measure_ratio(fleet, joint):
+    """The gear ratio of an ODrive joint, MEASURED: turn the joint through an angle you
+    read off a phone and compare with the motor turns. ratio = motor turns per joint
+    turn = |delta turns| * 360 / |delta degrees|. Nothing is commanded.
+
+    Which motor turned is picked by measurement, as in the main pass, so this also
+    re-checks the node -> joint mapping. Prints the line for fleet_config.GEAR_RATIO;
+    it doesn't edit the config.
+    """
+    if not is_odrive(joint):
+        print(f"\n  !! {joint} is a Damiao joint: its encoder is on the output shaft, so "
+              f"there is no ratio to measure. --ratio is for knees and ankles.")
+        return None
+    held, moving = _RATIO_LINKS[joint.rsplit("_", 1)[0]]
+    print("\n" + "=" * 72)
+    print(f"  GEAR RATIO — {joint}")
+    print("=" * 72)
+    print(f"""
+  Hold {held} still. Lay the phone ON ITS EDGE along {moving}, in the plane the
+  joint swings in, with a spirit-level / inclinometer app. Type the angle it shows,
+  turn the joint 40-80 deg (at least {RATIO_MIN_DEG:.0f}; staying inside one quadrant of
+  the app avoids it wrapping), hold still, type the new angle. Only the difference
+  counts, so any zero of the app is fine.
+""")
+    ratios = []
+    while True:
+        a0 = _ask_deg("    phone angle, joint still: [deg] ")
+        before = settle(fleet)
+        a1 = _ask_deg(f"    turn {joint} 40-80 deg, hold still. phone angle: [deg] ")
+        after = settle(fleet)
+        d_deg = a1 - a0
+        turned = {m: after[m] - before[m] for m in before
+                  if m in after and is_odrive(m)}
+        ranked = sorted(turned.items(), key=lambda kv: -abs(kv[1]))
+        if not ranked:
+            print("    !! no ODrive reading at all — is the fleet online?")
+        elif abs(d_deg) < RATIO_MIN_DEG:
+            print(f"    !! only {d_deg:+.1f} deg: turn it at least {RATIO_MIN_DEG:.0f} deg.")
+        elif (len(ranked) > 1 and abs(ranked[1][1]) > 1e-9
+              and abs(ranked[0][1]) / abs(ranked[1][1]) < DOMINANCE):
+            print(f"    !! AMBIGUOUS — {ranked[0][0]} turned {ranked[0][1]:+.3f} but "
+                  f"{ranked[1][0]} turned {ranked[1][1]:+.3f} too. Move only {joint}.")
+        else:
+            win, dturns = ranked[0]
+            ratio = abs(dturns) * 360.0 / abs(d_deg)
+            ratios.append(ratio)
+            print(f"    -> motor '{win}' turned {dturns:+.3f} turns for {d_deg:+.1f} deg: "
+                  f"ratio {ratio:.2f}")
+            if win != joint:
+                print(f"    ** that is the motor fleet_config calls '{win}', not '{joint}': "
+                      f"the node -> joint mapping is WRONG for one of them.")
+        if input("    again (an average of 2-3 beats one)? [Y/n] "
+                 ).strip().lower().startswith("n"):
+            break
+    if not ratios:
+        return None
+    mean = statistics.mean(ratios)
+    spread = (max(ratios) - min(ratios)) / mean * 100 if len(ratios) > 1 else float("nan")
+    print(f"\n  {joint}: ratio {mean:.2f} from {len(ratios)} turn(s)"
+          + (f", spread {spread:.1f} %" if len(ratios) > 1 else ""))
+    print(f"  Put it in fleet_config.GEAR_RATIO:   \"{joint}\": {mean:.2f},")
+    print("  (Then redo the main pass for the ODrive joints: entries made with the old "
+          "ratio are refused.)")
+    return mean
 
 
 def write_calib(calib, path="joint_calib.py"):
@@ -669,6 +806,8 @@ def write_calib(calib, path="joint_calib.py"):
         "  motor  : the fleet_config motor that actually drives this joint (measured, not assumed)",
         "  sign   : +1 if the motor reading increases in the sim's +angle direction, else -1",
         "  sim_lo/sim_hi : the mechanical hard stops, in SIM radians",
+        "  ratio  : the gear ratio (motor turns per joint turn) the entry was made with;",
+        "           real2sim refuses the entry if fleet_config.GEAR_RATIO now differs",
         "",
         "PERISHABLE — encoder-origin-relative. A boot-relative motor (the ODrives zero their",
         "position estimate at power-up) invalidates these on EVERY power cycle. Re-establish",
@@ -677,8 +816,8 @@ def write_calib(calib, path="joint_calib.py"):
         "  raw_lo/raw_hi : the same stops, in the motor's NATIVE units",
         "",
         "Conversion, both directions:",
-        "    raw    = zero + sign * to_native(q_sim)",
-        "    q_sim  = to_rad(raw - zero) * sign",
+        "    q_sim  = sign * (raw - zero) * scale     scale: Damiao 1, ODrive 2*pi/ratio",
+        "    raw    = zero + sign * q_sim / scale     (real2sim.JointCal)",
         '"""',
         "",
         "JOINT_CALIB = {",
@@ -691,7 +830,8 @@ def write_calib(calib, path="joint_calib.py"):
         if j not in calib:
             continue
         c = calib[j]
-        lines.append(f'    "{j}": dict(motor="{c["motor"]}", sign={c["sign"]:+d},')
+        lines.append(f'    "{j}": dict(motor="{c["motor"]}", sign={c["sign"]:+d}, '
+                     f'ratio={float(c.get("ratio", 1.0)):g},')
         lines.append(f'        sim_lo={num(c, "sim_lo")}, sim_hi={num(c, "sim_hi")},')
         lines.append(f'        zero={num(c, "zero")}, raw_lo={num(c, "raw_lo")}, '
                      f'raw_hi={num(c, "raw_hi")}),')
@@ -772,13 +912,25 @@ def main():
     ap.add_argument("--verify", action="store_true",
                     help="read-only check: move a joint by hand, see what the CALIBRATED "
                          "layer thinks you did. Catches a flipped sign.")
-    ap.add_argument("--out", default="joint_calib.py")
+    ap.add_argument("--ratio", metavar="JOINT",
+                    help="measure an ODrive joint's gear ratio: turn it through an angle "
+                         "read off a phone (knees/ankles). Prints the GEAR_RATIO line.")
+    ap.add_argument("--pose", choices=sorted(POSES), default="zero",
+                    help="reference pose for the main pass and --verify (default: zero = "
+                         "legs hanging straight down, soles level)")
+    ap.add_argument("--out", default=str(real2sim.CALIB_PATH),
+                    help="default: the repo's joint_calib.py, which real2sim reads")
     args = ap.parse_args()
 
     joints = args.only or list(POLICY_JOINT_ORDER)
-    for j in joints:
+    for j in [*joints, *([args.ratio] if args.ratio else [])]:
         if j not in POLICY_JOINT_ORDER:
             sys.exit(f"unknown joint {j!r}; expected one of {list(POLICY_JOINT_ORDER)}")
+    unknown_ratio = [j for j in POLICY_JOINT_ORDER if not real2sim.ratio_known(j)]
+    if unknown_ratio and not args.ratio and not args.check_persistence:
+        print(f"  NOTE: no measured gear ratio for {', '.join(unknown_ratio)} "
+              f"(fleet_config.GEAR_RATIO): their angles read as direct drive. "
+              f"Measure first: calibrate_joints.py --ratio <joint>")
 
     print(__doc__.split("WHAT IT SOLVES")[0])
     print("  ROBOT ON THE GANTRY. Motors stay LIMP — nothing is ever commanded.")
@@ -799,16 +951,18 @@ def main():
             check_persistence(fleet)
             return 0
 
+        if args.ratio:
+            return 0 if measure_ratio(fleet, args.ratio) else 1
         if args.home:
             return 0 if home(fleet, joints, args.out) else 1
         if args.limits:
             return 0 if measure_limits(fleet, joints, args.out) else 1
         if args.verify:
-            return 0 if verify(fleet, joints, args.out) else 1
+            return 0 if verify(fleet, joints, args.out, args.pose) else 1
 
         # The main pass: one pose, then one nudge per joint.
-        snap = pose_home(fleet)
-        calib = identify(fleet, joints, snap)
+        snap = pose_home(fleet, args.pose)
+        calib = identify(fleet, joints, snap, args.pose)
         if calib:
             write_calib(calib, args.out)
             report(read_calib(args.out))
