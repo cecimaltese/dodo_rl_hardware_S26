@@ -1,5 +1,5 @@
 {
-  "_comment": "IMU mount on `body`. Written by imu_locate.py measure; imu_locate.py apply turns it into the URDF, AXIS_REMAP and README.",
+  "_comment": "IMU mount on body.",
   "axis_remap": [
     [0, 1, 0],
     [1, 0, 0],
