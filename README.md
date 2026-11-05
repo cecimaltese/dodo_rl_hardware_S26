@@ -163,7 +163,8 @@ python3 calibrate_joints.py --ratio foot_left    # each knee/ankle -> fleet_conf
 python3 calibrate_joints.py --check-persistence  # do stored zeros survive a power cycle?
 python3 calibrate_joints.py                      # legs straight down once, nudge each joint
 python3 calibrate_joints.py --verify             # prove the signs by hand
-python3 visualize_motor_state.py                 # THE check: the model follows your hands
+python3 visualize_hardware.py                    # THE check: the model follows your hands
+                                                 # (and tilts with the robot: the IMU)
 python3 calibrate_joints.py --limits             # hard stops -> sim_lo/sim_hi
 python3 imu_locate.py measure                    # IMU mounted -> URDF imu_link + AXIS_REMAP
 
@@ -225,9 +226,13 @@ drops the PD's preload. In sim, 0.7° at the ankles tips the standing robot over
   from the legs-straight-down zero pose by default), and the stop angles (`--limits`). It
   writes `joint_calib.py`, recording the ratio each entry was made with. Its `--home`
   re-zeros that file by pushing each joint to a stop by hand.
-- **`visualize_motor_state.py`** is the acceptance check: the meshed model follows your
-  hands, the right way and by the right amount, or something above is wrong. On exit it
-  lists the range each joint reached.
+- **`visualize_hardware.py`** (was `visualize_motor_state.py`) is the acceptance check:
+  the meshed model follows your hands, the right way and by the right amount, or
+  something above is wrong. Its body tilts with the IMU (roll and pitch through the
+  deployment path, `AXIS_REMAP` included; the heading is arbitrary without a
+  magnetometer, so it isn't shown unless `--imu-yaw`), with the tilt and the gyro
+  printed. On exit it lists the range each joint reached and the largest tilt.
+  `--no-imu` / `--imu-only` (no CAN, works on a Mac).
 
 **Not wired yet (the blocker):** `motor_service` uses the gear ratio (through `real2sim`),
 but neither the measured signs (it assumes +1) nor the measured stops (`BOOT_POSE_RAD`
@@ -280,7 +285,7 @@ the robot.
 | `firmware/` | Nicla firmware: v2 (flashed) and v1 (rollback). |
 | `real2sim.py` | Motor reading ↔ sim joint angle (sign, zero, gear ratio), for every tool. |
 | `calibrate_joints.py`, `joint_calib.py` | Guided gear-ratio/sign/zero/limit calibration (read-only, by hand) and its output (not yet made). |
-| `read_motor_state.py`, `visualize_motor_state.py` | Read-only fleet diagnostics: a live table, or the meshed MuJoCo model following the robot (+ reached ranges). |
+| `read_motor_state.py`, `visualize_hardware.py` | Read-only diagnostics: a live motor table, or the meshed MuJoCo model following the robot's joints and IMU tilt (+ reached ranges, largest tilt). |
 | `odrive_can_scan.py`, `odrive_can_setup.py`, `odrive_position_control.py` | ODrive: find nodes on a bus; put a drive on CAN (USB, once per drive); tune gains (USB). |
 | `imu_check.py`, `imu_sniff.py` | IMU acceptance test; raw dump, range cross-check, `--axes`. |
 | `imu_locate.py` | Measures the IMU mount (three poses + a ruler) and writes, from `dodo_assets/imu_mount.json`, the IMU blocks of its URDF and MJCF, its README rows and our `AXIS_REMAP`; `refit [--exact]` re-solves from the stored poses; `check --live` verifies on the robot. |
@@ -318,7 +323,7 @@ controller, Shafeef's standing policy, and later walking (onboard compute + batt
 
 1. Measure the knee/ankle gear ratios (`calibrate_joints.py --ratio <joint>`) into
    `fleet_config.GEAR_RATIO`.
-2. Calibrate (bring-up step 3) and check it with `visualize_motor_state.py`; then the
+2. Calibrate (bring-up step 3) and check it with `visualize_hardware.py`; then the
    limits (`--limits`) into `fleet_config.py`.
 3. Wire the signs, measured stops and motor mapping into `motor_service`.
 4. First motion and the PD stand (bring-up steps 5–6, `tools/dodo_startup.py`). Then match

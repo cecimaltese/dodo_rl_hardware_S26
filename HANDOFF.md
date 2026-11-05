@@ -165,6 +165,25 @@ if it still reads ~3°. Optional: weigh the robot (the CAD says 4.72 kg).
 
 ## 4. Log (newest first)
 
+### 2026-11-05 (f) — `visualize_hardware.py`: the visualizer shows the IMU too
+`visualize_motor_state.py` → `visualize_hardware.py` (git mv; the user's request).
+- The model's base got a free joint; its orientation follows the Nicla, polled in a
+  thread like imu_service, through `imu_protocol` (firmware scales, AXIS_REMAP). Tilt
+  only: roll/pitch from the fused quaternion's gravity direction (accelerometer
+  without one, firmware v1). The heading is arbitrary without a magnetometer, so
+  it's dropped unless `--imu-yaw`. Shown in the terminal (one line per source,
+  rewritten in place) and in the viewer's overlay: nose-down / right-down degrees
+  (imu_locate's words) and the gyro in body axes. Exit summary: readings, rate,
+  largest tilt. `--no-imu` = the old tool; `--imu-only` opens no CAN bus (Mac too).
+  An IMU that won't open (port held, permissions) is a warning, not a stop.
+- Checked on the real Nicla (the hanging robot): firmware v2 ranges self-reported,
+  67–69 Hz, |accel| 9.78 m/s², 1.6° nose-down / 0.9° left-down, gyro ~0. The main loop
+  ran headless (stand-in viewer, `--imu-only`) against it: 60 Hz redraws, overlay,
+  summary. Not yet looked at in the real viewer window with the motors.
+- Tests: `test_visualize_hardware.py` (tilt math, heading dropped, accel fallback = quat,
+  the fake Nicla mounted with the real AXIS_REMAP through `ImuFeed` → the model's body
+  gravity = the robot's, a silent board). Suite: 215 passed, 1 known failure, 1 skip.
+
 ### 2026-11-05 (e) — the PD stand in sim, through the robot's own stack
 Roadmap step 3 in sim (the user's plan: sim, then the robot, then a policy).
 - **`sim_service.py --scene`:** `dodo_assets`' `scene.xml` as the virtual robot. Its
@@ -701,7 +720,9 @@ gain-tuning tool.
   brings both buses up at 1 Mbit when the adapters appear (by hand: `ip link`).
 - `can0`/`can1` are enumeration order, not identity: use the udev names
   `can_dm`/`can_od`.
-- The direct-CAN tools (`read_motor_state`, `calibrate_joints`, `visualize_motor_state`,
-  `odrive_can_scan`) and `motor_service` all open the buses: run one at a time.
+- The direct-CAN tools (`read_motor_state`, `calibrate_joints`, `visualize_hardware`,
+  `odrive_can_scan`) and `motor_service` all open the buses: run one at a time. The
+  Nicla's port, likewise: `imu_service`, `imu_check`, `imu_locate`, `imu_sniff` and
+  `visualize_hardware` (unless `--no-imu`).
 - Pausing the policy runner (a debugger, a viewer) stops the command stream, and
   `motor_service` e-stops after 0.5 s by design. `dodo_ctl estop_reset` recovers.

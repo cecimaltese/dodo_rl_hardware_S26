@@ -163,7 +163,7 @@ class TestMotorServiceUnits:
 
 class TestViewModel:
     def test_meshes_shown_boxes_hidden(self):
-        import visualize_motor_state as viz
+        import visualize_hardware as viz
         m = viz.build_view_model()
         types = [m.geom_type[g] for g in range(m.ngeom)]
         meshes = [g for g, t in enumerate(types) if t == mujoco.mjtGeom.mjGEOM_MESH]
