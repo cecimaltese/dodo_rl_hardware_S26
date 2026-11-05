@@ -207,6 +207,30 @@ python3 run_policy.py --backend zmq --task stand \
     --policy policies/dodo_stand/2026-06-30_18-44-06/exported/policy.onnx
 ```
 
+### Checking a knee/ankle motor connection
+
+1. **Power off, multimeter** (lowest Ω range; short the probes first and subtract, or
+   use REL): unplug the motor's three phase leads from its ODrive and measure A–B,
+   B–C, C–A at the motor side. All three equal (within ~10 %), and like the same motor
+   on another joint. OL on two pairs = an open phase; one pair high or drifting while
+   you wiggle the cable = a bad crimp / solder joint. Each phase to the motor housing:
+   OL. Plug back in and measure again across the drive's motor terminals (still off),
+   to include the connector. A meter's milliamps can pass a joint that fails at the
+   drive's amps, so this isn't the last word.
+2. **The drive measures it** (motor_service stopped; THE MOTOR MOVES 8-16°, legs free):
+   ```bash
+   python3 tools/odrive_check.py --joint lower_leg_left --compare foot_left --repeat 3
+   ```
+   It runs the drive's own calibration, whose first step pushes real current through
+   the windings, and logs it. Healthy: the motor step takes ~4.2 s and draws ~0.1 A from
+   the 24 V supply, then a ~9 s encoder scan, PASS. The open phase of 2026-11-05: 0.00 A,
+   PHASE_RESISTANCE_OUT_OF_RANGE after 1.6 s. Wiggle the cable between runs.
+3. **Under load:** the in-air steps of *Bring-up* (5–6) on that joint: smooth motion,
+   no drive errors, and a push-test stiffness like the other side's.
+
+If the resistances are fine but the drive still fails: suspect the drive itself (its
+output stage, or the motor connector on its board).
+
 ### Rehearse the PD stand in sim first
 
 `sim_service.py --scene` is `dodo_assets`' `scene.xml` (Shafeef's PD position actuators,
@@ -324,7 +348,7 @@ the robot.
 | `imu_check.py`, `imu_sniff.py` | IMU acceptance test; raw dump, range cross-check, `--axes`. |
 | `imu_locate.py` | Measures the IMU mount (three poses + a ruler) and writes, from `dodo_assets/imu_mount.json`, the IMU blocks of its URDF and MJCF, its README rows and our `AXIS_REMAP`; `refit [--exact]` re-solves from the stored poses; `check --live` verifies on the robot. |
 | `setup/99-dodo-can.rules` | udev rule: the two USB-CAN adapters → `can_dm` / `can_od` by serial, up at 1 Mbit. |
-| `tools/` | `dodo_ctl.py` (ctl CLI), `dodo_startup.py` (power-on ritual without a policy; the PD stand), `pd_push_test.py` (push a held joint by hand: real stiffness vs kp, torque units, the ODrive's torque cap), `zmq_echo.py` and `zmq_hz.py` (topic echo and rate). |
+| `tools/` | `dodo_ctl.py` (ctl CLI), `dodo_startup.py` (power-on ritual without a policy; the PD stand), `pd_push_test.py` (push a held joint by hand: real stiffness vs kp, torque units, the ODrive's torque cap), `odrive_check.py` (one drive's calibration, logged: is the motor connected?), `zmq_echo.py` and `zmq_hz.py` (topic echo and rate). |
 | `demo_combined.py` | Sine-drive any joints through the full service stack. |
 | `policies/` | The reference `dodo_stand` run the tests use. |
 | `docs/zmq.md` | ZMQ topic and schema spec. |

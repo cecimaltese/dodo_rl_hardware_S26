@@ -184,6 +184,20 @@ if it still reads ~3°. Optional: weigh the robot (the CAD says 4.72 kg).
 
 ## 4. Log (newest first)
 
+### 2026-11-05 (k) — `tools/odrive_check.py`: testing a repaired motor connection
+The user asked how to test the left knee's wiring after the repair (continuity alone
+found last week's broken CAN lines, but a phase can conduct at milliamps and fail at
+amps). README *Checking a knee/ankle motor connection*: power-off phase-to-phase
+resistances (balanced, like another motor's, no short to the housing), then
+`odrive_check.py` runs that one drive's calibration directly on the bus and logs the
+steps, the DC bus current during the motor step (healthy ~0.12 A over ~4.2 s; the
+open phase: 0.00 A, failed at 1.6 s), the rotor sweep and the result; `--repeat` to
+wiggle the cable between runs, `--compare` a good drive first. It RTR-polls bus V/I,
+Iq and Get_Error, which node 7 (that doesn't stream them) answers (checked on the robot,
+read-only). Refuses while a ctl service answers. Tested against the fake drives
+(`test_odrive_check.py`); not yet run on the robot as a tool (the same procedure as
+the 11-05 (j) diagnosis, which was).
+
 ### 2026-11-05 (j) — robot: the LEFT KNEE's motor gets no current; the service fixed
 - **User:** odrive_calibrate moved only the right leg noticeably, never ended in
   SUCCESS, and the service was always E-STOPPED.
