@@ -69,7 +69,11 @@ the robot yet.
    (`fleet_config.GEAR_RATIO`; log).
 2. ~~Persistence~~ — done 2026-11-05: Damiao zeros survive a power cycle, ODrive zeros
    don't (log). The startup reference pose follows from that (§3, open question there).
-3. **Calibrate** (README bring-up step 3): the main pass at the zero pose (the default:
+3. *(2026-11-05: main pass + `--limits` done and reviewed (log); `hip_right` sign fixed;
+   zero pose confirmed against the URDF by photo. The reference pose is now a sitting
+   pose (§3). Next per the user: the PD stand in sim, then on the robot, then a policy
+   (log 11-05 (c)).)*
+   **Calibrate** (README bring-up step 3): the main pass at the zero pose (the default:
    legs hanging straight down, soles level, body level by `imu_locate.py level`), then
    `--verify`, then the visualizer as the acceptance check: every joint follows your
    hands the right way and by the right amount. The July `joint_calib.py` was deleted
@@ -120,9 +124,11 @@ if it still reads ~3°. Optional: weigh the robot (the CAD says 4.72 kg).
 - **Zeros (2026-11-05, measured):** the Damiao zeros are stored (they survive a power
   cycle); the ODrive zeros are re-established every session from a reference pose
   against the hard stops (the user's "tuck"), then a short startup move to a working pose.
-  OPEN: the user considered making the tuck the joint ZERO itself; the recommendation is
-  to keep the URDF's q = 0 (the policy's and Shafeef's coordinates) and treat the tuck as
-  a reference pose with measured angles (`BOOT_POSE_RAD` from `--limits`).
+- **Reference pose = a bird SITTING pose** (user + Shafeef, 2026-11-05): Damiao readings
+  saved there, the ODrive joints against physical stops. A stand-up from it is
+  hardcoded first (or trained into the policy later). Still to confirm: whether the
+  URDF's q = 0 moves with it. The recommendation is no: keep the URDF frames and give
+  the sitting pose measured URDF angles (`BOOT_POSE_RAD`).
 - Safety: `|torque| > 0.8 × rated` → that one motor IDLE (torque normalized 0–1 of rated);
   full e-stop on fault, over-speed, over-travel, silent feedback or a stalled command
   stream.
@@ -145,6 +151,84 @@ if it still reads ~3°. Optional: weigh the robot (the CAD says 4.72 kg).
 ---
 
 ## 4. Log (newest first)
+
+### 2026-11-05 (c) — Shafeef's `dodo_assets`; PD stand in sim; plan to the robot
+- **`Atarilab/dodo_assets`** (Shafeef), cloned next to this repo: the same URDF and
+  meshes as `description/`, plus an MJCF, `scene.xml` (floor, PD position actuators,
+  `home`/`straight` keyframes) and `scripts/pd_stand.py`. Its `imu_mount.json` is the
+  11-02 *snapped* record, not our 11-04 exact refit (4.4° apart): irrelevant for the PD
+  stand, sync before a policy. Its joint order is URDF order (right leg first), ours
+  is Isaac Lab's.
+- **PD stand in sim works** (`pd_stand.py --headless`, MuJoCo 3.17): kp 150/150/50/50,
+  kd 1.5/1.5/0.8/0.8 (hip, upper_leg, knee, ankle), armature 0.005 (placeholder),
+  implicit position actuators at 2 ms. `home` = 0, 0.45, −1.0, 0.55: stays up, 5.8° max
+  tilt, knee tracking −2.8°. Peak torques: knee 2.9 Nm, ankle 1.3, hips ~1. With a
+  5 N push: 6.8°. `straight`: 3.4° tilt, knee only 0.65 Nm. The `home` pose is inside
+  every measured stop.
+- **Our `sim_service` can't run those gains as is:** a software PD at a 5 ms step
+  (KP 32/KD 3). `pd_stand.py`'s note says a Python-side PD at these gains is unstable.
+  The motors run their PD inside the drive at kHz rates, so implicit position
+  actuators are also the closer model of the hardware.
+- **Gains on the hardware:** Damiao MIT kp/kd are output-side Nm/rad and Nm·s/rad, so
+  150/1.5 go in as they are (range 0–500 / 0–5). The ODrive is a cascaded P-PI. For a
+  PD, set `vel_integrator_gain` 0; then joint K = N²·pos_gain·vel_gain/2π and D =
+  N²·vel_gain/2π. For K 50 / D 0.8: knee (N 25.6) vel_gain 0.0077 Nm/(turn/s), ankle
+  (28.5) 0.0062, pos_gain 62.5 for both. That assumes `motor.config.torque_constant` =
+  8.27/300. Whether pos_gain 62.5 runs without buzz depends on the encoder: find out
+  in the air. To verify: firmware 0.6's CAN Simple may have Set_Pos_Gain/Set_Vel_Gains
+  (0x1A/0x1B), which would let `motor_service` set the gains instead of USB.
+- **Thermal:** 2.9 Nm at the knee is ~0.11 Nm at the MN4004, ~4 A held continuously.
+  Check the drives' `current_lim` and the motor temperature on the first ground test.
+
+### 2026-11-05 (b) — main pass + `--limits` done (user); the numbers reviewed
+`joint_calib.py`: the main pass is in `b76ad25`, the stops were uncommitted when this was
+written. Claude reviewed them against the URDF, the CAD meshes, July's raw ranges and a
+passive bus snapshot. Nothing was commanded.
+- **Consistent:** every joint is driven by the motor of the same name, so the ODrive
+  node → joint map (3/4/7/8 = knee L, ankle L, knee R, ankle R) is now measured, not
+  July's word. Every entry round-trips raw ↔ sim exactly and carries today's ratios.
+  The ankles agree L/R within 0.6° at both stops and turn 13.32/13.28 motor turns stop
+  to stop (July: 13.40/13.35), so those are repeatable metal stops; 168° of travel.
+  The knee's + stop (foot back) agrees L/R within 1.7°. Knee and ankle ranges have the
+  URDF's lopsided shape, so the front/back sense is right in absolute terms, not just
+  L vs R. Hip pitch is +1/−1 (mirrored), as the mirrored CAD hip links predict, and
+  the two ranges agree under those signs. The default crouch sits ≥ 32° inside every
+  stop. Live (passive candump): all ODrives IDLE, axis_error 0; the hanging right leg
+  reads ≈ 0 on all four joints. Suite: 174 passed, 1 skip (known failure deselected).
+- **Suspect: `hip_right` sign −1.** Identical motors on a shared +x axis in mirrored hip
+  assemblies (the CAD hip links are exact y-mirrors) should read with the same sign,
+  and July measured +1/+1. Today's motor frames match July's (one stop each, within
+  0.1° and 1.7°). July's raw ranges are mirror-symmetric only with equal signs (out
+  34°/36°, in 58°/58°); with +1/−1 the right hip would reach 58° out against the
+  left's 34°. With equal signs, the stops that repeat since July are both outward,
+  and the ones that changed are both inward (today 42°/36°: the legs meeting?).
+  Today's right-hip range is symmetric about zero (±36°), so it can't decide, and
+  `--verify` can't either (it uses the same mental model as the nudge). Robot-left vs
+  viewer-left already tripped the 11-04 IMU check. **Confirmed by the user in the
+  visualizer; fixed:** `hip_right` sign +1, stops negated and swapped (−0.631 … +0.634).
+  The zero and the raw stops are unchanged: q = 0 at the pose, so `zero` doesn't
+  depend on the sign. Written through `calibrate_joints.write_calib`.
+- **Bug in the zero-pose instructions (Claude, 11-04): URDF q = 0 is NOT a straight
+  leg.** The knee axis sits 2 cm in front of the hip–ankle line: the thigh leans 5.7°
+  forward and the shank 5.7° back (the meshes' long axes: 4.8°/3.8°). `POSE_HOWTO`
+  said "hip, knee and ankle axes on ONE vertical line". That pose is upper_leg +0.100,
+  knee −0.200, ankle +0.100 with soles level. A zero taken there biases those
+  readings by that much (the crouch comes out deeper; the feet stay flat, since the
+  errors sum to 0). **Resolved:** the user's side photo of the zero pose matches a
+  render of the URDF at q = 0 (straight thigh and shank sections parallel, the knee
+  housing jogged forward), not the axes-in-line render. The zero is good. The
+  instruction text still needs fixing.
+- **Asymmetries to look at:** knee fold stop L −159° vs R −169° (18.28 vs 19.11 motor
+  turns); thigh forward stop L −51° vs R −63°. The knee fold stop is the planned
+  per-session ODrive reference (BOOT_POSE knees at `sim_lo`), so test its
+  repeatability before relying on it. The knee's + stop agrees L/R and is what `--home`
+  uses; pick one convention.
+- The real stops are tighter than the training URDF in two places: thigh forward
+  (−0.90/−1.10 vs −1.57) and knee fold (−2.78/−2.96 vs −3.14). Give Shafeef the measured
+  stops once the two checks above are settled.
+- `fleet_config.JOINT_LIMITS_RAD`/`BOOT_POSE_RAD` still hold raw-frame/URDF numbers.
+  Don't copy the sim-frame stops in before `motor_service` applies sign/zero (§2 step
+  5); do both in one change.
 
 ### 2026-11-05 — gear ratios measured; persistence verdict (robot session, user)
 - **"IMU not responding" = permissions, not the IMU.** None of the user's terminals had
