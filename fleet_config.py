@@ -150,11 +150,11 @@ FEEDBACK_FRESH_S = 0.1
 
 # ODrive gearing: MOTOR turns per JOINT turn, per joint. Every rad <-> turns conversion
 # (real2sim.py, used by motor_service, calibrate_joints and the visualizer) divides by
-# it. None = NOT MEASURED, treated as 1 (direct drive), which is wrong: in July both
-# ankles measured ~13.4 motor turns stop to stop, roughly 32:1 against the URDF's
-# ankle range. Measure each one (`calibrate_joints.py --ratio <joint>`) and enter it
-# here. A calibration (joint_calib.py) records the ratio it was made with, and the
-# tools refuse an entry whose ratio no longer matches.
+# it. MEASURED 2026-11-05 with `calibrate_joints.py --ratio` (phone on the moving link)
+# and checked by eye in the visualizer. (None would mean unmeasured, read as direct
+# drive.) A calibration (joint_calib.py) records the ratio it was made with, and the
+# tools refuse an entry whose ratio no longer matches: change a number here and the
+# knee/ankle calibration must be redone.
 GEAR_RATIO = {
     "lower_leg_left": 25.6, "lower_leg_right": 25.6,   # knee
     "foot_left": 28.5,      "foot_right": 28.5,        # ankle

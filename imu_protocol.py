@@ -34,7 +34,10 @@ What the policy actually uses (see rl_env.OBS_STAND):
 
 from __future__ import annotations
 
+import errno
+import grp
 import math
+import os
 import time
 from typing import Optional, Tuple
 
@@ -77,6 +80,12 @@ except ImportError:
 # are never used. That is the whole point of v2 — stop guessing.
 GYRO_RANGE_DPS = 2000.0   # v1 only; VERIFY — gyro full scale, +/- dps
 ACCEL_RANGE_G = 8.0       # v1 only; VERIFY — accel full scale, +/- g
+
+# What firmware v2 SETS (imu_firmware_v2.ino ACCEL_RANGE_G / GYRO_RANGE_DPS). Used only
+# for a v2 board whose live readback keeps saying 0 ("don't trust me"): for v2 the v1
+# guesses above are certainly wrong, by 2x on both sensors.
+V2_ACCEL_RANGE_G = 4.0
+V2_GYRO_RANGE_DPS = 1000.0
 
 GYRO_LSB_TO_RAD_S = (GYRO_RANGE_DPS / 32768.0) * (math.pi / 180.0)
 ACCEL_LSB_TO_M_S2 = (ACCEL_RANGE_G / 32768.0) * 9.80665
@@ -226,19 +235,27 @@ def parse_imu_line(line: str,
     return out
 
 
-def query_version(ser, attempts: int = 4) -> Optional[dict]:
+def query_version(ser, attempts: int = 4, readback_attempts: int = 8) -> Optional[dict]:
     """Ask the firmware for its protocol version + configured sensor ranges ('V').
 
-    Firmware v2 self-reports the ranges it read back off the chip, which removes the
-    guesswork entirely. v1 doesn't implement 'V' -> returns None and the caller keeps
-    its (guessed) param values.
+    Returns {"proto", "accel_range_g", "gyro_range_dps", "readback"} or None (v1, which
+    doesn't answer 'V': the caller keeps its guessed ranges). `readback` is True when
+    both ranges were read back off the chip.
 
     RETRIES because the FIRST command after opening the port is reliably dropped: the
     Nicla is USB-CDC and does not reset on open, so the first write lands while the
     CDC endpoint is still settling. Measured: attempt 1 times out, attempt 2 answers.
     A one-shot query here would silently mis-scale every run.
+
+    A range of 0 ("readback failed, don't trust me") is retried too: it is
+    INTERMITTENT, not only right after boot as first thought (2026-11-05 on the robot,
+    long after boot: 'VER 2 0 1000', then 'VER 2 4 1000' on the next query). It used to
+    end the query, and every tool then ran on the v1 guesses, 2x too large for v2. If
+    it stays 0, a v2 board gets the ranges v2 configures (V2_*), with readback False.
     """
-    for i in range(attempts):
+    failed = None                  # the last VER reply with a range of 0
+    silent = 0
+    while True:
         try:
             ser.reset_input_buffer()
             ser.write(b"V")
@@ -250,19 +267,39 @@ def query_version(ser, attempts: int = 4) -> Optional[dict]:
                 proto, arange, grange = int(parts[1]), float(parts[2]), float(parts[3])
             except ValueError:
                 return None
-            if arange <= 0 or grange <= 0:
-                # v2 explicitly reporting "range readback failed, don't trust me".
-                # That's a definitive answer, not a dropped byte — don't retry it.
-                return None
-            return {"proto": proto, "accel_range_g": arange, "gyro_range_dps": grange}
-        time.sleep(0.05)   # empty/torn line: CDC still settling, or this is v1
-    return None
+            if arange > 0 and grange > 0:
+                return {"proto": proto, "accel_range_g": arange, "gyro_range_dps": grange,
+                        "readback": True}
+            failed = (proto, arange, grange)
+            readback_attempts -= 1
+            if readback_attempts <= 0:
+                break
+        else:
+            silent += 1    # empty/torn line: CDC still settling, or this is v1
+            if silent >= attempts:
+                break
+        time.sleep(0.05)
+    if failed is None or failed[0] < 2:
+        return None
+    proto, arange, grange = failed
+    return {"proto": proto,
+            "accel_range_g": arange if arange > 0 else V2_ACCEL_RANGE_G,
+            "gyro_range_dps": grange if grange > 0 else V2_GYRO_RANGE_DPS,
+            "readback": False}
 
 
 # Firmware v2 runs at 921600 (115200 capped the poll at ~41 Hz — BELOW the 50 Hz
 # control loop); v1 runs at 115200. Auto-detecting means flashing the board never
 # strands the host config, and one command works against either firmware.
 BAUD_CANDIDATES = (921600, 115200)
+
+
+def _port_group(port: str) -> str:
+    """The group owning a device node ('dialout' for /dev/ttyACM* on Ubuntu)."""
+    try:
+        return grp.getgrgid(os.stat(port).st_gid).gr_name
+    except (OSError, KeyError):
+        return "dialout"
 
 
 def open_imu(port: str, baud: Optional[int] = None, settle: float = 2.0):
@@ -279,6 +316,15 @@ def open_imu(port: str, baud: Optional[int] = None, settle: float = 2.0):
         try:
             ser = serial.Serial(port, b, timeout=0.5)
         except Exception as e:            # wrong port / already open elsewhere
+            if getattr(e, "errno", None) == errno.EACCES or isinstance(e, PermissionError):
+                # Not "no response": this shell may not open the port at all. Say so,
+                # instead of sending people looking for a process holding it.
+                raise RuntimeError(
+                    f"permission denied opening {port}: this shell isn't in the "
+                    f"'{_port_group(port)}' group. Once: `sudo usermod -aG "
+                    f"{_port_group(port)} $USER`, then log out and back in (a new "
+                    f"terminal is not enough). Right now: `newgrp {_port_group(port)}` "
+                    f"in this terminal.") from e
             err = e
             continue
         time.sleep(settle)

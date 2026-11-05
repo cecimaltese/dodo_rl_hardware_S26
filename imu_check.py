@@ -75,8 +75,10 @@ def main():
     if ver:
         gs = (ver["gyro_range_dps"] / 32768.0) * (math.pi / 180.0)
         as_ = (ver["accel_range_g"] / 32768.0) * 9.80665
-        check("PORT", True, f"firmware v{ver['proto']} @ {baud} baud — ranges from "
-                            f"device: accel +/-{ver['accel_range_g']:.0f} g, "
+        where = ("from device" if ver.get("readback", True) else
+                 "= v2's CONFIGURED values (readback said 0; SCALE below verifies)")
+        check("PORT", True, f"firmware v{ver['proto']} @ {baud} baud — ranges {where}: "
+                            f"accel +/-{ver['accel_range_g']:.0f} g, "
                             f"gyro +/-{ver['gyro_range_dps']:.0f} dps")
     else:
         gs, as_ = proto.GYRO_LSB_TO_RAD_S, proto.ACCEL_LSB_TO_M_S2

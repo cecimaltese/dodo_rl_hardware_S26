@@ -126,3 +126,63 @@ class TestToMessage:
         assert back.accel == pytest.approx(msg.accel, rel=1e-6)
         assert back.quat == pytest.approx(msg.quat, rel=1e-6)
         assert back.quat_valid and not back.lin_vel_valid
+
+
+class FakeVPort:
+    """Answers each 'V' with the next scripted line (b"" = a dropped reply)."""
+
+    def __init__(self, *lines):
+        self.lines, self.asked = list(lines), 0
+
+    def reset_input_buffer(self):
+        pass
+
+    def write(self, data):
+        self.asked += 1
+
+    def readline(self):
+        return self.lines.pop(0) if self.lines else b""
+
+
+class TestQueryVersion:
+    """'V' -> ranges. 2026-11-05 on the robot: 'VER 2 0 1000' (accel readback 0) long
+    after boot, then 'VER 2 4 1000' a moment later. A 0 used to end the query and every
+    tool fell back to the v1 guesses: 2x too large for v2, on the gyro too."""
+
+    def test_clean_reply(self):
+        v = proto.query_version(FakeVPort(b"VER 2 4 1000\r\n"))
+        assert v == {"proto": 2, "accel_range_g": 4.0, "gyro_range_dps": 1000.0,
+                     "readback": True}
+
+    def test_first_command_dropped_then_answers(self):
+        v = proto.query_version(FakeVPort(b"", b"VER 2 4 1000\r\n"))
+        assert v["readback"] and v["accel_range_g"] == 4.0
+
+    def test_an_intermittent_zero_is_retried(self):
+        v = proto.query_version(FakeVPort(b"VER 2 0 1000\r\n", b"VER 2 4 1000\r\n"))
+        assert v["readback"] and v["accel_range_g"] == 4.0
+
+    def test_a_lasting_zero_gets_v2s_configured_ranges_not_v1_guesses(self):
+        v = proto.query_version(FakeVPort(*[b"VER 2 0 1000\r\n"] * 20))
+        assert v == {"proto": 2, "accel_range_g": proto.V2_ACCEL_RANGE_G,
+                     "gyro_range_dps": 1000.0, "readback": False}
+        assert proto.V2_ACCEL_RANGE_G != proto.ACCEL_RANGE_G          # not the v1 guess
+        gyro, _, src = sensor_scales(v)
+        assert gyro == pytest.approx(GYRO_V2) and "not verified" in src
+
+    def test_v1_never_answers(self):
+        port = FakeVPort()
+        assert proto.query_version(port) is None
+        assert port.asked == 4                                       # gives up in time
+
+
+class TestOpenImuPermission:
+    def test_permission_denied_says_so(self, monkeypatch, tmp_path):
+        """A shell without the port's group used to get "no IMU response ... is
+        something else holding the port?" (2026-11-05: the user's terminals predated
+        `usermod -aG dialout`)."""
+        def denied(*a, **kw):
+            raise proto.serial.SerialException(13, "could not open port: Permission denied")
+        monkeypatch.setattr(proto.serial, "Serial", denied)
+        with pytest.raises(RuntimeError, match=r"permission denied.*log out and back in"):
+            proto.open_imu(str(tmp_path / "ttyACM0"), settle=0.0)

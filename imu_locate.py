@@ -767,6 +767,8 @@ def _open(args):
     try:
         ser, _, ver = proto.open_imu(args.port, args.baud)
     except (RuntimeError, AttributeError) as e:   # AttributeError: pyserial missing
+        if "permission denied" in str(e):
+            sys.exit(str(e))
         sys.exit(f"{e}\n  Is imu_service.py (or a serial monitor) holding the port? "
                  f"`ls /dev/ttyACM*` (Linux) or `ls /dev/cu.usbmodem*` (Mac) to find it.")
     ser.timeout = 0.2

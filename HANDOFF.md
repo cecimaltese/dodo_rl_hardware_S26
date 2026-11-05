@@ -58,23 +58,17 @@ the robot yet.
 - **Verified:** the stand policy in MuJoCo (30 s+ lockstep; 10 s through the full ZMQ
   stack), the IMU on the bench and its pose on the robot (axes/signs by live check), power +
   CAN on the repaired robot (all 8 motors answer), the visualizer reading the live
-  ODrives. The test suite runs anywhere: 168 passed, 1 known failure (the joint-order
+  ODrives. The test suite runs anywhere: 174 passed, 1 known failure (the joint-order
   guard), 1 skip (stale flat run); without `dodo_rl` beside the repo, 3 more
   training-side skips. Python 3.12 (new robot machine); before 2026-11-04, 3.10.
 - **Never run on hardware:** `motor_service`, the safety layer (including the silent-joint
   watchdog, fixed 2026-11-04), any commanded motion.
 
 **Next steps, in order** (roadmap step 1 is 1–4 here):
-1. **Knee/ankle gear ratios.** `python3 calibrate_joints.py --ratio <joint>` for each of
-   `lower_leg_left/right`, `foot_left/right`: hold the link above still, phone on its edge
-   on the moving link, turn the joint 40–80°, type the two angles; 2–3 turns each. A
-   nameplate/CAD/WS25 number beats this if anyone has one. Enter them in
-   `fleet_config.GEAR_RATIO`. Check: turn an ankle 90° with `visualize_motor_state.py`
-   running — the model must turn 90°. (If the ankles' ~32:1 holds for the knee too, its
-   real stops sit inside its URDF range: 2026-07-16 log.)
-2. **Persistence:** `calibrate_joints.py --check-persistence` (power-cycle the motors
-   without touching the robot). Record the verdict here: it decides whether the Damiao
-   zeros can be stored (assumed) and confirms the ODrives are boot-relative.
+1. ~~Knee/ankle gear ratios~~ — done 2026-11-05: knees 25.6, ankles 28.5
+   (`fleet_config.GEAR_RATIO`; log).
+2. ~~Persistence~~ — done 2026-11-05: Damiao zeros survive a power cycle, ODrive zeros
+   don't (log). The startup reference pose follows from that (§3, open question there).
 3. **Calibrate** (README bring-up step 3): the main pass at the zero pose (the default:
    legs hanging straight down, soles level, body level by `imu_locate.py level`), then
    `--verify`, then the visualizer as the acceptance check: every joint follows your
@@ -89,7 +83,10 @@ the robot yet.
    `sim_lo`, ankles at `sim_hi`; `--home` uses `sim_hi` for every joint).
 5. **Wire the calibration into `motor_service`:** `_JointAdapter` through
    `real2sim.JointCal` (sign, mapping; the ratio already goes through it). Damiao zero
-   from `joint_calib.py` if the persistence test allows; ODrive zero from the boot pose.
+   from `joint_calib.py` (persistence allows it); ODrive zero from the tuck/boot pose.
+   Clamp in joint radians against the measured stops (a fixed margin, not today's 0.9 ×
+   limit, which shrinks toward 0 and gives lopsided margins). ODrive torque into joint
+   Nm (2026-11-05 log) before the IDLE check means anything.
 6. **PD standing controller** (roadmap 3), on the gantry: bring-up steps 5–6 first (one
    joint, a few degrees; then `tools/dodo_startup.py`, which already enables, ramps to the
    default crouch and holds it — that IS a joint-space PD stand). Then the gains toward the
@@ -120,6 +117,12 @@ if it still reads ~3°. Optional: weigh the robot (the CAD says 4.72 kg).
 - **No powered homing, ever** (2026-07-06): it could overload the 3D-printed parts and
   belts. Power on with the ODrive joints folded at their stops, then `dodo_ctl calibrate`.
   `motor_service` never auto-enables.
+- **Zeros (2026-11-05, measured):** the Damiao zeros are stored (they survive a power
+  cycle); the ODrive zeros are re-established every session from a reference pose
+  against the hard stops (the user's "tuck"), then a short startup move to a working pose.
+  OPEN: the user considered making the tuck the joint ZERO itself; the recommendation is
+  to keep the URDF's q = 0 (the policy's and Shafeef's coordinates) and treat the tuck as
+  a reference pose with measured angles (`BOOT_POSE_RAD` from `--limits`).
 - Safety: `|torque| > 0.8 × rated` → that one motor IDLE (torque normalized 0–1 of rated);
   full e-stop on fault, over-speed, over-travel, silent feedback or a stalled command
   stream.
@@ -142,6 +145,37 @@ if it still reads ~3°. Optional: weigh the robot (the CAD says 4.72 kg).
 ---
 
 ## 4. Log (newest first)
+
+### 2026-11-05 — gear ratios measured; persistence verdict (robot session, user)
+- **"IMU not responding" = permissions, not the IMU.** None of the user's terminals had
+  `dialout` (the desktop login predates `usermod -aG dialout`; a new terminal doesn't
+  pick it up, only a fresh login). The tools said "no IMU response… is something holding
+  the port?". `open_imu` now says "permission denied … log out and back in / `newgrp
+  dialout`". The board itself passed `imu_check` (0.39 % off 1 g, 67 Hz). ModemManager
+  is active but doesn't probe it (CDC protocol 0, no modem found).
+- **Firmware v2's range readback is intermittently 0** ("VER 2 0 1000", then "VER 2 4
+  1000" on the next query), long after boot, not only right after it as its comment
+  says. `query_version` gave up on a 0, and every tool then used the v1 guesses (2× too
+  large for v2, gyro included). It now retries a 0, and if it persists uses the ranges v2
+  configures (±4 g / ±1000 °/s), flagged as not read back (`imu_check`'s SCALE verifies).
+- Tests no longer depend on the live `GEAR_RATIO` (they broke once real ratios were in).
+  Suite: 174 passed, 1 known failure, 1 skip.
+- **Gear ratios** (`calibrate_joints.py --ratio`, phone on the moving link): knees
+  **25.6**, ankles **28.5**, in `fleet_config.GEAR_RATIO` (same value left and right). In
+  the visualizer the knees/ankles now turn by about the right amount (full `--verify`
+  pending). Against July's stop-to-stop turns that means ~169° of real ankle travel
+  (URDF: 150°) and ~200° for the left knee (URDF: 260°).
+- **Persistence (`--check-persistence`): Damiao zeros survive a power cycle; ODrive
+  zeros don't** (boot-relative), as expected. So the ODrive joints need a reference pose
+  every session; the user proposes a "tuck" against the hard stops (§3).
+- **The left leg reads inverted** in the visualizer (identity map, no `joint_calib.py`
+  yet): expected to come out as sign −1 in the main pass. Mind hip roll: July found +1 on
+  both hips, and their ranges are symmetric with +1/+1 (`fleet_config.py`).
+- **To check before trusting the ODrive torque IDLE:** `OdriveCanJoint` reads Get_Torques'
+  estimate, which is MOTOR-side Nm (Iq × torque_constant) unless the drives'
+  `motor.config.torque_constant` was set to include the gearing (8.27/KV = 0.0276 Nm/A
+  means motor-side). `motor_service` compares it with 0.8 × 9 Nm, a JOINT torque: at
+  25–28:1 that check can't fire. Fix with the calibration wiring (§2 step 5).
 
 ### 2026-11-04 (b) — real2sim: one reading→angle map, gear ratio, meshed visualizer
 Roadmap step 1 tooling (§1). Software only; the visualizer was smoke-tested on the real
@@ -487,6 +521,8 @@ gain-tuning tool.
   in `dialout` for the Nicla (README *Machine setup*).
 - Old robot PC, for the record: system `python3` 3.10, an editable `damiao_motor` 1.0.7b2
   in the uv cache next to the regular 1.0.6.
+- Group changes (`dialout` for the Nicla) apply to sessions started after a fresh
+  login: log out of the desktop and back in. Until then `newgrp dialout` per terminal.
 - CAN bitrates are set at OS level, never by python-can: `setup/99-dodo-can.rules`
   brings both buses up at 1 Mbit when the adapters appear (by hand: `ip link`).
 - `can0`/`can1` are enumeration order, not identity: use the udev names

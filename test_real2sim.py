@@ -23,6 +23,14 @@ from real2sim import JointCal
 TWO_PI = 2.0 * math.pi
 
 
+@pytest.fixture(autouse=True)
+def unmeasured_ratios(monkeypatch):
+    """Every test starts from unmeasured ratios, whatever fleet_config holds today,
+    and sets the ones it needs with `ratios`."""
+    for j in list(fleet_config.GEAR_RATIO):
+        monkeypatch.setitem(fleet_config.GEAR_RATIO, j, None)
+
+
 @pytest.fixture
 def ratios(monkeypatch):
     """Set gear ratios for one test: ratios(foot_left=32.0, ...)."""

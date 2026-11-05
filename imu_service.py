@@ -49,7 +49,9 @@ def sensor_scales(ver: Optional[dict], gyro_range_dps: float = GYRO_RANGE_DPS,
     """
     if ver:
         gyro_range_dps, accel_range_g = ver["gyro_range_dps"], ver["accel_range_g"]
-        src = f"firmware v{ver['proto']} (self-reported)"
+        src = (f"firmware v{ver['proto']} (self-reported)" if ver.get("readback", True)
+               else f"firmware v{ver['proto']}'s configured ranges (its readback said 0, "
+                    f"so not verified on the chip)")
     else:
         src = "GUESSED (firmware did not answer 'V')"
     return ((gyro_range_dps / 32768.0) * (math.pi / 180.0),
@@ -78,6 +80,9 @@ def run(port: str, baud: int, rate_hz: float, gyro_range_dps: float,
     log.info("imu_service up: polling %s@%d, publishing '%s' at up to %.0f Hz.",
              port, baud, ipc.TOPIC_IMU, rate_hz)
     log.info("sensor ranges from %s", src)
+    if ver and not ver.get("readback", True):
+        log.warning("IMU range readback kept saying 0: using firmware v2's configured "
+                    "ranges. `python3 imu_check.py` verifies them (|accel| = 1 g).")
     if not ver:
         # A wrong gyro range scales base_ang_vel by a constant and the policy never
         # knows. Don't let that pass as a routine info line.
