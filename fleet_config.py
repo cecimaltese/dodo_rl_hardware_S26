@@ -156,6 +156,6 @@ FEEDBACK_FRESH_S = 0.1
 # here. A calibration (joint_calib.py) records the ratio it was made with, and the
 # tools refuse an entry whose ratio no longer matches.
 GEAR_RATIO = {
-    "lower_leg_left": None, "lower_leg_right": None,   # knee
-    "foot_left": None,      "foot_right": None,        # ankle
+    "lower_leg_left": 25.6, "lower_leg_right": 25.6,   # knee
+    "foot_left": 28.5,      "foot_right": 28.5,        # ankle
 }
