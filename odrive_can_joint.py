@@ -44,6 +44,7 @@ CMD_SET_AXIS_STATE = 0x07
 CMD_GET_ENCODER_ESTIMATES = 0x09
 CMD_SET_CONTROLLER_MODE = 0x0B
 CMD_SET_INPUT_POS = 0x0C
+CMD_CLEAR_ERRORS = 0x18
 CMD_SET_POS_GAIN = 0x1A
 CMD_SET_VEL_GAINS = 0x1B
 CMD_GET_TORQUES = 0x1C
@@ -66,6 +67,30 @@ PROCEDURE_RESULTS = ("SUCCESS", "BUSY", "CANCELLED", "DISARMED", "NO_RESPONSE",
                      "HOMING_WITHOUT_ENDSTOP", "INVALID_STATE", "NOT_CALIBRATED",
                      "NOT_CONVERGING")
 PROCEDURE_NOT_CALIBRATED = 14
+PROCEDURE_PHASE_RESISTANCE_OUT_OF_RANGE = 6
+# Error bits (firmware 0.6 ODriveError): heartbeat axis_error, Get_Error's
+# active_errors / disarm_reason. They stay latched until Clear_Errors.
+ODRIVE_ERRORS = {
+    0x1: "INITIALIZING", 0x2: "SYSTEM_LEVEL", 0x4: "TIMING_ERROR",
+    0x8: "MISSING_ESTIMATE", 0x10: "BAD_CONFIG", 0x20: "DRV_FAULT",
+    0x40: "MISSING_INPUT", 0x100: "DC_BUS_OVER_VOLTAGE", 0x200: "DC_BUS_UNDER_VOLTAGE",
+    0x400: "DC_BUS_OVER_CURRENT", 0x800: "DC_BUS_OVER_REGEN_CURRENT",
+    0x1000: "CURRENT_LIMIT_VIOLATION", 0x2000: "MOTOR_OVER_TEMP",
+    0x4000: "INVERTER_OVER_TEMP", 0x8000: "VELOCITY_LIMIT_VIOLATION",
+    0x10000: "POSITION_LIMIT_VIOLATION", 0x1000000: "WATCHDOG_TIMER_EXPIRED",
+    0x2000000: "ESTOP_REQUESTED", 0x4000000: "SPINOUT_DETECTED",
+    0x8000000: "BRAKE_RESISTOR_DISARMED", 0x10000000: "THERMISTOR_DISCONNECTED",
+    0x40000000: "CALIBRATION_ERROR",
+}
+
+
+def error_names(bits: int) -> str:
+    """'CALIBRATION_ERROR' / 'A|B' / 'none' for an error bit field."""
+    names = [n for b, n in ODRIVE_ERRORS.items() if bits & b]
+    rest = bits & ~sum(ODRIVE_ERRORS)
+    if rest:
+        names.append(f"0x{rest:X}")
+    return "|".join(names) or "none"
 
 
 def axis_state_name(state: int) -> str:
@@ -157,6 +182,11 @@ class OdriveCanJoint:
         self._send(CMD_SET_VEL_GAINS, struct.pack("<ff", vel_gain, vel_integrator_gain))
         self.gains = (pos_gain, vel_gain, vel_integrator_gain)
 
+    def clear_errors(self) -> None:
+        """Clear the drive's latched errors (active_errors, disarm_reason, and the
+        heartbeat's axis_error). Doesn't change the axis state."""
+        self._send(CMD_CLEAR_ERRORS, bytes([0]))
+
     def request_calibration(self) -> None:
         """Run the drive's FULL_CALIBRATION_SEQUENCE (motor R/L, then the encoder
         offset: THE ROTOR TURNS, a fraction of a turn and back). Needed once after
@@ -177,6 +207,8 @@ class OdriveCanJoint:
         return {"state": axis_state_name(self._axis_state),
                 "procedure_result": procedure_result_name(self._procedure_result),
                 "axis_error": f"0x{self._axis_error:X}",
+                "errors": error_names(self._axis_error | self._active_errors
+                                      | self._disarm_reason),
                 "active_errors": f"0x{self._active_errors:X}",
                 "disarm_reason": f"0x{self._disarm_reason:X}"}
 

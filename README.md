@@ -169,10 +169,12 @@ python3 visualize_hardware.py                    # all 8 + IMU sensible?
 python3 motor_service.py --gain-scale 0.3        # starts DISABLED, soft PD (terminal 1)
 #    Once per power-up: the ODrives' own motor/encoder calibration. They forget it when
 #    switched off and refuse closed loop until it's redone (NOT_CALIBRATED). THE KNEE
-#    AND ANKLE MOTORS MOVE: a beep, then ~10-15 deg and back.
+#    AND ANKLE MOTORS MOVE: a beep, then 8-16 deg and back, ~16 s.
 python3 tools/dodo_ctl.py odrive_calibrate
 python3 tools/dodo_ctl.py status                 # each drive: IDLE + SUCCESS when done
-#    Then the legs hanging straight, and the joint calibration:
+#    If a drive fails (PHASE_RESISTANCE_OUT_OF_RANGE = no current reaches that motor:
+#    its phase wires/connector), leave its joint out: motor_service.py --only <others>.
+#    Then straighten the legs by hand (the right knee ends ~7 deg off), and:
 python3 tools/dodo_ctl.py calibrate --pose straight   # knees/ankles ARE straight now
 python3 tools/dodo_ctl.py status                 # knees/ankles ~0; all_calibrated
 #    (tools/dodo_startup.py --odrive-calibrate does both, asking before each.)

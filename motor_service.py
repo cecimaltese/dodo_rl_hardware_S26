@@ -39,7 +39,9 @@ ODrive drive calibration, once per power-up: the drives forget their motor/encod
 calibration when switched off and REFUSE closed loop until it's redone (heartbeat
 procedure_result NOT_CALIBRATED). ctl `odrive_calibrate` runs it over CAN, legs
 hanging free: each knee/ankle motor beeps, then turns a fraction of a turn and back
-(~10-15 deg at the joint). It voids the joint calibration below; redo that after.
+(measured 2026-11-05: ankles 8 deg; the right knee 16 deg, ending ~7 deg off, as its
+encoder also searches its index). It voids the joint calibration below; redo that
+after, legs straightened by hand. ~16 s.
 `enable` checks every ODrive actually reaches closed loop, and an ODrive that leaves
 it while enabled is an e-stop.
 
@@ -103,9 +105,10 @@ from damiao_motor import DaMiaoController
 import dodo_ipc as ipc
 import real2sim
 from damiao_joint import DamiaoJoint
-from odrive_can_joint import (AXIS_STATE_CLOSED_LOOP_CONTROL,
-                              PROCEDURE_NOT_CALIBRATED, OdriveCanJoint,
-                              axis_state_name, procedure_result_name)
+from odrive_can_joint import (AXIS_STATE_CLOSED_LOOP_CONTROL, AXIS_STATE_IDLE,
+                              PROCEDURE_NOT_CALIBRATED,
+                              PROCEDURE_PHASE_RESISTANCE_OUT_OF_RANGE, OdriveCanJoint,
+                              axis_state_name, error_names, procedure_result_name)
 from fleet_config import (DM_JOINTS, OD_JOINTS, DM_CHANNEL, OD_CHANNEL, BUSTYPE,
                           RATED_TORQUE_NM, JOINT_VEL_LIMIT_RAD, REFERENCE_POSES,
                           FEEDBACK_FRESH_S, JOINT_KP, JOINT_KD, joint_group,
@@ -222,7 +225,14 @@ class _JointAdapter:
         fault = None
         if self.is_odrive:
             if st.get("axis_error"):
-                fault = f"ODrive axis_error=0x{int(st['axis_error']):X}"
+                err = int(st["axis_error"])
+                fault = f"ODrive {error_names(err)} (axis_error 0x{err:X})"
+                if self.joint.procedure_result == PROCEDURE_PHASE_RESISTANCE_OUT_OF_RANGE:
+                    fault += (": its calibration measured no usable phase resistance, "
+                              "i.e. no current flows: check this motor's phase wires / "
+                              "connector")
+                elif self.joint.procedure_result:
+                    fault += f" after {procedure_result_name(self.joint.procedure_result)}"
         else:
             dm_status = (self.joint.motor.get_states() or {}).get("status")
             if dm_status in DM_FAULT_STATUS:
@@ -279,6 +289,7 @@ class MotorService:
         self._got_cmd = False
         self._last_cmd_time = 0.0
         self._last_cmd_seq: Optional[int] = None
+        self._fault_logged: Dict[str, str] = {}   # disabled-time faults, logged once
 
         # ── Damiao: one controller/socket ─────────────────────────
         self.dm_controller: Optional[DaMiaoController] = None
@@ -461,8 +472,16 @@ class MotorService:
                      if not (a.measured and a.calibrated and a.band)}
         if not_ready:
             raise RuntimeError(f"refusing to enable: {not_ready}")
+        busy = self._busy_drives()
+        if busy:
+            raise RuntimeError(f"refusing to enable: drives still busy {busy}")
 
         states = {n: a.read_state() for n, a in self.adapters.items()}
+        faults = {n: st["fault"] for n, st in states.items() if st["fault"]}
+        if faults:
+            raise RuntimeError(f"refusing to enable, drive faults: {faults}. "
+                               f"(`odrive_calibrate` clears and retries an ODrive; or "
+                               f"leave the joint out: motor_service --only ...)")
         silent_od = [n for n, a in self.adapters.items()
                      if a.is_odrive and not states[n]["has_feedback"]]
         if silent_od:
@@ -570,6 +589,10 @@ class MotorService:
         missing = sorted(set(todo) - set(ref))
         if missing:
             raise RuntimeError(f"reference pose '{pose}' has no angle for {missing}")
+        busy = self._busy_drives()
+        if busy:
+            raise RuntimeError(f"drives still busy {busy}: wait for odrive_calibrate to "
+                               f"finish (status), then straighten the legs")
         unmeasured = sorted(n for n, a in todo.items() if not a.measured)
         if unmeasured:
             raise RuntimeError(f"{unmeasured}: sign not measured (joint_calib.py); "
@@ -614,10 +637,17 @@ class MotorService:
                               "kd": round(a.kd * math.sqrt(self.gain_scale), 3)}
                           for n, a in self.adapters.items()}}
 
+    def _busy_drives(self) -> Dict[str, str]:
+        """ODrives in a state other than IDLE while the fleet is disabled: calibrating."""
+        return {n: axis_state_name(a.joint.axis_state) for n, a in self.adapters.items()
+                if a.is_odrive and a.joint.axis_state not in (AXIS_STATE_IDLE,)}
+
     def _ctl_odrive_calibrate(self, args: dict) -> dict:
         """Run each ODrive's FULL_CALIBRATION_SEQUENCE (joints=[...], default all):
         once per power-up, legs hanging free, while DISABLED. THE MOTORS MOVE: a beep,
-        then each knee/ankle turns ~10-15 deg and back. Non-blocking: `status` shows
+        then each knee/ankle turns 8-16 deg and back (the right knee ends ~7 deg off:
+        its index search). It clears the drives' latched errors first. ~16 s,
+        non-blocking: `status` shows
         each drive's state (back to IDLE when done) and procedure_result (SUCCESS).
         Voids those joints' calibration: `calibrate pose=...` again afterwards."""
         if self._enabled:
@@ -630,14 +660,18 @@ class MotorService:
         if silent:
             raise RuntimeError(f"{silent}: no feedback — check power/CAN")
         for n in names:
+            self.adapters[n].joint.clear_errors()    # a latched error would block it
+        time.sleep(0.05)
+        for n in names:
             a = self.adapters[n]
             a.joint.request_calibration()
             a.calibrated = False          # the rotor moves; the joint zero is redone after
         log.warning("odrive_calibrate: %s — the knee/ankle motors MOVE now (beep, then "
-                    "~10-15 deg and back); then calibrate pose=straight again", names)
+                    "8-16 deg and back, ~16 s); then straighten the legs and "
+                    "calibrate pose=straight again", names)
         return {"started": names,
-                "note": "watch status joints.<name>.drive: state back to IDLE and "
-                        "procedure_result SUCCESS; then calibrate pose=straight"}
+                "note": "~15 s. Watch status joints.<name>.drive: state back to IDLE "
+                        "and procedure_result SUCCESS; then calibrate pose=straight"}
 
     def _ctl_estop_reset(self, _args: dict) -> dict:
         if not self._estopped:
@@ -648,6 +682,8 @@ class MotorService:
         self._start_time = time.monotonic()     # fresh startup grace
         for a in self.adapters.values():
             a.idled = False
+            if a.is_odrive:
+                a.joint.clear_errors()      # else a latched drive error blocks enable
         # A joint that is still silent trips the watchdog again after the grace:
         # resetting doesn't make a dead bus alive.
         log.warning("e-stop RESET — motors remain disabled; 'enable' to resume")
@@ -722,8 +758,19 @@ class MotorService:
             if a.idled:
                 continue
             if st["fault"]:
-                self._estop(f"{name} reported fault: {st['fault']}")
-                return
+                # Enabled: stop everything. Disabled there's nothing to stop, and an
+                # e-stop would send IDLE to every drive, cancelling the calibrations
+                # of the others (2026-11-05: one bad knee motor did exactly that).
+                # Reported instead; `enable` refuses while it lasts.
+                if self._enabled:
+                    self._estop(f"{name} reported fault: {st['fault']}")
+                    return
+                if self._fault_logged.get(name) != st["fault"]:
+                    log.warning("%s: %s (motors disabled: reported, not an e-stop; "
+                                "`enable` refuses while it lasts)", name, st["fault"])
+                    self._fault_logged[name] = st["fault"]
+                continue
+            self._fault_logged.pop(name, None)
             if (self._enabled and a.is_odrive
                     and a.joint.axis_state != AXIS_STATE_CLOSED_LOOP_CONTROL):
                 r = a.joint.drive_report()

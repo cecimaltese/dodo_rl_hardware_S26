@@ -111,6 +111,11 @@ class FakeFleet:
         self.od_drive_cal = {c.node_id: True for c in OD_JOINTS}
         self.od_proc = {c.node_id: 0 for c in OD_JOINTS}
         self.od_cal_until = {}
+        # A motor with an open phase (node 3 on the robot, 2026-11-05): its calibration
+        # fails PHASE_RESISTANCE_OUT_OF_RANGE and latches CALIBRATION_ERROR until
+        # Clear_Errors.
+        self.od_phase_open = {c.node_id: False for c in OD_JOINTS}
+        self.od_err = {c.node_id: 0 for c in OD_JOINTS}
         self.dm_cmd = {}        # motor_id -> (pos, kp, kd) of the last MIT frame
         self.od_input_pos = {}  # node -> turns of the last Set_Input_Pos
         self.od_gains = {}      # node -> [pos_gain, vel_gain, vel_integrator_gain]
@@ -176,10 +181,15 @@ class FakeFleet:
                         if want == AXIS_STATE_CLOSED_LOOP_CONTROL and not self.od_drive_cal[node]:
                             self.od_state[node], self.od_proc[node] = AXIS_STATE_IDLE, 14
                         elif want == 3:                       # FULL_CALIBRATION_SEQUENCE
-                            self.od_state[node] = 3
+                            self.od_state[node] = 4           # MOTOR_CALIBRATION first
                             self.od_cal_until[node] = time.monotonic() + 0.3
-                        else:
+                        elif not (want == AXIS_STATE_IDLE
+                                  and self.od_state[node] == AXIS_STATE_IDLE):
+                            # (IDLE while IDLE leaves the last result: the real drives
+                            # kept NOT_CALIBRATED through it, 2026-11-05)
                             self.od_state[node], self.od_proc[node] = want, 0
+                    elif cmd == 0x18:                         # Clear_Errors
+                        self.od_err[node] = 0
                     elif cmd == CMD_SET_INPUT_POS:
                         self.od_input_pos[node] = struct.unpack("<fhh", d)[0]
                     elif cmd == CMD_SET_POS_GAIN:
@@ -194,8 +204,12 @@ class FakeFleet:
             for node, until in list(self.od_cal_until.items()):
                 if time.monotonic() >= until:                 # calibration finished
                     del self.od_cal_until[node]
-                    self.od_state[node], self.od_proc[node] = AXIS_STATE_IDLE, 0
-                    self.od_drive_cal[node] = True
+                    if self.od_phase_open[node]:
+                        self.od_state[node], self.od_proc[node] = AXIS_STATE_IDLE, 6
+                        self.od_err[node] = 0x40000000
+                    else:
+                        self.od_state[node], self.od_proc[node] = AXIS_STATE_IDLE, 0
+                        self.od_drive_cal[node] = True
             if time.monotonic() >= next_cyclic:
                 next_cyclic = time.monotonic() + 0.010
                 for node, alive in self.od_alive.items():
@@ -205,7 +219,8 @@ class FakeFleet:
                         self._od_send(node, CMD_GET_TORQUES,
                                       struct.pack("<ff", 0.0, self.od_torque[node]))
                         self._od_send(node, CMD_HEARTBEAT,
-                                      struct.pack("<IBBBB", 0, self.od_state[node],
+                                      struct.pack("<IBBBB", self.od_err[node],
+                                                  self.od_state[node],
                                                   self.od_proc[node], 0, 0))
 
     def close(self):
@@ -569,8 +584,13 @@ def test_odrive_calibrate_then_enable(service, fleet):
     assert ctl.request("calibrate", pose="straight")["ok"]
     rep = ctl.request("odrive_calibrate")
     assert rep["ok"] and len(rep["started"]) == 4, rep
+    time.sleep(0.1)                                      # the drives are calibrating
     st = status(ctl)
     assert not st["all_calibrated"], "the rotor moved: the joint zeros are void"
+    rep = ctl.request("calibrate", pose="straight")
+    assert not rep["ok"] and "busy" in rep["error"], "no joint zero mid-motion"
+    assert not ctl.request("enable")["ok"]
+    time.sleep(0.4)
     st = wait_for(lambda: (s := status(ctl)) and all(
         j["drive"]["state"] == "IDLE" and j["drive"]["procedure_result"] == "SUCCESS"
         for j in s["joints"].values() if j["type"] == "odrive") and s, 2.0,
@@ -599,3 +619,91 @@ def test_an_odrive_leaving_closed_loop_estops(service, fleet):
     st = wait_for(lambda: (s := status(ctl))["estopped"] and s, 1.0,
                   "e-stop on the drive that dropped out")
     assert "foot_right left closed loop" in st["estop_reason"]
+
+
+
+def drives_done(ctl):
+    return wait_for(lambda: (s := status(ctl)) and all(
+        j["drive"]["state"] == "IDLE" and j["drive"]["procedure_result"] != "SUCCESS"
+        or j["drive"]["state"] == "IDLE" and j["drive"]["procedure_result"] == "SUCCESS"
+        for j in s["joints"].values() if j["type"] == "odrive") and s, 2.0,
+        "every drive back in IDLE")
+
+
+def test_a_dead_motor_doesnt_estop_or_cancel_the_others(service, fleet):
+    """2026-11-05 on the robot: the left knee's calibration failed (open phase), its
+    latched error e-stopped the disabled service, and the e-stop's IDLE cancelled the
+    other drives' calibration, every time."""
+    _, ctl = service
+    time.sleep(ms.STARTUP_GRACE_S)
+    for node in fleet.od_drive_cal:
+        fleet.od_drive_cal[node] = False
+    fleet.od_phase_open[fleet.od_id["lower_leg_left"]] = True
+    assert ctl.request("odrive_calibrate")["ok"]
+    time.sleep(0.6)
+    st = drives_done(ctl)
+    assert not st["estopped"], st["estop_reason"]
+    bad = st["joints"]["lower_leg_left"]
+    assert bad["drive"]["procedure_result"] == "PHASE_RESISTANCE_OUT_OF_RANGE"
+    assert "CALIBRATION_ERROR" in bad["drive"]["errors"]
+    assert "phase wires" in bad["fault"]
+    for name in ("foot_left", "lower_leg_right", "foot_right"):
+        assert st["joints"][name]["drive"]["procedure_result"] == "SUCCESS", name
+    assert ctl.request("calibrate", pose="straight")["ok"]
+    rep = ctl.request("enable")
+    assert not rep["ok"] and "lower_leg_left" in rep["error"] and "fault" in rep["error"]
+    assert not status(ctl)["estopped"]
+
+
+def test_odrive_calibrate_clears_a_latched_error(service, fleet):
+    """After a repair the old CALIBRATION_ERROR is still latched in the drive: the
+    retry must clear it first, then succeed."""
+    _, ctl = service
+    time.sleep(ms.STARTUP_GRACE_S)
+    node = fleet.od_id["lower_leg_left"]
+    fleet.od_err[node], fleet.od_proc[node], fleet.od_drive_cal[node] = 0x40000000, 6, False
+    time.sleep(0.1)
+    assert status(ctl)["joints"]["lower_leg_left"]["fault"]
+    assert ctl.request("odrive_calibrate", joints=["lower_leg_left"])["ok"]
+    time.sleep(0.6)
+    st = drives_done(ctl)
+    j = st["joints"]["lower_leg_left"]
+    assert j["drive"]["procedure_result"] == "SUCCESS" and j["fault"] is None, j
+    assert ctl.request("calibrate", pose="straight")["ok"]
+    assert ctl.request("enable")["ok"]
+    ctl.request("disable")
+
+
+def test_the_fleet_runs_without_the_dead_joint(fleet, tmp_path):
+    """motor_service --only <the other seven>: the bad knee isn't part of the fleet."""
+    calib = tmp_path / "joint_calib.py"
+    write_test_calib(calib)
+    fleet.od_phase_open[fleet.od_id["lower_leg_left"]] = True
+    fleet.od_err[fleet.od_id["lower_leg_left"]] = 0x40000000
+    others = [j for j in TEST_CAL if j != "lower_leg_left"]
+    svc = ms.MotorService(dm_channel=fleet.dm_channel, od_channel=fleet.od_channel,
+                          bustype="virtual", calib_path=calib, only=others)
+    th = threading.Thread(target=svc.run, daemon=True)
+    th.start()
+    ctl = ipc.CtlClient()
+    try:
+        st = enabled(ctl, fleet)
+        assert st["enabled"] and "lower_leg_left" not in st["joints"]
+        ctl.request("disable")
+    finally:
+        svc._stop.set()
+        th.join(timeout=3.0)
+        ctl.close()
+
+
+def test_estop_reset_clears_the_drives_errors(service, fleet):
+    _, ctl = service
+    enabled(ctl, fleet)
+    node = fleet.od_id["foot_right"]
+    fleet.od_err[node] = 0x1000                          # CURRENT_LIMIT_VIOLATION
+    st = wait_for(lambda: (s := status(ctl))["estopped"] and s, 1.0, "e-stop on the fault")
+    assert "CURRENT_LIMIT_VIOLATION" in st["estop_reason"]
+    assert ctl.request("estop_reset")["ok"]
+    time.sleep(0.2)
+    assert fleet.od_err[node] == 0
+    assert status(ctl)["joints"]["foot_right"]["fault"] is None

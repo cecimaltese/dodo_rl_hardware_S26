@@ -4,7 +4,7 @@ dodo_ctl.py — send ctl commands to the motor service (real or sim).
     python3 tools/dodo_ctl.py status
     python3 tools/dodo_ctl.py odrive_calibrate          # ONCE PER POWER-UP, legs free:
                                               # the drives' own calibration; the
-                                              # knee/ankle motors MOVE ~10-15 deg
+                                              # knee/ankle motors MOVE 8-16 deg
     python3 tools/dodo_ctl.py calibrate --pose straight
                                               # EVERY SESSION: the knees/ankles are
                                               # in that reference pose (legs hanging

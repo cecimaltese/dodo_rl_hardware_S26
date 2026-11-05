@@ -10,7 +10,7 @@ hanging straight). This tool then:
     1. status      sanity: who is there, what do they read
     1b. odrive_calibrate   with --odrive-calibrate, once per power-up: the drives'
                    own motor/encoder calibration (THE KNEE/ANKLE MOTORS MOVE:
-                   ~10-15 deg and back; legs hanging free). Without it they refuse
+                   8-16 deg and back; legs hanging free). Without it they refuse
                    closed loop, and `enable` says so.
     2. calibrate   the ODrives' zero from a reference pose the knees/ankles are
                    in (--ref-pose, default `straight`: legs hanging straight on
@@ -84,7 +84,14 @@ def wait_for_drives(ctl: ipc.CtlClient, timeout_s: float = 60.0) -> None:
             print()
             failed = {n: d for n, d in drives.items() if d["procedure_result"] != "SUCCESS"}
             if failed:
-                raise SystemExit(f"ODrive calibration failed: {failed}")
+                hint = ("\n  PHASE_RESISTANCE_OUT_OF_RANGE: no current flows through that "
+                        "motor: check its phase wires / connector."
+                        if any(d["procedure_result"] == "PHASE_RESISTANCE_OUT_OF_RANGE"
+                               for d in failed.values()) else "")
+                raise SystemExit("ODrive calibration failed: " + "; ".join(
+                    f"{n}: {d['procedure_result']} ({d['errors']})"
+                    for n, d in failed.items()) + hint
+                    + "\n  To go on without it: motor_service.py --only <the other joints>")
             return
         if time.monotonic() - t0 > timeout_s:
             raise SystemExit(f"\nODrive calibration still running after {timeout_s:.0f} s: {busy}")
@@ -130,7 +137,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--odrive-calibrate", action="store_true",
                     help="first run the ODrives' own calibration (once per power-up; "
-                         "the knee/ankle motors MOVE ~10-15 deg; legs hanging free)")
+                         "the knee/ankle motors MOVE 8-16 deg; legs hanging free)")
     ap.add_argument("--ref-pose", default="straight",
                     help="where the knees/ankles ARE if the service still needs "
                          "`calibrate` (fleet_config.REFERENCE_POSES; default: straight, "
@@ -173,8 +180,8 @@ def main():
 
     # 1b) the ODrives' own motor/encoder calibration (once per power-up) ---------
     if args.odrive_calibrate:
-        print("\nODrive calibration: each knee/ankle motor beeps, then turns ~10-15 deg "
-              "and back. The legs must hang FREE.")
+        print("\nODrive calibration: each knee/ankle motor beeps, then turns 8-16 deg "
+              "and back (~16 s). The legs must hang FREE.")
         if not args.yes and input("  go? [y/N] ").strip().lower() not in ("y", "yes"):
             raise SystemExit("aborted (nothing moved).")
         rep = ctl.request("odrive_calibrate")

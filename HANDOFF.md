@@ -132,7 +132,9 @@ if it still reads ~3°. Optional: weigh the robot (the CAD says 4.72 kg).
 - Transport → **ZMQ, not ROS2** (2026-07-06). The ROS2 nodes were deleted on 2026-10-30;
   their last state is at `658874c`.
 - **ODrive drive calibration every power-up, over CAN** (2026-11-05): `dodo_ctl
-  odrive_calibrate` (motors move ~10-15°, legs free), before the joint calibration.
+  odrive_calibrate` (motors move 8-16°, ~16 s, legs free), before the joint calibration.
+- **Drive faults while disabled are reported, not e-stops** (2026-11-05): nothing to stop,
+  and the e-stop's IDLE would cancel the other drives' calibration. `enable` refuses.
 - ODrive transport → **CAN Simple**. USB only for configuration. **The PD gains go over
   CAN** (2026-11-05; Set_Pos_Gain 0x1A / Set_Vel_Gains 0x1B, firmware 0.5 and 0.6;
   RAM only), set by `motor_service` at every enable from `fleet_config.JOINT_KP/JOINT_KD`
@@ -181,6 +183,46 @@ if it still reads ~3°. Optional: weigh the robot (the CAD says 4.72 kg).
 ---
 
 ## 4. Log (newest first)
+
+### 2026-11-05 (j) — robot: the LEFT KNEE's motor gets no current; the service fixed
+- **User:** odrive_calibrate moved only the right leg noticeably, never ended in
+  SUCCESS, and the service was always E-STOPPED.
+- **Diagnosis (Claude, on the robot; the user had cleared it to run the process):**
+  node 3 (`lower_leg_left`) reported `PHASE_RESISTANCE_OUT_OF_RANGE` + CALIBRATION_ERROR
+  (0x40000000). Cleared and re-run alone: MOTOR_CALIBRATION, then that failure after
+  1.6 s, rotor still, **DC bus current 0.00 A** throughout. The healthy left ankle
+  (node 4), same step: 4.2 s at 0.12 A, then a 9.2 s encoder offset scan, SUCCESS. So
+  **no current reaches the left knee motor: an open phase** (wires / connector between
+  node 3's ODrive and its MN4004; cf. node 7's re-soldered connector, 11-04). Its
+  encoder works (positions, the calibration's main pass). **Hardware fix needed.**
+- The other three calibrate (measured, each alone): ankles 13.5 s, rotor 0.67 turns =
+  8.4° at the ankle, back to the start; right knee (node 7, configured by
+  odrive_can_setup.py: it also has an ENCODER_INDEX_SEARCH) 15.4 s, 1.17 turns = 16.4°,
+  **ending 0.49 turns = 7° from its start**. Straighten the legs before `calibrate`.
+- **Why always e-stopped:** a drive keeps its error latched (heartbeat axis_error) until
+  Clear_Errors. motor_service e-stopped on that fault ~1 s after every start, disabled
+  or not, and the e-stop's IDLE cancelled any calibration in flight. Confirmed on the
+  robot before the fix.
+- **Fixes:** a drive fault while the fleet is DISABLED is reported (status, log once),
+  not an e-stop; enabled it still e-stops. `enable` refuses with any fault, and while
+  any ODrive is busy (calibrating); `calibrate` refuses while one is busy (no joint
+  zero mid-motion). `odrive_calibrate` and `estop_reset` send Clear_Errors (0x18)
+  first. Error bits decoded (`odrive_can_joint.ODRIVE_ERRORS`, firmware 0.6), and
+  PHASE_RESISTANCE_OUT_OF_RANGE says "no current flows: check its phase wires".
+- **Checked on the robot through the fixed service:** no e-stop at start (the fault
+  listed instead), odrive_calibrate → foot_left, foot_right SUCCESS at 13.8 s,
+  lower_leg_right at 16.4 s, lower_leg_left failed at 1.8 s with the hint, nothing
+  cancelled, never e-stopped; `enable` refused (joint calibration pending). Stopped
+  there: `calibrate pose=straight` needs eyes on the legs.
+- **Until the knee is fixed:** the other seven run with `motor_service.py --only
+  hip_left,hip_right,upper_leg_left,upper_leg_right,foot_left,lower_leg_right,foot_right`
+  (README *Bring-up* step 4): steps 5–6 in the air, the push test on three ODrives.
+  Standing (step 7) needs the left knee.
+- Tests: the fake drives fail like node 3 (open phase: PHASE_RESISTANCE_OUT_OF_RANGE,
+  latched until Clear_Errors) and keep their last result through IDLE-while-IDLE
+  (as the real ones did). New: a dead motor neither e-stops nor cancels the others,
+  odrive_calibrate clears a latched error, the fleet runs without the dead joint,
+  estop_reset clears drive errors, calibrate/enable refused while calibrating.
 
 ### 2026-11-05 (i) — robot: the ODrives refused closed loop (NOT_CALIBRATED); fixed
 - **User at the robot, bring-up step 5:** with `demo_combined.py` no ODrive joint moved
