@@ -86,21 +86,29 @@ the robot yet.
    `fleet_config.JOINT_LIMITS_RAD` ← the measured stops (all 8, in the sim frame) and
    `BOOT_POSE_RAD` ← the stops the ODrive joints are folded against at power-on (knees at
    `sim_lo`, ankles at `sim_hi`; `--home` uses `sim_hi` for every joint).
-5. **Wire the calibration into `motor_service`:** `_JointAdapter` through
-   `real2sim.JointCal` (sign, mapping; the ratio already goes through it). Damiao zero
-   from `joint_calib.py` (persistence allows it); ODrive zero from the tuck/boot pose.
-   Clamp in joint radians against the measured stops (a fixed margin, not today's 0.9 ×
-   limit, which shrinks toward 0 and gives lopsided margins). ODrive torque into joint
-   Nm (2026-11-05 log) before the IDLE check means anything.
+5. ~~Wire the calibration into `motor_service`~~ — done 2026-11-05 (log 11-05 (g)).
+   Smoke-tested on the real buses, disabled; never enabled on a motor yet.
 6. **PD standing controller** (roadmap 3). *In sim: done 2026-11-05* (`sim_service.py
    --scene --gantry`, README *Rehearse the PD stand in sim first*; log 11-05 (e)). On the
-   robot, on the gantry: bring-up steps 5–6 (one joint, a few degrees; then
-   `tools/dodo_startup.py --pose home` in the air, lower, let the ropes go slack). Gains
-   = `scene.xml`'s: the Damiao MIT kp/kd take 150/1.5 as they are; the ODrives need
-   `vel_integrator_gain` 0 and the pos/vel gains from log 11-05 (c). The stand has little
-   margin forward (log 11-05 (e)): keep the gantry close to taut, and watch which way
-   it wants to tip. Re-take the weight before ending `dodo_startup` (its park ends limp).
-   Prerequisite: step 5.
+   robot, on the gantry: README *Bring-up* steps 4–7 (calibrate `straight`, one joint
+   at a time at gain scale 0.3, `home` in the air raising the gains live, then lower).
+   The stand has little margin forward (log 11-05 (e)): keep the gantry close to taut,
+   and watch which way it wants to tip. Re-take the weight before ending `dodo_startup`
+   (its park ends limp).
+   **Open before step 7 (standing): the ODrives' `vel_limit` caps the knee torque.** In
+   position control the drive's velocity setpoint saturates at `vel_limit`, so the most
+   torque it holds at standstill is vel_gain × vel_limit. kd 0.8 fixes vel_gain at
+   0.0077 Nm/(turn/s) (knee), so at the 10 turns/s fleet_config lists that's 0.077 Nm at
+   the motor, 2.0 Nm at the knee; `home` needs 2.9 Nm (sim). The drives' real
+   `vel_limit`, current limit and `torque_constant` were set by WS25 and are unknown (CAN
+   Simple can't read them; the `odrive` USB package isn't installed). **Plan (user,
+   2026-11-05: no USB, the ports sit badly in the body): the push test** in step 6
+   (`tools/pd_push_test.py`, log 11-05 (h)) measures the cap on each knee/ankle in the
+   air. If the cap at full gains is under ~1.3 × the stand's need (knee 2.9, ankle 1.4
+   Nm), raise the ODrive kd in `fleet_config.JOINT_KD` (cap = kd · 2π · vel_limit / N):
+   kd 2 gives 4.9 Nm at vel_limit 10, and the sim stand is unchanged by it (3.8° lean,
+   5.3° max vs 5.8°). If the plateau doesn't scale with the gains, it's the current
+   limit instead, which only USB (or Set_Limits with a guessed current) can raise.
 7. **Shafeef's standing policy** (roadmap 4): adapt `rl_env.py` to its contract, add the
    run to `policies/`, rehearse on `sim_service`, then the gantry. Before it runs on the
    robot, settle the IMU's pitch (below).
@@ -123,8 +131,12 @@ if it still reads ~3°. Optional: weigh the robot (the CAD says 4.72 kg).
 ## 3. Decisions (don't re-ask)
 - Transport → **ZMQ, not ROS2** (2026-07-06). The ROS2 nodes were deleted on 2026-10-30;
   their last state is at `658874c`.
-- ODrive transport → **CAN Simple**. USB only for configuration and gain tuning
-  (gains can't be set over CAN).
+- **ODrive drive calibration every power-up, over CAN** (2026-11-05): `dodo_ctl
+  odrive_calibrate` (motors move ~10-15°, legs free), before the joint calibration.
+- ODrive transport → **CAN Simple**. USB only for configuration. **The PD gains go over
+  CAN** (2026-11-05; Set_Pos_Gain 0x1A / Set_Vel_Gains 0x1B, firmware 0.5 and 0.6;
+  RAM only), set by `motor_service` at every enable from `fleet_config.JOINT_KP/JOINT_KD`
+  (the earlier "gains can't be set over CAN" was wrong).
 - CAN → **two buses**, one adapter each, pinned by serial to `can_dm` / `can_od`.
   ODrive nodes 3/4/7/8 (measured on the live bus).
 - **No powered homing, ever** (2026-07-06): it could overload the 3D-printed parts and
@@ -133,6 +145,11 @@ if it still reads ~3°. Optional: weigh the robot (the CAD says 4.72 kg).
 - **Zeros (2026-11-05, measured):** the Damiao zeros are stored (they survive a power
   cycle); the ODrive zeros are re-established every session from a reference pose
   against the hard stops (the user's "tuck"), then a short startup move to a working pose.
+- **ODrive zero per session from a named reference pose** (2026-11-05,
+  `fleet_config.REFERENCE_POSES`, `dodo_ctl calibrate --pose <name>`; no default, so
+  nobody calibrates against a pose the robot isn't in). On the gantry: `straight`. The
+  placeholder `BOOT_POSE_RAD` (URDF limits, 20° off the real knee stop) and July's
+  raw-frame `JOINT_LIMITS_RAD` are gone; the stops come from `joint_calib.py`.
 - **Reference pose = a bird SITTING pose** (user + Shafeef, 2026-11-05): Damiao readings
   saved there, the ODrive joints against physical stops. A stand-up from it is
   hardcoded first (or trained into the policy later). Still to confirm: whether the
@@ -164,6 +181,104 @@ if it still reads ~3°. Optional: weigh the robot (the CAD says 4.72 kg).
 ---
 
 ## 4. Log (newest first)
+
+### 2026-11-05 (i) — robot: the ODrives refused closed loop (NOT_CALIBRATED); fixed
+- **User at the robot, bring-up step 5:** with `demo_combined.py` no ODrive joint moved
+  (even at --amp 0.95) and the push test read 0 Nm: the knees/ankles were limp.
+- **Cause, read passively off can_od afterwards:** all four heartbeats: state IDLE,
+  `procedure_result` 14 = NOT_CALIBRATED, axis_error 0 (Get_Error: active_errors 0,
+  disarm_reason 0). The drives lose their motor/encoder calibration at every
+  power-off (incremental encoders, which is also why their positions read 0 at boot)
+  and refuse closed loop until it's redone. WS25's stack must have run it; our tools
+  never did. `motor_service` never checked that a drive reached closed loop, so it
+  reported "enabled" over four idle drives.
+- **Fixes:** `OdriveCanJoint` parses the heartbeat's procedure_result and Get_Error,
+  and has `request_calibration()` (FULL_CALIBRATION_SEQUENCE). `motor_service`:
+  `enable` waits up to 1 s for every ODrive to REPORT closed loop, else disables
+  everything and says why (NOT_CALIBRATED → run odrive_calibrate); an ODrive leaving
+  closed loop while enabled is an e-stop; new ctl `odrive_calibrate` (disabled only,
+  non-blocking, voids the joint zeros: calibrate pose=straight again); `status` shows
+  each drive's state, procedure_result, errors. `dodo_startup.py --odrive-calibrate`,
+  `dodo_ctl odrive_calibrate`; sim_service accepts it (no-op). README *Bring-up* step 4.
+- **The calibration moves the motors:** motor R/L (a beep), then the encoder offset
+  scan turns the rotor a fraction of a turn and back: ~10-15° at the knee/ankle (not
+  measured yet). Legs hanging free.
+- Tests: the fake drives refuse closed loop until calibrated, like the real ones.
+  Enable fails closed (and disables the drives that did close the loop);
+  odrive_calibrate → IDLE + SUCCESS → joint zeros void → calibrate → enable works;
+  refused while enabled; a drive dropping out e-stops.
+- Still unverified on the robot: everything after closed loop (gains over CAN, torque
+  units, the vel_limit cap: the push test, §2 step 6).
+
+### 2026-11-05 (h) — `tools/pd_push_test.py`: the ODrives' torque cap without USB
+The user prefers not to use the drives' USB ports (they sit badly in the body). So the
+cap (§2 step 6) is measured by hand: while motor_service holds a joint, push it slowly
+and let `pd_push_test.py` read motor_states.
+- **Stiffness** = torque/error at small errors vs the kp the service set: ~1 means the
+  CAN gains took and the torque units are right; much stiffer means the drive's own
+  gains (WS25's had an integrator) still run, or its torque is already joint-side (at
+  ~the gear ratio); negative means an inverted torque sign.
+- **Cap:** a torque plateau while the error grows = vel_gain × vel_limit (or the current
+  limit), turned into the drive's vel_limit and the cap at full gains, against the
+  stand's need. A second push at another gain scale tells the two apart (the velocity
+  cap scales with √scale).
+- **Fallback, checked in sim:** knee/ankle kd 1.5/2.0/3.0 instead of 0.8 doesn't change
+  the stand (0.412 m, 3.8° lean; max 5.5/5.3/4.9° vs 5.8°) and raises the cap at
+  vel_limit 10 to 3.7/4.9/7.4 Nm.
+- `sim_service` reports kp/kd (and the gain scale) in `status` like motor_service, so
+  the tool runs against the sim too: the knee pushed with up to 1.5 Nm on the gantry →
+  stiffness 50.0 vs kp 50 (ratio 1.00), no plateau (the sim's PD has no velocity cap).
+- Tests: `test_pd_push_test.py` (synthetic ODrive pushes: plateau → vel_limit 10 → 2.0
+  Nm "NOT enough"; vel_limit 30 enough; lower bound without a plateau; joint-side
+  torque; inverted sign; Damiao; moving samples ignored), and the tool against the sim
+  in `test_sim_scene.py`. README *Bring-up* step 6 includes it.
+
+### 2026-11-05 (g) — the calibration wired into `motor_service` (HANDOFF §2 step 5)
+- **Joint units on the wire, raw units on the bus.** `_JointAdapter` maps every joint
+  through `real2sim.JointCal`: positions, velocities, commands, clamps, the over-travel
+  e-stop and the IDLE torque. The drivers' own software zero stays 0. Damiao: sign and
+  zero from `joint_calib.py`, calibrated from boot. ODrive: sign from `joint_calib.py`,
+  zero from `calibrate pose=<reference pose>` (`fleet_config.REFERENCE_POSES`, only
+  `straight` so far); `set_zero` is now an alias for `calibrate pose=straight` (it used
+  to re-zero the Damiaos by eye too). A joint whose `joint_calib` motor isn't the one
+  of the same name is refused at startup.
+- **Fail-closed enable:** refused unless every joint is calibrated (measured sign;
+  ODrive calibrated this session) and has measured stops.
+- **Clamps / e-stop:** commands 0.1 rad (`STOP_MARGIN_RAD`) inside the measured stops;
+  e-stop 0.1 rad past them, judged only for calibrated joints. Velocity limit
+  0.9 × 6 rad/s at the joint.
+- **Gains:** `fleet_config.JOINT_KP/JOINT_KD` = scene.xml's 150/150/50/50 and
+  1.5/1.5/0.8/0.8 (the Damiaos had 30/0.5). Damiao: in every MIT frame (own config
+  copy per joint). ODrive: `real2sim.odrive_gains` → Set_Pos_Gain/Set_Vel_Gains over
+  CAN at enable (knee pos_gain 62.5, vel_gain 0.0077; ankle 62.5/0.0062; integrator 0).
+  `--gain-scale` and ctl `gains scale=` (kp × s, kd × √s; at most 1). `status` reports
+  per joint `target_rad`, `err_rad`, `torque_nm`, `kp`, `kd`, `band_rad`, so
+  err × kp ≈ torque checks both the gains and the torque units on the robot.
+- **ODrive torque → joint Nm:** × gear ratio × sign (`ODRIVE_TORQUE_IS_MOTOR_SIDE`,
+  assumed; if a drive's torque_constant included the gearing, joints would only IDLE
+  too early).
+- `fleet_config`: `BOOT_POSE_RAD` and `JOINT_LIMITS_RAD` removed (placeholders /
+  July's raw frame); the node → joint comment now says the mapping is measured.
+  `dodo_startup.py --ref-pose straight` (asks first unless `--yes`), `demo_combined.py
+  --center current` (default: oscillates around the held target, no jump),
+  `dodo_ctl.py gains`, `visualize_hardware.py`'s exit table compares with the measured
+  stops.
+- **On the real buses, disabled:** `motor_service` started with the real
+  `joint_calib.py` (signs as measured, bands, kp/kd), 200 Hz with 0 overruns; `status`
+  fine; `enable` refused ("no ctl `calibrate` this session" for the four ODrives).
+  Nothing enabled, nothing calibrated (the legs' pose unknown).
+- **Found: the ODrives' `vel_limit` caps the knee torque** (§2 step 6, open).
+- Tests: the watchdog harness's fake fleet now reports positions/torques and records
+  MIT frames, Set_Input_Pos and gains; `test_motor_watchdog.py` checks the wiring end
+  to end on the virtual bus (angles, commands in raw units with signs, the clamp, gains
+  and their scale, ODrive torque IDLE at the joint, enable refused until calibrated).
+  `test_boot_calibration.py` → `test_motor_calibration.py` (the adapter, the gain
+  conversion, the robot's own config is complete). Suite: 229 passed, 1 known failure,
+  1 skip.
+- `sim_service --scene` got ctl `gains` and `--gain-scale` (motor_service's rule), so
+  README *Bring-up* steps 6–7 rehearse 1:1: gantry, scale 0.3, `home` in the air (0.005
+  rad error), live to 0.6 and 1.0, lower 12 cm, release → 0.412 m, 3.5° (real CLI
+  processes, no warnings).
 
 ### 2026-11-05 (f) — `visualize_hardware.py`: the visualizer shows the IMU too
 `visualize_motor_state.py` → `visualize_hardware.py` (git mv; the user's request).

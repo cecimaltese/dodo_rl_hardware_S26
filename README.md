@@ -25,7 +25,7 @@ decisions behind it.
 | Hip roll + pitch | Damiao DM4340P, 27 Nm |
 | Knee + ankle | T-Motor MN4004 via ODrive, geared, 9 Nm in sim |
 
-## Status (2026-11-04)
+## Status (2026-11-05)
 
 | Subsystem | State |
 |---|---|
@@ -33,21 +33,17 @@ decisions behind it.
 | **ZMQ stack** | ✅ Reconciled with main's July work 2026-10-30. In sim, the stand policy balances 10 s through `sim_service` + `ZmqEnv`. ⚠️ Never run against `motor_service` on the robot. |
 | **Sim → sim (MuJoCo)** | ✅ The `dodo_stand` policy stands 30 s+. |
 | **IMU** | ✅ Verified on hardware (firmware v2): scale 0.5 % off 1 g, gyro bias ~1 °/s, ~60 Hz. ✅ Pose measured on the robot 2026-11-02 (`dodo_assets/imu_mount.json` → its URDF and MJCF `imu_link`, our `AXIS_REMAP`). The board sits off square, so the record is the exact fit (2026-11-04). ⚠️ The first live check still read 3.8° nose-down on a phone-levelled robot: pitch unresolved (HANDOFF §2 step 1, `imu_locate.py level`). |
-| **Safety layer** | ✅ In `motor_service`: position/velocity clamps, 0.8 × rated torque → that motor IDLE, e-stop, and a silent-joint watchdog that works (it couldn't fire before 2026-11-04). ⚠️ Never exercised on hardware. |
-| **Motor control** | ⚠️ Never run on a motor. |
-| **Sign / zero calibration** | ❌ **The blocker.** Tooling ready (`real2sim.py`, `calibrate_joints.py`, the meshed visualizer as the check); the calibration itself is still to do (July's run was deleted), and `motor_service` doesn't apply measured signs or stops yet. |
-| **ODrive gear ratio** | ❌ Unknown (~32:1 inferred). Blocks every knee/ankle number. Measure: `calibrate_joints.py --ratio <joint>` → `fleet_config.GEAR_RATIO`. |
+| **Safety layer** | ✅ In `motor_service`, in joint units: commands clamped 0.1 rad inside the measured stops, e-stop past them, velocity limit, 0.8 × rated joint torque → that motor IDLE, a silent-joint watchdog that works (it couldn't fire before 2026-11-04). ⚠️ Never exercised on hardware. |
+| **Motor control** | ✅ `motor_service` runs on the real buses (started disabled 2026-11-05: 200 Hz, 0 overruns; `enable` refused until calibrated). ⚠️ Never enabled on a motor. |
+| **Sign / zero calibration** | ✅ Measured 2026-11-05 (`joint_calib.py`: signs, zeros, stops; right hip roll fixed by hand-check) and wired into `motor_service`: Damiao zeros persistent, ODrive zeros per session from a reference pose (`calibrate pose=straight`). |
+| **ODrive gear ratio** | ✅ Measured 2026-11-05: knees 25.6, ankles 28.5 (`fleet_config.GEAR_RATIO`). |
+| **PD stand** | ✅ In sim through the robot's own stack, on a simulated gantry (`sim_service.py --scene --gantry`). ⚠️ Not yet on the robot: *Bring-up* steps 4–7. The drives' `vel_limit` may cap the knee torque below what standing needs (HANDOFF §2). |
 | **CAN udev rule** | ✅ `setup/99-dodo-can.rules` names the adapters `can_dm`/`can_od` by serial and brings them up at 1 Mbit (2026-11-04, *Machine setup*). |
 
-> ### ⛔ Do not run a policy on the robot yet
-> `motor_service` has no sign or zero-offset layer: `_JointAdapter` only converts
-> rad ↔ turns. The measured hip-pitch ranges are left/right mirrored
-> (`upper_leg_left (-0.32, 2.38)` vs `upper_leg_right (-2.30, 0.29)`), which points to one
-> hip-pitch motor reading inverted relative to the URDF, and July's incomplete calibration
-> never measured that pair. (The hip-roll ranges look mirrored too, but that's expected:
-> see `fleet_config.py`.) The knee/ankle gear ratio is also unknown. Until calibration is
-> done and wired in, a policy can drive a joint the wrong way into its hard stop under a
-> 27 Nm motor. A gantry stops the robot falling; it does not stop it breaking.
+> ### ⛔ No policy on the robot yet
+> The PD stand comes first (*Bring-up* steps 4–7), on the gantry. A policy needs it
+> working, the IMU pitch question settled (HANDOFF §2), and `rl_env.py` adapted to
+> Shafeef's contract. A gantry stops the robot falling; it does not stop it breaking.
 
 ## Architecture
 
@@ -91,10 +87,10 @@ unchanged, and made the real-time sim stand-in on the same topics possible.
 | Zero | hardware zero, assumed to persist (`calibrate_joints.py --check-persistence` decides) | boot-relative: the encoder zeroes at power-up |
 | Bus | `can_dm` @ 1 Mbit/s; ids 0x01/0x02/0x05/0x06, feedback 0x11–0x16 | `can_od` @ 1 Mbit/s; nodes 3/4/7/8 |
 
-> ⚠️ **The ODrive joints are geared, ratio unknown.** Every conversion assumes 1 motor turn
-> = 2π rad at the joint. In July both ankles measured ~13.4 motor turns stop to stop, which
-> implies roughly 32:1. Until the ratio is in `fleet_config.py`, every knee/ankle command,
-> clamp and velocity check is off by that factor.
+> **The ODrive joints are geared:** knees 25.6, ankles 28.5 motor turns per joint turn
+> (measured 2026-11-05, `fleet_config.GEAR_RATIO`). Every conversion goes through it
+> (`real2sim`), and so do the ODrive gains: the drive's cascade at the motor becomes a
+> joint PD of kp = N² pos_gain vel_gain / 2π, kd = N² vel_gain / 2π.
 
 **CAN.** Two buses, one USB-CAN adapter each. `can0`/`can1` are enumeration order, not
 identity: a replug can silently swap them. A udev rule pins each adapter by serial to
@@ -168,22 +164,43 @@ python3 visualize_hardware.py                    # THE check: the model follows 
 python3 calibrate_joints.py --limits             # hard stops -> sim_lo/sim_hi
 python3 imu_locate.py measure                    # IMU mounted -> URDF imu_link + AXIS_REMAP
 
-# 4) Services. Power on with knees and ankles folded back against their stops.
-python3 motor_service.py                         # starts DISABLED
-python3 imu_service.py
-python3 tools/dodo_ctl.py status
-python3 tools/dodo_ctl.py calibrate              # ODrive turns-since-boot -> BOOT_POSE_RAD
-python3 tools/dodo_ctl.py status                 # VERIFY the stop angles match reality
+# 4) On the gantry, legs hanging free. Check the readings first, then the service.
+python3 visualize_hardware.py                    # all 8 + IMU sensible?
+python3 motor_service.py --gain-scale 0.3        # starts DISABLED, soft PD (terminal 1)
+#    Once per power-up: the ODrives' own motor/encoder calibration. They forget it when
+#    switched off and refuse closed loop until it's redone (NOT_CALIBRATED). THE KNEE
+#    AND ANKLE MOTORS MOVE: a beep, then ~10-15 deg and back.
+python3 tools/dodo_ctl.py odrive_calibrate
+python3 tools/dodo_ctl.py status                 # each drive: IDLE + SUCCESS when done
+#    Then the legs hanging straight, and the joint calibration:
+python3 tools/dodo_ctl.py calibrate --pose straight   # knees/ankles ARE straight now
+python3 tools/dodo_ctl.py status                 # knees/ankles ~0; all_calibrated
+#    (tools/dodo_startup.py --odrive-calibrate does both, asking before each.)
 
-# 5) One joint, a few degrees: prove direction, clamps and the e-stop
-python3 demo_combined.py --joints hip_left --amp 0.05
+# 5) One joint at a time, a few degrees around where it hangs: direction, no buzz,
+#    small torques. Each run enables and disables. Signs to watch: upper_leg_right,
+#    lower_leg_left, foot_left are -1 (the service handles it; the joint must still
+#    move the sim's + way: thigh back, knee foot-back, toe down, hips foot-left).
+python3 demo_combined.py --joints hip_left --amp 0.05        # then each other joint
 
-# 6) The PD stand without a policy: enable, ramp to `home`, hold, fold back on exit.
-#    Rehearse it in sim first (below). Before ending it on the floor, take the
-#    weight on the gantry again: the park ends in `disable`, and the legs go limp.
-python3 tools/dodo_startup.py --pose home
+# 6) The PD stand in the air: enable, ramp to `home`, hold. While it holds (other
+#    terminal), push each knee and ankle by hand, slowly, a little harder each time:
+#    the push test checks the gains reached the drive, the torque units, and finds
+#    the most torque the ODrive holds (its vel_limit cap). Then raise the gains live,
+#    watching for buzz or oscillation, and push again at full gains.
+python3 tools/dodo_startup.py --pose home --ramp 5
+python3 tools/pd_push_test.py --joint lower_leg_left     # each knee + ankle, 30 s
+python3 tools/dodo_ctl.py gains --arg scale=0.6  # then scale=1.0
+python3 tools/pd_push_test.py --joint lower_leg_left     # again: cap at full gains
 
-# 7) Only then, a policy
+# 7) Lower the gantry until the feet touch, then let it take the weight slowly.
+#    Only if the push test says the knees and ankles hold enough at full gains.
+#    Knee sag beyond ~0.1 rad (status err_rad) = not enough knee torque: lift again
+#    (HANDOFF §2: the ODrives' vel_limit). Before ending, take the weight on the gantry
+#    again: Ctrl-C parks back to the start pose, then disables (the legs go limp).
+#    Emergency: tools/dodo_ctl.py disable, or the power switch.
+
+# 8) Only then, a policy
 python3 run_policy.py --backend zmq --task stand \
     --policy policies/dodo_stand/2026-06-30_18-44-06/exported/policy.onnx
 ```
@@ -212,12 +229,22 @@ drops the PD's preload. In sim, 0.7° at the ankles tips the standing robot over
 
 ### Calibration: how the pieces fit
 
-- **Damiao (hips):** hardware zero, assumed persistent. `motor_service` treats them as
+- **Damiao (hips):** measured zero (`joint_calib.py`), persistent across power cycles
+  (checked 2026-11-05). `motor_service` treats them as
   calibrated from boot.
 - **ODrive (knees, ankles):** zeroed at power-up. Instead of a homing drive, which could
-  overload the 3D-printed parts and belts, the robot is powered on with these joints folded
-  against their stops. `dodo_ctl calibrate` then maps turns-since-boot onto `BOOT_POSE_RAD`
-  in `fleet_config.py`. `ZmqEnv` refuses to run until every joint is calibrated.
+  overload the 3D-printed parts and belts, they are put in a reference pose by hand each
+  session (`fleet_config.REFERENCE_POSES`: `straight`, legs hanging straight on the
+  gantry; the bird sitting pose once measured), and `dodo_ctl calibrate --pose straight`
+  makes their current readings those angles. `motor_service` refuses to enable, and
+  `ZmqEnv` to run, until every joint is calibrated.
+- **`motor_service`** talks joint units on the wire (sim radians, rad/s, joint Nm) and
+  converts each joint through its `real2sim.JointCal` (sign, zero, gear ratio). Commands
+  are clamped 0.1 rad inside the measured stops. The PD gains are
+  `fleet_config.JOINT_KP/JOINT_KD` (= `dodo_assets`' scene.xml): straight into the
+  Damiaos' MIT frames, and over CAN into the ODrives at enable (Set_Pos_Gain /
+  Set_Vel_Gains, no integrator). `--gain-scale` / `dodo_ctl gains --arg scale=` for
+  soft first tests.
 - **`real2sim.py`** is what a reading means: `q = sign · (raw − zero) · scale`, scale 1 for
   a Damiao, 2π / gear ratio for an ODrive (`fleet_config.GEAR_RATIO`). Every tool that
   turns a reading into an angle goes through it.
@@ -234,11 +261,16 @@ drops the PD's preload. In sim, 0.7° at the ankles tips the standing robot over
   printed. On exit it lists the range each joint reached and the largest tilt.
   `--no-imu` / `--imu-only` (no CAN, works on a Mac).
 
-**Not wired yet (the blocker):** `motor_service` uses the gear ratio (through `real2sim`),
-but neither the measured signs (it assumes +1) nor the measured stops (`BOOT_POSE_RAD`
-holds URDF placeholders). Its ODrive node → joint mapping in `fleet_config.py` is the July
-calibration's word only. There is no `joint_calib.py` yet: July's was incomplete and was
-deleted on 2026-11-04.
+**ODrive drive calibration:** the drives lose their motor/encoder calibration at
+every power-off (incremental encoders) and refuse closed loop until `dodo_ctl
+odrive_calibrate` has run (found 2026-11-05: `procedure_result` NOT_CALIBRATED, no error
+bit). `motor_service` checks each ODrive really reaches closed loop at `enable`
+(fail-closed otherwise) and e-stops if one leaves it while enabled.
+
+**Not verified on the robot yet:** the ODrives' response to the CAN gain commands, the
+torque units they report (assumed motor-side, `fleet_config.ODRIVE_TORQUE_IS_MOTOR_SIDE`;
+wrong the other way would only IDLE a joint too early), and how much torque their
+`vel_limit` lets the knees hold (HANDOFF §2).
 
 ## The sim-to-real contract
 
@@ -290,7 +322,7 @@ the robot.
 | `imu_check.py`, `imu_sniff.py` | IMU acceptance test; raw dump, range cross-check, `--axes`. |
 | `imu_locate.py` | Measures the IMU mount (three poses + a ruler) and writes, from `dodo_assets/imu_mount.json`, the IMU blocks of its URDF and MJCF, its README rows and our `AXIS_REMAP`; `refit [--exact]` re-solves from the stored poses; `check --live` verifies on the robot. |
 | `setup/99-dodo-can.rules` | udev rule: the two USB-CAN adapters → `can_dm` / `can_od` by serial, up at 1 Mbit. |
-| `tools/` | `dodo_ctl.py` (ctl CLI), `dodo_startup.py` (power-on ritual without a policy), `zmq_echo.py` and `zmq_hz.py` (topic echo and rate). |
+| `tools/` | `dodo_ctl.py` (ctl CLI), `dodo_startup.py` (power-on ritual without a policy; the PD stand), `pd_push_test.py` (push a held joint by hand: real stiffness vs kp, torque units, the ODrive's torque cap), `zmq_echo.py` and `zmq_hz.py` (topic echo and rate). |
 | `demo_combined.py` | Sine-drive any joints through the full service stack. |
 | `policies/` | The reference `dodo_stand` run the tests use. |
 | `docs/zmq.md` | ZMQ topic and schema spec. |

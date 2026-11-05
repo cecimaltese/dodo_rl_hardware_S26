@@ -17,10 +17,18 @@ motor_states feedback, and the service's clamps + watchdogs.
     # everything, gentler, against sim_service around the standing pose
     python3 demo_combined.py --amp 0.1 --center default
 
-Bring-up first (real robot): motor_service running, ODrives calibrated (robot
-was POWERED ON with the legs folded at the stops — see tools/dodo_startup.py):
+    # robot, first motion: one joint, a few degrees around where it is held
+    python3 demo_combined.py --joints hip_left --amp 0.05
+
+Bring-up first (real robot): motor_service running, ODrives calibrated (knees and
+ankles in a reference pose, e.g. legs hanging straight on the gantry):
     python3 tools/dodo_ctl.py status
-    python3 tools/dodo_ctl.py calibrate    # if ODrives not calibrated yet
+    python3 tools/dodo_ctl.py calibrate --pose straight   # if not calibrated yet
+
+--center current (the default) oscillates around each joint's held target after
+the bumpless enable, so the first command never jumps; zero / default jump to
+0 rad / the old stand policy's pose first (ramped in over 2 s by the sine's gain,
+but the offset itself is a step).
 """
 
 from __future__ import annotations
@@ -38,7 +46,9 @@ _DEFAULT_CENTER = {
 }
 
 
-def _center_for(joint: str, mode: str) -> float:
+def _center_for(joint: str, mode: str, held: dict = None) -> float:
+    if mode == "current":
+        return float(held[joint])
     if mode == "zero":
         return 0.0
     for prefix, val in _DEFAULT_CENTER.items():
@@ -62,8 +72,9 @@ def main():
     ap.add_argument("--freq", type=float, default=0.25, help="sine frequency [Hz]")
     ap.add_argument("--secs", type=float, default=10.0, help="run time [s]")
     ap.add_argument("--rate", type=float, default=50.0, help="command rate [Hz]")
-    ap.add_argument("--center", choices=["zero", "default"], default="zero",
-                    help="sine center: joint zero (bench) or the standing pose (sim)")
+    ap.add_argument("--center", choices=["current", "zero", "default"], default="current",
+                    help="sine center: where each joint is held after enable (default), "
+                         "joint zero, or the old stand policy's pose (sim)")
     ap.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     args = ap.parse_args()
 
@@ -116,7 +127,11 @@ def main():
     time.sleep(0.3)                       # slow-joiner settle before streaming
 
     idx = [ipc.JOINT_INDEX[n] for n in selected]
-    center = [_center_for(n, args.center) for n in selected]
+    held = {n: (j.get("target_rad") if j.get("target_rad") is not None
+                else j.get("pos_rad", 0.0))
+            for n, j in ctl.request("status").get("joints", {}).items()}
+    center = [_center_for(n, args.center, held) for n in selected]
+    print("centers: " + ", ".join(f"{n} {c:+.3f}" for n, c in zip(selected, center)))
     loop = ipc.RateLoop(args.rate, name="demo")
     t0 = time.monotonic()
     last_print = 0.0

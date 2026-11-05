@@ -2,12 +2,19 @@
 dodo_startup.py — rehearse the full power-on routine, WITHOUT a policy.
 
 The startup convention (no homing — a homing drive could overload the
-3D-printed structure/belts): the robot is POWERED ON with the ODrive joints
-folded all the way back against their mechanical stops. This tool then:
+3D-printed structure/belts): the ODrives zero their encoders at power-up, so
+each session their angle comes from a reference pose the knees and ankles are
+put in by hand (fleet_config.REFERENCE_POSES; on the gantry: `straight`, legs
+hanging straight). This tool then:
 
     1. status      sanity: who is there, what do they read
-    2. calibrate   map ODrive turns-since-boot onto the known boot pose
-                   (skipped if already calibrated)
+    1b. odrive_calibrate   with --odrive-calibrate, once per power-up: the drives'
+                   own motor/encoder calibration (THE KNEE/ANKLE MOTORS MOVE:
+                   ~10-15 deg and back; legs hanging free). Without it they refuse
+                   closed loop, and `enable` says so.
+    2. calibrate   the ODrives' zero from a reference pose the knees/ankles are
+                   in (--ref-pose, default `straight`: legs hanging straight on
+                   the gantry); skipped if already calibrated
     3. enable      bumpless; the service slowly unparks joints into the
                    safety band
     4. ramp        smoothstep all joints to the stand pose (--pose: a dodo_assets
@@ -60,6 +67,30 @@ def fresh_states(sub: ipc.Subscriber, timeout_s: float = 2.0):
     raise SystemExit("no motor_states — is motor_service (or sim_service) running?")
 
 
+def wait_for_drives(ctl: ipc.CtlClient, timeout_s: float = 60.0) -> None:
+    """After odrive_calibrate: until every ODrive is back in IDLE (and at least 1 s,
+    so a heartbeat from before the request can't pass), then each must say SUCCESS.
+    A service without drive reports (sim_service) passes at once."""
+    t0 = time.monotonic()
+    while True:
+        joints = ctl.request("status").get("joints", {})
+        drives = {n: j["drive"] for n, j in joints.items() if "drive" in j}
+        if not drives:
+            return
+        busy = {n: d["state"] for n, d in drives.items() if d["state"] != "IDLE"}
+        print(f"\r  {'calibrating ' + ', '.join(sorted(busy)) if busy else 'done'}   ",
+              end="", flush=True)
+        if not busy and time.monotonic() - t0 > 1.0:
+            print()
+            failed = {n: d for n, d in drives.items() if d["procedure_result"] != "SUCCESS"}
+            if failed:
+                raise SystemExit(f"ODrive calibration failed: {failed}")
+            return
+        if time.monotonic() - t0 > timeout_s:
+            raise SystemExit(f"\nODrive calibration still running after {timeout_s:.0f} s: {busy}")
+        time.sleep(0.3)
+
+
 def start_targets(ctl: ipc.CtlClient, states: ipc.MotorStates, present) -> list:
     """Where the first ramp starts: each joint's held TARGET (status `target_rad`), else
     its measured angle. Not the measured angles alone: under load a PD-held joint sags
@@ -97,6 +128,13 @@ def ramp_to(pub: ipc.Publisher, sub: ipc.Subscriber, loop: ipc.RateLoop,
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--odrive-calibrate", action="store_true",
+                    help="first run the ODrives' own calibration (once per power-up; "
+                         "the knee/ankle motors MOVE ~10-15 deg; legs hanging free)")
+    ap.add_argument("--ref-pose", default="straight",
+                    help="where the knees/ankles ARE if the service still needs "
+                         "`calibrate` (fleet_config.REFERENCE_POSES; default: straight, "
+                         "legs hanging straight on the gantry)")
     ap.add_argument("--pose", default="home",
                     help="stand pose: a scene.xml keyframe (home, straight) or 'default' "
                          "(the vendored stand policy's). Default: home")
@@ -133,11 +171,25 @@ def main():
         raise SystemExit("service is E-STOPPED — fix the cause, then "
                          "tools/dodo_ctl.py estop_reset")
 
-    # 2) calibrate (boot pose) --------------------------------------------------
+    # 1b) the ODrives' own motor/encoder calibration (once per power-up) ---------
+    if args.odrive_calibrate:
+        print("\nODrive calibration: each knee/ankle motor beeps, then turns ~10-15 deg "
+              "and back. The legs must hang FREE.")
+        if not args.yes and input("  go? [y/N] ").strip().lower() not in ("y", "yes"):
+            raise SystemExit("aborted (nothing moved).")
+        rep = ctl.request("odrive_calibrate")
+        if not rep.get("ok"):
+            raise SystemExit(f"odrive_calibrate failed: {rep.get('error')}")
+        wait_for_drives(ctl)
+        st = ctl.request("status")       # the joint zeros are void now: step 2 redoes them
+
+    # 2) calibrate the ODrives (reference pose) ----------------------------------
     if not st.get("all_calibrated"):
-        print("\ncalibrating: assuming the robot was POWERED ON with the legs "
-              "folded at the stops.")
-        rep = ctl.request("calibrate")
+        print(f"\ncalibrating the knees and ankles: assuming they are in the "
+              f"'{args.ref_pose}' reference pose RIGHT NOW (fleet_config.REFERENCE_POSES).")
+        if not args.yes and input("  are they? [y/N] ").strip().lower() not in ("y", "yes"):
+            raise SystemExit("aborted (nothing calibrated or enabled).")
+        rep = ctl.request("calibrate", pose=args.ref_pose)
         if not rep.get("ok"):
             raise SystemExit(f"calibrate failed: {rep.get('error')}")
         print(f"  assumed angles: {rep.get('assumed_rad')}")

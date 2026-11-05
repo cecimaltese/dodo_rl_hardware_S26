@@ -77,6 +77,20 @@ class TestSceneModel:
             assert m.actuator_biasprm[a, 1] == -(10, 20, 30, 40)[g]
             assert m.actuator_biasprm[a, 2] == -(1, 2, 3, 4)[g]
 
+    def test_gain_scale_like_motor_service(self):
+        svc = SimService.from_scene()
+        try:
+            kp0, kd0 = svc._kp0.copy(), svc._kd0.copy()
+            assert svc._ctl_gains({"scale": 0.25}) == {"gain_scale": 0.25}
+            m = svc.model
+            assert m.actuator_gainprm[:, 0] == pytest.approx(kp0 * 0.25)
+            assert -m.actuator_biasprm[:, 1] == pytest.approx(kp0 * 0.25)
+            assert -m.actuator_biasprm[:, 2] == pytest.approx(kd0 * 0.5)
+            with pytest.raises(RuntimeError):
+                svc._ctl_gains({"scale": 1.5})
+        finally:
+            svc.close()
+
     def test_gantry_adds_four_ropes(self):
         m = build_scene_model(gantry=True)
         ropes = [m.tendon(t).name for t in range(m.ntendon)]
@@ -180,3 +194,32 @@ class TestPdStand:
             t = svc.track
         assert t["base_z"] == pytest.approx(HOME_Z, abs=0.01), t
         assert t["max_tilt_deg"] < MAX_TILT_DEG, t
+
+
+def test_pd_push_test_against_the_sim():
+    """tools/pd_push_test.py through the real stack: the knee held in the air, pushed
+    by a slowly varying external torque. The sim's PD has no velocity cap, so the
+    stiffness must match kp and there is no plateau."""
+    import threading as th
+    push_tool = Path(__file__).resolve().parent / "tools" / "pd_push_test.py"
+    with service(start="straight", gantry=True) as svc:
+        dof = svc.model.jnt_dofadr[svc.model.joint("lower_leg_left").id]
+        stop = th.Event()
+
+        def push():
+            t0 = time.monotonic()
+            while not stop.is_set():
+                t = time.monotonic() - t0
+                svc.data.qfrc_applied[dof] = 1.5 * math.sin(0.6 * t) ** 2   # slow, <= 1.5 Nm
+                time.sleep(0.005)
+        pusher = th.Thread(target=push, daemon=True)
+        pusher.start()
+        try:
+            out = subprocess.run([sys.executable, str(push_tool), "--joint",
+                                  "lower_leg_left", "--secs", "5"],
+                                 capture_output=True, text=True, timeout=30).stdout
+        finally:
+            stop.set()
+            pusher.join(timeout=1.0)
+    assert "stiffness matches kp" in out, out
+    assert "no plateau" in out, out

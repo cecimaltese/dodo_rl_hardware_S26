@@ -10,7 +10,12 @@ looked alive with frozen numbers. These tests pin the fix.
 No hardware: the REAL MotorService, drivers and damiao_motor library run on
 python-can's in-process `virtual` bus, against FakeFleet, which answers like the
 motors do (Damiao: replies to enable / MIT / register frames only; ODrive: cyclic
-encoder + heartbeat frames every 10 ms, RTR answers, Set_Axis_State).
+encoder + torque + heartbeat frames every 10 ms, RTR answers, Set_Axis_State) and
+records what it is told (MIT frames, Set_Input_Pos, gains).
+
+The second half pins the calibration wiring (2026-11-05): the service talks JOINT
+angles on the wire and each motor's own raw units on the bus, through a test
+calibration with known signs and zeros (TEST_CAL), not the robot's joint_calib.py.
 """
 from __future__ import annotations
 
@@ -20,18 +25,26 @@ import threading
 import time
 import uuid
 
+import math
+
 import can
 import pytest
+from damiao_motor.core.motor import float_to_uint, uint_to_float
 
 import calibrate_joints
 import dodo_ipc as ipc
+import fleet_config
 import motor_service as ms
+import real2sim
 from fleet_config import DM_JOINTS, FEEDBACK_FRESH_S, OD_JOINTS
-from odrive_can_joint import (AXIS_STATE_IDLE, CMD_GET_ENCODER_ESTIMATES,
-                              CMD_HEARTBEAT, CMD_SET_AXIS_STATE)
+from odrive_can_joint import (AXIS_STATE_CLOSED_LOOP_CONTROL, AXIS_STATE_IDLE,
+                              CMD_GET_ENCODER_ESTIMATES,
+                              CMD_GET_TORQUES, CMD_HEARTBEAT, CMD_SET_AXIS_STATE,
+                              CMD_SET_INPUT_POS, CMD_SET_POS_GAIN, CMD_SET_VEL_GAINS)
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")  # damiao: bustype=
 
+DM_P_MAX = 12.5          # the 4340P preset's position range (damiao_motor)
 DM_ENABLE = bytes([0xFF] * 7 + [0xFC])
 DM_DISABLE = bytes([0xFF] * 7 + [0xFD])
 CTRL_MODE_MIT = 1
@@ -49,6 +62,30 @@ def isolated_ports(monkeypatch):
         monkeypatch.setenv(f"DODO_ZMQ_PORT_{topic.upper()}", str(_free_port()))
 
 
+# The service's calibration in these tests: (sign, zero [raw], measured stops [rad]).
+# Mixed signs on both motor types, so a missing or doubled sign shows.
+TEST_CAL = {
+    "hip_left":        (+1, 0.10, (-0.6, 0.6)),
+    "hip_right":       (+1, -0.05, (-0.6, 0.6)),
+    "upper_leg_left":  (+1, 0.0, (-0.9, 2.3)),
+    "upper_leg_right": (-1, 1.0, (-1.0, 2.3)),
+    "lower_leg_left":  (-1, 0.0, (-2.7, 1.6)),
+    "lower_leg_right": (+1, 0.0, (-2.9, 1.6)),
+    "foot_left":       (-1, 0.0, (-1.3, 1.5)),
+    "foot_right":      (+1, 0.0, (-1.3, 1.5)),
+}
+
+
+def write_test_calib(path) -> None:
+    lines = ["JOINT_CALIB = {"]
+    for j, (sign, zero, (lo, hi)) in TEST_CAL.items():
+        ratio = fleet_config.GEAR_RATIO.get(j) or 1
+        lines.append(f"    {j!r}: dict(motor={j!r}, sign={sign:+d}, ratio={ratio}, "
+                     f"sim_lo={lo}, sim_hi={hi}, zero={zero}, raw_lo=None, raw_hi=None),")
+    lines.append("}")
+    path.write_text("\n".join(lines) + "\n")
+
+
 class FakeFleet:
     """The 8 motors, answering on two virtual buses. Set dm_alive[motor_id] or
     od_alive[node_id] False to make one go silent."""
@@ -63,6 +100,22 @@ class FakeFleet:
         self.dm_enabled = {i: False for i in self.dm_cfg}
         self.od_alive = {c.node_id: True for c in OD_JOINTS}
         self.od_state = {c.node_id: AXIS_STATE_IDLE for c in OD_JOINTS}
+        # Raw readings (Damiao rad at its zero = TEST_CAL's, so every joint reads 0;
+        # ODrive turns-since-boot, arbitrary) and what each motor was last told.
+        self.dm_pos = {c.motor_id: TEST_CAL[c.name][1] for c in DM_JOINTS}
+        self.od_pos = {c.node_id: 2.5 + 0.1 * c.node_id for c in OD_JOINTS}
+        self.od_torque = {c.node_id: 0.0 for c in OD_JOINTS}     # motor-side Nm
+        # Drive calibration: like the real drives, closed loop is refused (IDLE,
+        # procedure_result NOT_CALIBRATED) until FULL_CALIBRATION_SEQUENCE ran. True by
+        # default so the other tests start from calibrated drives.
+        self.od_drive_cal = {c.node_id: True for c in OD_JOINTS}
+        self.od_proc = {c.node_id: 0 for c in OD_JOINTS}
+        self.od_cal_until = {}
+        self.dm_cmd = {}        # motor_id -> (pos, kp, kd) of the last MIT frame
+        self.od_input_pos = {}  # node -> turns of the last Set_Input_Pos
+        self.od_gains = {}      # node -> [pos_gain, vel_gain, vel_integrator_gain]
+        self.dm_id = {c.name: c.motor_id for c in DM_JOINTS}
+        self.od_id = {c.name: c.node_id for c in OD_JOINTS}
         self._run = True
         self._threads = [threading.Thread(target=f, daemon=True)
                          for f in (self._damiao_loop, self._odrive_loop)]
@@ -72,7 +125,8 @@ class FakeFleet:
     # ── Damiao: speaks only when spoken to ──────────────────────────
     def _dm_feedback(self, mid: int) -> None:
         status = 1 if self.dm_enabled[mid] else 0
-        pos_u, vel_u, tq_u = 0x7FFF, 0x7FF, 0x7FF          # ~0 rad, 0 rad/s, 0 Nm
+        pos_u = float_to_uint(self.dm_pos[mid], -DM_P_MAX, DM_P_MAX, 16)
+        vel_u, tq_u = 0x7FF, 0x7FF                         # ~0 rad/s, 0 Nm
         data = bytes([(status << 4) | mid, pos_u >> 8, pos_u & 0xFF, vel_u >> 4,
                       ((vel_u & 0xF) << 4) | (tq_u >> 8), tq_u & 0xFF, 30, 30])
         self.dm_bus.send(can.Message(arbitration_id=self.dm_cfg[mid].feedback_id,
@@ -97,6 +151,11 @@ class FakeFleet:
                     self.dm_enabled[mid] = True
                 elif d == DM_DISABLE:
                     self.dm_enabled[mid] = False
+                elif d[:7] != bytes([0xFF] * 7):       # an MIT command frame
+                    self.dm_cmd[mid] = (
+                        uint_to_float((d[0] << 8) | d[1], -DM_P_MAX, DM_P_MAX, 16),
+                        uint_to_float(((d[3] & 0xF) << 8) | d[4], 0.0, 500.0, 12),
+                        uint_to_float((d[5] << 4) | (d[6] >> 4), 0.0, 5.0, 12))
                 self._dm_feedback(mid)                 # every frame gets a reply
 
     # ── ODrive: streams cyclic feedback, enabled or not ─────────────
@@ -111,19 +170,43 @@ class FakeFleet:
             if msg is not None:
                 node, cmd = msg.arbitration_id >> 5, msg.arbitration_id & 0x1F
                 if self.od_alive.get(node):
+                    d = bytes(msg.data)
                     if cmd == CMD_SET_AXIS_STATE:
-                        self.od_state[node] = struct.unpack("<I", bytes(msg.data[:4]))[0]
+                        want = struct.unpack("<I", d[:4])[0]
+                        if want == AXIS_STATE_CLOSED_LOOP_CONTROL and not self.od_drive_cal[node]:
+                            self.od_state[node], self.od_proc[node] = AXIS_STATE_IDLE, 14
+                        elif want == 3:                       # FULL_CALIBRATION_SEQUENCE
+                            self.od_state[node] = 3
+                            self.od_cal_until[node] = time.monotonic() + 0.3
+                        else:
+                            self.od_state[node], self.od_proc[node] = want, 0
+                    elif cmd == CMD_SET_INPUT_POS:
+                        self.od_input_pos[node] = struct.unpack("<fhh", d)[0]
+                    elif cmd == CMD_SET_POS_GAIN:
+                        self.od_gains.setdefault(node, [None] * 3)[0] = \
+                            struct.unpack("<f", d[:4])[0]
+                    elif cmd == CMD_SET_VEL_GAINS:
+                        self.od_gains.setdefault(node, [None] * 3)[1:] = \
+                            struct.unpack("<ff", d)
                     elif cmd == CMD_GET_ENCODER_ESTIMATES and msg.is_remote_frame:
                         self._od_send(node, CMD_GET_ENCODER_ESTIMATES,
-                                      struct.pack("<ff", 0.0, 0.0))
+                                      struct.pack("<ff", self.od_pos[node], 0.0))
+            for node, until in list(self.od_cal_until.items()):
+                if time.monotonic() >= until:                 # calibration finished
+                    del self.od_cal_until[node]
+                    self.od_state[node], self.od_proc[node] = AXIS_STATE_IDLE, 0
+                    self.od_drive_cal[node] = True
             if time.monotonic() >= next_cyclic:
                 next_cyclic = time.monotonic() + 0.010
                 for node, alive in self.od_alive.items():
                     if alive:
                         self._od_send(node, CMD_GET_ENCODER_ESTIMATES,
-                                      struct.pack("<ff", 0.0, 0.0))
+                                      struct.pack("<ff", self.od_pos[node], 0.0))
+                        self._od_send(node, CMD_GET_TORQUES,
+                                      struct.pack("<ff", 0.0, self.od_torque[node]))
                         self._od_send(node, CMD_HEARTBEAT,
-                                      struct.pack("<IBBBB", 0, self.od_state[node], 0, 0, 0))
+                                      struct.pack("<IBBBB", 0, self.od_state[node],
+                                                  self.od_proc[node], 0, 0))
 
     def close(self):
         self._run = False
@@ -141,10 +224,12 @@ def fleet():
 
 
 @pytest.fixture
-def service(fleet):
-    """The real MotorService on the fake fleet, its main loop in a thread."""
+def service(fleet, tmp_path):
+    """The real MotorService on the fake fleet (TEST_CAL), its main loop in a thread."""
+    calib = tmp_path / "joint_calib.py"
+    write_test_calib(calib)
     svc = ms.MotorService(dm_channel=fleet.dm_channel, od_channel=fleet.od_channel,
-                          bustype="virtual")
+                          bustype="virtual", calib_path=calib)
     th = threading.Thread(target=svc.run, daemon=True)
     th.start()
     ctl = ipc.CtlClient()
@@ -188,7 +273,7 @@ def test_disabled_damiaos_are_silent_by_design(service):
 def test_silent_odrive_estops_and_voids_its_calibration(service, fleet):
     _, ctl = service
     time.sleep(ms.STARTUP_GRACE_S)
-    rep = ctl.request("calibrate")
+    rep = ctl.request("calibrate", pose="straight")
     assert rep["ok"], rep
     assert status(ctl)["all_calibrated"]
 
@@ -221,7 +306,7 @@ def test_silent_damiao_while_enabled_estops(service, fleet):
     must stop the fleet instead of being held on frozen numbers."""
     _, ctl = service
     time.sleep(ms.STARTUP_GRACE_S)
-    rep = ctl.request("calibrate")
+    rep = ctl.request("calibrate", pose="straight")
     assert rep["ok"], rep
     rep = ctl.request("enable")
     assert rep["ok"], rep
@@ -244,7 +329,7 @@ def test_status_reports_the_held_targets(service, fleet):
     measured angles, which sag below the targets under load."""
     _, ctl = service
     time.sleep(ms.STARTUP_GRACE_S)
-    assert ctl.request("calibrate")["ok"]
+    assert ctl.request("calibrate", pose="straight")["ok"]
     assert all(j["target_rad"] is None for j in status(ctl)["joints"].values())
     rep = ctl.request("enable")
     assert rep["ok"], rep
@@ -307,3 +392,210 @@ def test_calibration_tool_sees_a_silent_motor_as_offline(fleet, monkeypatch):
     finally:
         f.close()
         f.dm_ctl.shutdown()
+
+
+# ── the calibration wiring: joint angles on the wire, raw units on the bus ─────────
+
+def enabled(ctl, fleet, settle_s: float = None) -> dict:
+    """Calibrate (ODrives at `straight`) and enable, past the startup grace."""
+    time.sleep(ms.STARTUP_GRACE_S if settle_s is None else settle_s)
+    rep = ctl.request("calibrate", pose="straight")
+    assert rep["ok"], rep
+    rep = ctl.request("enable")
+    assert rep["ok"], rep
+    time.sleep(0.2)
+    return status(ctl)
+
+
+def scale(joint: str) -> float:
+    return real2sim.rad_per_native(joint)
+
+
+def test_enable_refused_until_calibrated(service):
+    _, ctl = service
+    time.sleep(ms.STARTUP_GRACE_S)
+    rep = ctl.request("enable")
+    assert not rep["ok"] and "calibrate" in rep["error"], rep
+    rep = ctl.request("calibrate")                       # no pose: refused
+    assert not rep["ok"] and "pose=" in rep["error"], rep
+    rep = ctl.request("calibrate", pose="sitting_somewhere")
+    assert not rep["ok"], rep
+    assert not status(ctl)["all_calibrated"]
+
+
+def test_states_are_joint_angles_through_the_calibration(service, fleet):
+    """calibrate pose=straight makes every ODrive read 0 where it is; a Damiao reads
+    sign * (raw - zero); moving a motor moves its joint by sign x scale."""
+    _, ctl = service
+    st = enabled(ctl, fleet)
+    for name, j in st["joints"].items():
+        assert j["pos_rad"] == pytest.approx(0.0, abs=2e-3), (name, j)
+    fleet.dm_pos[fleet.dm_id["upper_leg_right"]] = 1.0 + 0.3      # raw +0.3 rad
+    fleet.od_pos[fleet.od_id["lower_leg_left"]] += 1.0             # one motor turn
+    time.sleep(0.2)
+    j = status(ctl)["joints"]
+    assert j["upper_leg_right"]["pos_rad"] == pytest.approx(-0.3, abs=2e-3)   # sign -1
+    assert j["lower_leg_left"]["pos_rad"] == pytest.approx(
+        -scale("lower_leg_left"), abs=1e-4)                          # -2pi / 25.6
+    ctl.request("disable")
+
+
+def test_commands_reach_the_motors_in_their_own_units(service, fleet):
+    _, ctl = service
+    enabled(ctl, fleet)
+    raw_knee0 = fleet.od_pos[fleet.od_id["lower_leg_left"]]   # calibrated as 0 here
+    q = {"upper_leg_right": 0.4, "hip_left": -0.2, "lower_leg_left": -1.0,
+         "foot_right": 0.5}
+    pub = ipc.Publisher(ipc.TOPIC_MOTOR_COMMANDS)
+    try:
+        time.sleep(0.3)
+        cmd = [ipc.NO_COMMAND] * ipc.N_JOINTS
+        for name, v in q.items():
+            cmd[ipc.JOINT_INDEX[name]] = v
+        for _ in range(10):
+            pub.send(ipc.MotorCommands(target_pos=cmd))
+            time.sleep(0.02)
+    finally:
+        pub.close()
+    time.sleep(0.1)
+    res = 25.0 / 65535                                   # Damiao position resolution
+    assert fleet.dm_cmd[fleet.dm_id["upper_leg_right"]][0] == pytest.approx(
+        1.0 - 0.4, abs=res)                              # zero + sign * q, sign -1
+    assert fleet.dm_cmd[fleet.dm_id["hip_left"]][0] == pytest.approx(0.10 - 0.2, abs=res)
+    assert fleet.od_input_pos[fleet.od_id["lower_leg_left"]] == pytest.approx(
+        raw_knee0 + 1.0 / scale("lower_leg_left"), abs=1e-4)          # sign -1
+    raw_ankle0 = fleet.od_pos[fleet.od_id["foot_right"]]
+    assert fleet.od_input_pos[fleet.od_id["foot_right"]] == pytest.approx(
+        raw_ankle0 + 0.5 / scale("foot_right"), abs=1e-4)
+    j = status(ctl)["joints"]
+    assert j["upper_leg_right"]["target_rad"] == pytest.approx(0.4)
+    ctl.request("disable")
+
+
+def test_commands_are_clamped_inside_the_measured_stops(service, fleet):
+    _, ctl = service
+    enabled(ctl, fleet)
+    pub = ipc.Publisher(ipc.TOPIC_MOTOR_COMMANDS)
+    try:
+        time.sleep(0.3)
+        cmd = [ipc.NO_COMMAND] * ipc.N_JOINTS
+        cmd[ipc.JOINT_INDEX["hip_right"]] = 5.0               # far past its +0.6 stop
+        for _ in range(5):
+            pub.send(ipc.MotorCommands(target_pos=cmd))
+            time.sleep(0.02)
+    finally:
+        pub.close()
+    time.sleep(0.1)
+    want = 0.6 - fleet_config.STOP_MARGIN_RAD
+    assert status(ctl)["joints"]["hip_right"]["target_rad"] == pytest.approx(want)
+    assert fleet.dm_cmd[fleet.dm_id["hip_right"]][0] == pytest.approx(
+        -0.05 + want, abs=25.0 / 65535)
+    ctl.request("disable")
+
+
+def test_gains_reach_both_motor_types_and_follow_the_scale(service, fleet):
+    svc, ctl = service
+    enabled(ctl, fleet)
+    kp_hip, kd_hip = fleet_config.JOINT_KP["hip"], fleet_config.JOINT_KD["hip"]
+    _, kp, kd = fleet.dm_cmd[fleet.dm_id["hip_left"]]
+    assert (kp, kd) == pytest.approx((kp_hip, kd_hip), abs=0.15)   # 12-bit encoding
+    want = real2sim.odrive_gains("foot_left", fleet_config.JOINT_KP["foot"],
+                                 fleet_config.JOINT_KD["foot"])
+    assert fleet.od_gains[fleet.od_id["foot_left"]] == pytest.approx(want, rel=1e-6)
+
+    rep = ctl.request("gains", scale=0.25)
+    assert rep["ok"], rep
+    time.sleep(0.1)
+    _, kp, kd = fleet.dm_cmd[fleet.dm_id["hip_left"]]
+    assert (kp, kd) == pytest.approx((kp_hip * 0.25, kd_hip * 0.5), abs=0.15)
+    want = real2sim.odrive_gains("foot_left", fleet_config.JOINT_KP["foot"] * 0.25,
+                                 fleet_config.JOINT_KD["foot"] * 0.5)
+    assert fleet.od_gains[fleet.od_id["foot_left"]] == pytest.approx(want, rel=1e-6)
+    assert not ctl.request("gains", scale=1.5)["ok"]          # never above fleet_config
+    assert not ctl.request("gains", scale=0.0)["ok"]
+    for c in DM_JOINTS:                                      # the shared config untouched
+        assert (c.kp, c.kd) == (fleet_config.JOINT_KP[fleet_config.joint_group(c.name)],
+                                fleet_config.JOINT_KD[fleet_config.joint_group(c.name)])
+    ctl.request("disable")
+
+
+def test_odrive_torque_is_joint_torque(service, fleet):
+    """Get_Torques is MOTOR-side Nm: x gear ratio (and the sign) at the joint, where
+    the 0.8 x 9 Nm IDLE threshold lives. Raw, 0.3 Nm could never trip it."""
+    _, ctl = service
+    enabled(ctl, fleet)
+    node = fleet.od_id["lower_leg_left"]
+    n = real2sim.gear_ratio("lower_leg_left")
+    fleet.od_torque[node] = 0.2                              # 5.1 Nm at the joint
+    time.sleep(0.2)
+    j = status(ctl)["joints"]["lower_leg_left"]
+    assert j["torque_nm"] == pytest.approx(-0.2 * n, abs=1e-3)       # sign -1
+    assert not j["idled"]
+    fleet.od_torque[node] = 0.3                              # 7.7 Nm > 0.8 x 9
+    st = wait_for(lambda: (s := status(ctl))["joints"]["lower_leg_left"]["idled"] and s,
+                  1.0, "the knee IDLEd on joint torque")
+    assert not st["estopped"] and st["joints"]["lower_leg_right"]["idled"] is False
+    ctl.request("disable")
+
+
+
+# ── the drives' own calibration (lost at every power-up) ─────────────────────────────
+
+def test_enable_fails_closed_when_an_odrive_refuses_closed_loop(service, fleet):
+    """2026-11-05 on the robot: every ODrive answered closed loop with IDLE +
+    NOT_CALIBRATED, no error bit, and the service carried on with four limp joints."""
+    _, ctl = service
+    time.sleep(ms.STARTUP_GRACE_S)
+    fleet.od_drive_cal[fleet.od_id["lower_leg_right"]] = False      # just powered up
+    assert ctl.request("calibrate", pose="straight")["ok"]
+    rep = ctl.request("enable")
+    assert not rep["ok"], rep
+    assert "lower_leg_right" in rep["error"] and "NOT_CALIBRATED" in rep["error"]
+    assert "odrive_calibrate" in rep["error"]
+    st = status(ctl)
+    assert not st["enabled"]
+    assert st["joints"]["lower_leg_right"]["drive"]["procedure_result"] == "NOT_CALIBRATED"
+    time.sleep(0.1)
+    assert all(v != AXIS_STATE_CLOSED_LOOP_CONTROL for v in fleet.od_state.values()), \
+        "the drives that did close the loop must be disabled again"
+    assert not any(fleet.dm_enabled.values())
+
+
+def test_odrive_calibrate_then_enable(service, fleet):
+    _, ctl = service
+    time.sleep(ms.STARTUP_GRACE_S)
+    for node in fleet.od_drive_cal:
+        fleet.od_drive_cal[node] = False
+    assert ctl.request("calibrate", pose="straight")["ok"]
+    rep = ctl.request("odrive_calibrate")
+    assert rep["ok"] and len(rep["started"]) == 4, rep
+    st = status(ctl)
+    assert not st["all_calibrated"], "the rotor moved: the joint zeros are void"
+    st = wait_for(lambda: (s := status(ctl)) and all(
+        j["drive"]["state"] == "IDLE" and j["drive"]["procedure_result"] == "SUCCESS"
+        for j in s["joints"].values() if j["type"] == "odrive") and s, 2.0,
+        "the drives' calibration to finish")
+    assert not ctl.request("enable")["ok"]               # joint zeros still void
+    assert ctl.request("calibrate", pose="straight")["ok"]
+    rep = ctl.request("enable")
+    assert rep["ok"], rep
+    ctl.request("disable")
+
+
+def test_odrive_calibrate_refused_while_enabled(service, fleet):
+    _, ctl = service
+    enabled(ctl, fleet)
+    rep = ctl.request("odrive_calibrate")
+    assert not rep["ok"] and "disable first" in rep["error"]
+    rep = ctl.request("disable")
+    rep = ctl.request("odrive_calibrate", joints=["hip_left"])
+    assert not rep["ok"] and "not ODrive" in rep["error"]
+
+
+def test_an_odrive_leaving_closed_loop_estops(service, fleet):
+    _, ctl = service
+    enabled(ctl, fleet)
+    fleet.od_state[fleet.od_id["foot_right"]] = AXIS_STATE_IDLE      # disarmed itself
+    st = wait_for(lambda: (s := status(ctl))["estopped"] and s, 1.0,
+                  "e-stop on the drive that dropped out")
+    assert "foot_right left closed loop" in st["estop_reason"]

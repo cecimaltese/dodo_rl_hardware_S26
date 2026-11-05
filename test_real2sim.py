@@ -149,16 +149,20 @@ class TestCalibrateJoints:
 
 class TestMotorServiceUnits:
     def test_the_adapter_uses_the_gear_ratio(self, ratios):
-        """Commands, clamps and the velocity limit all go through the ratio."""
-        from test_boot_calibration import make_joint
-        _, j = make_joint(node_id=3)                         # lower_leg_left
-        a1 = ms._JointAdapter(j)
+        """Readings, commands and the ODrive gains all go through the ratio. (The
+        clamp band and the velocity limit are in joint radians: ratio-free.)"""
+        from odrive_can_joint import OdriveCanJoint, OdriveCanJointConfig
+        from test_motor_calibration import FakeBus
         ratios(lower_leg_left=32.0)
-        a32 = ms._JointAdapter(j)
-        assert a32.to_native(TWO_PI) == pytest.approx(32.0)
-        assert a32.to_rad(32.0) == pytest.approx(TWO_PI)
-        assert a32.vel_limit == pytest.approx(32 * a1.vel_limit)
-        assert a32.pos_hi == pytest.approx(32 * a1.pos_hi)
+        j = OdriveCanJoint(FakeBus(), OdriveCanJointConfig(name="lower_leg_left",
+                                                           node_id=3))
+        cal = real2sim.JointCal("lower_leg_left", "lower_leg_left", 1, 0.0,
+                                real2sim.gear_ratio("lower_leg_left"), True)
+        a = ms._JointAdapter(j, cal, None, (-1.0, 1.0))
+        assert a.to_native(TWO_PI) == pytest.approx(32.0)
+        assert a.to_rad(32.0) == pytest.approx(TWO_PI)
+        _, vel_gain, _ = real2sim.odrive_gains("lower_leg_left", 50.0, 0.8)
+        assert vel_gain == pytest.approx(0.8 * TWO_PI / 32.0 ** 2)
 
 
 class TestViewModel:

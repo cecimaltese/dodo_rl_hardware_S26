@@ -3,8 +3,10 @@ odrive_can_joint.py — control a single ODrive axis over CAN using the "CAN Sim
 protocol (raw python-can), exposing the SAME joint interface as DamiaoJoint and
 OdriveJoint so all motors share one control loop.
 
-This is the RUNTIME path for the ODrive. Gains / modes are NOT settable here —
-configure those once over USB with odrive_can_setup.py.
+This is the RUNTIME path for the ODrive. The position/velocity gains ARE settable
+here (Set_Pos_Gain / Set_Vel_Gains: RAM only, lost at power-off; motor_service sets
+them at every enable). Everything else (limits, encoder, CAN ids, cyclic messages)
+is configured once over USB with odrive_can_setup.py.
 
 CAN Simple basics
 -----------------
@@ -14,8 +16,16 @@ command id. The MotorController routes received frames to the right joint by
 node id, then each joint decodes by cmd id in process_frame().
 
 Command ids used (see HANDOFF / ros_odrive cmd table):
-  TX:  0x07 Set_Axis_State, 0x0B Set_Controller_Mode, 0x0C Set_Input_Pos
-  RX:  0x01 Heartbeat, 0x09 Get_Encoder_Estimates, 0x1C Get_Torques
+  TX:  0x07 Set_Axis_State, 0x0B Set_Controller_Mode, 0x0C Set_Input_Pos,
+       0x1A Set_Pos_Gain, 0x1B Set_Vel_Gains (firmware 0.5 and 0.6 alike)
+  RX:  0x01 Heartbeat, 0x03 Get_Error, 0x09 Get_Encoder_Estimates, 0x1C Get_Torques
+
+Every power-up the drives lose their motor/encoder calibration (incremental encoders:
+positions start at 0): Set_Axis_State(CLOSED_LOOP) is then REFUSED, the axis stays
+IDLE and the heartbeat's procedure_result says NOT_CALIBRATED (14), with axis_error 0.
+request_calibration() runs the full calibration sequence (motor R/L: a beep; encoder
+offset: the rotor turns a fraction of a turn and back), after which closed loop works
+until the next power-off.
 
 Units: ODrive positions are in *turns* (revolutions). 1 turn = 2*pi rad.
 """
@@ -29,15 +39,42 @@ import can
 
 # ── CAN Simple command ids ────────────────────────────────────────
 CMD_HEARTBEAT = 0x01
+CMD_GET_ERROR = 0x03
 CMD_SET_AXIS_STATE = 0x07
 CMD_GET_ENCODER_ESTIMATES = 0x09
 CMD_SET_CONTROLLER_MODE = 0x0B
 CMD_SET_INPUT_POS = 0x0C
+CMD_SET_POS_GAIN = 0x1A
+CMD_SET_VEL_GAINS = 0x1B
 CMD_GET_TORQUES = 0x1C
 
 # ── axis states / modes ───────────────────────────────────────────
 AXIS_STATE_IDLE = 1
+AXIS_STATE_FULL_CALIBRATION_SEQUENCE = 3
 AXIS_STATE_CLOSED_LOOP_CONTROL = 8
+AXIS_STATES = {0: "UNDEFINED", 1: "IDLE", 2: "STARTUP_SEQUENCE",
+               3: "FULL_CALIBRATION_SEQUENCE", 4: "MOTOR_CALIBRATION",
+               6: "ENCODER_INDEX_SEARCH", 7: "ENCODER_OFFSET_CALIBRATION",
+               8: "CLOSED_LOOP_CONTROL", 9: "LOCKIN_SPIN", 10: "ENCODER_DIR_FIND",
+               11: "HOMING", 12: "ENCODER_HALL_POLARITY_CALIBRATION",
+               13: "ENCODER_HALL_PHASE_CALIBRATION"}
+# Heartbeat byte 5: the result of the last requested state/procedure (firmware 0.6).
+PROCEDURE_RESULTS = ("SUCCESS", "BUSY", "CANCELLED", "DISARMED", "NO_RESPONSE",
+                     "POLARITY_MISMATCH", "PHASE_RESISTANCE_OUT_OF_RANGE",
+                     "PHASE_INDUCTANCE_OUT_OF_RANGE", "UNBALANCED_PHASES",
+                     "INVALID_MOTOR_TYPE", "ILLEGAL_HALL_STATE", "TIMEOUT",
+                     "HOMING_WITHOUT_ENDSTOP", "INVALID_STATE", "NOT_CALIBRATED",
+                     "NOT_CONVERGING")
+PROCEDURE_NOT_CALIBRATED = 14
+
+
+def axis_state_name(state: int) -> str:
+    return AXIS_STATES.get(state, f"state {state}")
+
+
+def procedure_result_name(result: int) -> str:
+    return (PROCEDURE_RESULTS[result] if 0 <= result < len(PROCEDURE_RESULTS)
+            else f"result {result}")
 CONTROL_MODE_POSITION = 3
 INPUT_MODE_PASSTHROUGH = 1
 
@@ -71,12 +108,16 @@ class OdriveCanJoint:
         self._torque_est: float = 0.0   # Nm
         self._axis_error: int = 0
         self._axis_state: int = AXIS_STATE_IDLE
+        self._procedure_result: int = 0
+        self._active_errors: int = 0     # Get_Error (streamed by some drives only)
+        self._disarm_reason: int = 0
         # time.monotonic() of the last encoder frame; None until one arrives. The
         # cached pos/vel are only as current as this — see feedback_age().
         self._last_fb_time: Optional[float] = None
 
         # Software zero offset (turns).
         self._zero_offset: float = 0.0
+        self.gains: Optional[tuple] = None   # last set_gains(), None = the drive's own
         self._last_target: Optional[float] = None
 
         # Non-blocking move state (mirrors DamiaoJoint).
@@ -106,6 +147,38 @@ class OdriveCanJoint:
     def set_controller_mode(self, control_mode: int = CONTROL_MODE_POSITION,
                             input_mode: int = INPUT_MODE_PASSTHROUGH) -> None:
         self._send(CMD_SET_CONTROLLER_MODE, struct.pack("<II", control_mode, input_mode))
+
+    def set_gains(self, pos_gain: float, vel_gain: float,
+                  vel_integrator_gain: float = 0.0) -> None:
+        """Set the controller gains (RAM only; a power cycle restores the saved ones).
+        pos_gain [(turns/s)/turn], vel_gain [Nm/(turns/s)], vel_integrator_gain
+        [Nm/turn]. Safe in closed loop. real2sim.odrive_gains converts a joint PD."""
+        self._send(CMD_SET_POS_GAIN, struct.pack("<f", pos_gain))
+        self._send(CMD_SET_VEL_GAINS, struct.pack("<ff", vel_gain, vel_integrator_gain))
+        self.gains = (pos_gain, vel_gain, vel_integrator_gain)
+
+    def request_calibration(self) -> None:
+        """Run the drive's FULL_CALIBRATION_SEQUENCE (motor R/L, then the encoder
+        offset: THE ROTOR TURNS, a fraction of a turn and back). Needed once after
+        every power-up before closed loop is accepted. Watch axis_state go back to IDLE
+        and procedure_result to SUCCESS."""
+        self._set_axis_state(AXIS_STATE_FULL_CALIBRATION_SEQUENCE)
+
+    @property
+    def axis_state(self) -> int:
+        return self._axis_state
+
+    @property
+    def procedure_result(self) -> int:
+        return self._procedure_result
+
+    def drive_report(self) -> dict:
+        """What the drive last said about itself (heartbeat + Get_Error)."""
+        return {"state": axis_state_name(self._axis_state),
+                "procedure_result": procedure_result_name(self._procedure_result),
+                "axis_error": f"0x{self._axis_error:X}",
+                "active_errors": f"0x{self._active_errors:X}",
+                "disarm_reason": f"0x{self._disarm_reason:X}"}
 
     def enable(self) -> None:
         # Ensure position/passthrough then enter closed loop.
@@ -241,9 +314,13 @@ class OdriveCanJoint:
         if cmd_id == CMD_HEARTBEAT and len(msg.data) >= 7:
             # <I B B B B> : axis_error, axis_state, procedure_result,
             #               trajectory_done_flag, (reserved)
-            err, state, _proc, _traj, _ = struct.unpack("<IBBBB", msg.data[:8].ljust(8, b"\x00"))
+            err, state, proc, _traj, _ = struct.unpack("<IBBBB", msg.data[:8].ljust(8, b"\x00"))
             self._axis_error = err
             self._axis_state = state
+            self._procedure_result = proc
+
+        elif cmd_id == CMD_GET_ERROR and len(msg.data) >= 8:
+            self._active_errors, self._disarm_reason = struct.unpack("<II", msg.data[:8])
 
         elif cmd_id == CMD_GET_ENCODER_ESTIMATES and len(msg.data) >= 8:
             pos, vel = struct.unpack("<ff", msg.data[:8])

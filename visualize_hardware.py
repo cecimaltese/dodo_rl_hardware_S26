@@ -31,8 +31,8 @@ Also shown: the tilt as nose-down / right-down degrees (the words imu_locate.py 
 and the gyro in body axes (deg/s): a nose-down turn is +y, a right-side-down turn +x.
 
 While it runs it records the range each joint reached and the largest tilt. Push
-joints to their stops and the exit summary lists them next to the URDF and
-fleet_config limits (calibrate_joints.py --limits records stops properly).
+joints to their stops and the exit summary lists them next to the URDF limits and
+the stops calibrate_joints.py --limits measured (joint_calib.py).
 
 No physics is stepped: readings go straight into qpos and the model is re-posed with
 mj_forward. The base stays at the origin; only its orientation follows the IMU.
@@ -66,7 +66,7 @@ import numpy as np
 import assets
 import real2sim
 from fleet_config import (DM_JOINTS, OD_JOINTS, DM_CHANNEL, OD_CHANNEL, BUSTYPE,
-                          FEEDBACK_FRESH_S, JOINT_LIMITS_RAD)
+                          FEEDBACK_FRESH_S)
 from rl_env import projected_gravity_from_quat
 from sim_env import URDF_PATH
 
@@ -138,13 +138,14 @@ def urdf_range(model, joint: str) -> Optional[Tuple[float, float]]:
 
 
 def range_summary(seen: Dict[str, list], model) -> str:
-    """The exit table: reached range per joint vs the URDF and fleet_config limits."""
+    """The exit table: reached range per joint vs the URDF and the measured stops."""
     lines = [f"  {'joint':17s} {'reached [deg]':>17s}   {'URDF [deg]':>17s}   "
-             f"{'fleet_config [deg]':>18s}"]
+             f"{'measured stops [deg]':>20s}"]
     deg = math.degrees
+    stops = real2sim.stops()
     for j, (lo, hi) in seen.items():
         u = urdf_range(model, j)
-        f = JOINT_LIMITS_RAD.get(j)
+        f = stops.get(j)
         lines.append(
             f"  {j:17s} {deg(lo):+7.1f} .. {deg(hi):+6.1f}   "
             + (f"{deg(u[0]):+7.1f} .. {deg(u[1]):+6.1f}" if u else f"{'--':>17s}")

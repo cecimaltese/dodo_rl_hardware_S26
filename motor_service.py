@@ -8,40 +8,55 @@ interface:
                                              + per-joint & global flags
     SUB  motor_commands  latest-value        absolute position targets [rad],
                                              NaN = leave that joint alone
-    REP  ctl             on demand           status / enable / disable /
-                                             set_zero / estop_reset
+    REP  ctl             on demand           status / calibrate / enable /
+                                             disable / gains / estop_reset
 
 This is a *pure* control service: it knows nothing about the policy (joint
 order on the wire is dodo_ipc.JOINT_ORDER; default pose / action scaling live
-in the Env layer). Units are converted to each motor's native units here
-(Damiao = radians, ODrive = turns) and NEVER on the wire.
+in the Env layer). The wire is in JOINT units, the sim's: radians as in the
+URDF, rad/s, joint Nm. Every joint goes through its MEASURED calibration
+(real2sim.JointCal from joint_calib.py: sign, zero, gear ratio) into its motor's
+native units (Damiao rad at the output, ODrive MOTOR turns), and nothing native
+ever reaches the wire.
 
 Design choices (all deliberate):
   * NO auto-enable at startup. Bring-up is explicit via tools/dodo_ctl.py:
         status → calibrate → enable            (normal startup, see below)
   * States keep publishing after an e-stop (with the ESTOPPED flag set) so
     consumers see WHY the robot stopped instead of a silent stream.
-  * Per-joint `calibrated` flag on the wire: Damiao joints have a persistent
-    hardware zero → calibrated from boot; ODrive positions are turns-since-boot
-    → calibrated by ctl `calibrate` (boot pose, below) or `set_zero` (jig).
-  * `enable` is BUMPLESS and fail-closed: it refuses if any joint is silent,
-    presets every setpoint to the measured position (so nothing jumps when the
-    loops close), then slowly "unparks" joints that sit outside the safety
-    band (e.g. folded at the stops) to the band edge.
+  * Per-joint `calibrated` flag on the wire: a Damiao keeps its measured zero
+    (joint_calib.py) across power cycles → calibrated from boot; an ODrive's
+    position is turns-since-boot → calibrated by ctl `calibrate` (below).
+  * `enable` is BUMPLESS and fail-closed: it refuses unless every joint is
+    calibrated, has measured stops and talks; sets the PD gains (Damiao: in
+    every MIT frame; ODrive: over CAN); presets every setpoint to the measured
+    position (so nothing jumps when the loops close), then slowly "unparks"
+    joints outside the command band to its edge.
+  * PD gains: fleet_config.JOINT_KP/JOINT_KD (the PD stand's, = dodo_assets'
+    scene.xml), times --gain-scale / ctl `gains` (kp x s, kd x sqrt s).
 
-Boot-pose calibration (replaces a homing routine — there is none, on purpose:
-driving the ODrive joints into their stops under power could damage the
-3D-printed structure/belts):
-  * POWER ON the robot with the ODrive-driven joints folded all the way back
-    against their mechanical stops (knees + ankles at the BOOT_POSE_RAD below).
-  * ctl `calibrate` then maps turns-since-boot onto those known angles.
-    Damiao joints are untouched (their zero is hardware-persistent).
-  * `calibrate`/`set_zero` are only accepted while DISABLED.
+ODrive drive calibration, once per power-up: the drives forget their motor/encoder
+calibration when switched off and REFUSE closed loop until it's redone (heartbeat
+procedure_result NOT_CALIBRATED). ctl `odrive_calibrate` runs it over CAN, legs
+hanging free: each knee/ankle motor beeps, then turns a fraction of a turn and back
+(~10-15 deg at the joint). It voids the joint calibration below; redo that after.
+`enable` checks every ODrive actually reaches closed loop, and an ODrive that leaves
+it while enabled is an e-stop.
+
+Joint calibration per session (no homing routine, on purpose: driving the ODrive
+joints into their stops under power could damage the 3D-printed parts/belts):
+  * put the knees and ankles in a reference pose (fleet_config.REFERENCE_POSES:
+    `straight` = legs hanging straight on the gantry, as in the calibration's
+    zero pose), then ctl `calibrate pose=straight` maps each ODrive's current
+    reading onto that angle. The Damiaos keep their measured zeros.
+  * `calibrate` is only accepted while DISABLED. Check the result with
+    visualize_hardware.py BEFORE starting the service, or `status` after.
 
 Safety layer:
-  * position commands clamped to SAFETY_FACTOR × fleet_config joint limits
-    (native units)
-  * |torque| > 0.8 × rated  → that ONE motor to IDLE (professor's spec)
+  * position commands clamped STOP_MARGIN_RAD inside the measured stops, in
+    joint radians (real2sim.command_band)
+  * |joint torque| > 0.8 × rated  → that ONE motor to IDLE (professor's spec;
+    ODrive torque converted to the joint, fleet_config.ODRIVE_TORQUE_IS_MOTOR_SIDE)
   * motor fault / over-speed / measured over-travel / silent feedback /
     stalled command stream → full e-stop (all motors disabled, latched until
     ctl estop_reset)
@@ -53,8 +68,9 @@ Safety layer:
     sends every tick). A silent ODrive also loses its calibration — if it
     rebooted, its encoder re-zeroed.
 
-Fleet, buses, limits and the boot pose all come from fleet_config.py — the
-single source of truth; nothing about the robot is configured here.
+Fleet, buses, gains and reference poses come from fleet_config.py, the measured
+calibration and stops from joint_calib.py (through real2sim); nothing about the
+robot is configured here.
 
 CAN topology: two buses, one USB-CAN adapter each (Damiao on DM_CHANNEL, ODrive
 on OD_CHANNEL; stable names from the udev rule, see fleet_config.py). Both types
@@ -67,16 +83,19 @@ by hand:
 
 Run (robot):
     python3 motor_service.py                    # full 8-joint fleet
+    python3 motor_service.py --gain-scale 0.3   # soft PD for first tests
     python3 motor_service.py --only hip_left,lower_leg_left   # bench subset
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
+import math
 import threading
 import time
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import can
 from damiao_motor import DaMiaoController
@@ -84,23 +103,29 @@ from damiao_motor import DaMiaoController
 import dodo_ipc as ipc
 import real2sim
 from damiao_joint import DamiaoJoint
-from odrive_can_joint import OdriveCanJoint
+from odrive_can_joint import (AXIS_STATE_CLOSED_LOOP_CONTROL,
+                              PROCEDURE_NOT_CALIBRATED, OdriveCanJoint,
+                              axis_state_name, procedure_result_name)
 from fleet_config import (DM_JOINTS, OD_JOINTS, DM_CHANNEL, OD_CHANNEL, BUSTYPE,
-                          JOINT_LIMITS_RAD, RATED_TORQUE_NM, JOINT_VEL_LIMIT_RAD,
-                          BOOT_POSE_RAD, FEEDBACK_FRESH_S)
+                          RATED_TORQUE_NM, JOINT_VEL_LIMIT_RAD, REFERENCE_POSES,
+                          FEEDBACK_FRESH_S, JOINT_KP, JOINT_KD, joint_group,
+                          ODRIVE_TORQUE_IS_MOTOR_SIDE)
 
 log = logging.getLogger("motor_service")
 
 DM_REGISTER_ID = 0x7FF  # Damiao register read/write reply arbitration id
 
 # --- Safety factors / thresholds -----------------------------------------------
-SAFETY_FACTOR = 0.9          # margin applied to position-clamp + velocity limit
+SAFETY_FACTOR = 0.9          # margin applied to the velocity limit
 TORQUE_IDLE_FACTOR = 0.8     # |torque| > 0.8 * rated  ->  that motor goes to IDLE
 CMD_WATCHDOG_S = 0.5         # once commands stream (while enabled), a gap -> e-stop
 FB_WATCHDOG_S = 0.5          # a joint that should be reporting goes silent -> e-stop
-POS_OVERTRAVEL_MARGIN = 0.10 # rad past the hard URDF limit (measured) -> e-stop
+POS_OVERTRAVEL_MARGIN = 0.10 # rad past a measured stop -> e-stop
 STARTUP_GRACE_S = 1.0        # ignore safety trips for the first second
-UNPARK_DURATION_S = 1.5      # slow move from the stop to the safety-band edge at enable
+UNPARK_DURATION_S = 1.5      # slow move from outside the command band to its edge at enable
+MAX_GAIN_SCALE = 1.0         # ctl `gains`: never stiffer than fleet_config's
+CLOSED_LOOP_TIMEOUT_S = 1.0  # enable: every ODrive must REPORT closed loop by then
+                             # (heartbeats are 10-100 Hz) or the fleet is disabled again
 
 DM_FAULT_STATUS = {
     "OVER_VOLTAGE", "UNDER_VOLTAGE", "OVER_CURRENT",
@@ -114,11 +139,16 @@ AnyJoint = Union[DamiaoJoint, OdriveCanJoint]
 # Per-joint adapter: unifies units (rad <-> native) + safety limits + state.
 # ---------------------------------------------------------------------------
 class _JointAdapter:
-    """Wraps any joint so the service treats Damiao (rad) and ODrive (turns)
-    uniformly: positions/velocities go on the wire in radians, while clamping
-    and feedback monitoring happen in the joint's native units."""
+    """One joint: JOINT units outside (sim radians, rad/s, joint Nm), the motor's
+    native units inside (Damiao rad at the output, ODrive MOTOR turns), through its
+    measured calibration (real2sim.JointCal: q = sign * (raw - zero) * scale).
 
-    def __init__(self, joint: AnyJoint):
+    The drivers' own software zero stays 0: all mapping happens here, so the
+    native values are the motors' raw readings."""
+
+    def __init__(self, joint: AnyJoint, cal: real2sim.JointCal,
+                 stops: Optional[Tuple[float, float]],
+                 band: Optional[Tuple[float, float]]):
         self.joint = joint
         self.name = joint.cfg.name
         self.is_odrive = isinstance(joint, OdriveCanJoint)
@@ -128,52 +158,59 @@ class _JointAdapter:
         # instead of the measured angles: under load those sag below the targets, and
         # re-targeting there drops the preload (a standing robot tips over).
         self.target_rad: Optional[float] = None
-        # Damiao has a persistent hardware zero -> calibrated from boot.
-        # ODrive reports turns-since-boot -> needs ctl `calibrate` (powered on
-        # in the boot pose, legs at the stops) or `set_zero` (jig).
-        self.calibrated = not self.is_odrive
-
-        cfg = joint.cfg
-        lo_rad, hi_rad = JOINT_LIMITS_RAD.get(self.name, (None, None))
-        self.pos_hard_lo_rad, self.pos_hard_hi_rad = lo_rad, hi_rad
-        self.pos_lo = self.to_native(lo_rad * SAFETY_FACTOR) if lo_rad is not None else None
-        self.pos_hi = self.to_native(hi_rad * SAFETY_FACTOR) if hi_rad is not None else None
-        cpm, cpx = getattr(cfg, "pos_min", None), getattr(cfg, "pos_max", None)
-        if cpm is not None:
-            self.pos_lo = cpm if self.pos_lo is None else max(self.pos_lo, cpm)
-        if cpx is not None:
-            self.pos_hi = cpx if self.pos_hi is None else min(self.pos_hi, cpx)
-        if self.pos_lo is None or self.pos_hi is None:
-            log.warning("%s: position UNCLAMPED (no URDF limit found).", self.name)
-
-        self.vel_limit = self.to_native(SAFETY_FACTOR * JOINT_VEL_LIMIT_RAD)
+        self.cal = cal
+        # Sign and mapping measured (joint_calib.py)? Without, nothing is commanded.
+        self.measured = cal.measured
+        # A Damiao's measured zero holds across power cycles; an ODrive's doesn't:
+        # its zero comes from ctl `calibrate` every session.
+        self.calibrated = cal.measured and not self.is_odrive
+        self.stops = stops              # measured hard stops [rad], None = unmeasured
+        self.band = band                # where commands may go [rad]
+        self.vel_limit_rad = SAFETY_FACTOR * JOINT_VEL_LIMIT_RAD
         self.rated_torque = RATED_TORQUE_NM.get(
-            self.name, getattr(cfg, "rated_torque", None) or 9.0)
+            self.name, getattr(joint.cfg, "rated_torque", None) or 9.0)
         self.torque_idle_limit = TORQUE_IDLE_FACTOR * self.rated_torque
+        # Reported torque -> joint Nm: the sign, and an ODrive's motor-side Nm through
+        # the gearing.
+        self.torque_scale = cal.sign * (
+            real2sim.gear_ratio(self.name)
+            if self.is_odrive and ODRIVE_TORQUE_IS_MOTOR_SIDE else 1.0)
+        self.kp = JOINT_KP[joint_group(self.name)]   # joint-side, before gain_scale
+        self.kd = JOINT_KD[joint_group(self.name)]
 
-    # ── unit conversion (native is MOTOR turns for ODrive, rad for Damiao) ──
-    # real2sim's scale: ODrive 2*pi / fleet_config.GEAR_RATIO (1 while unmeasured),
-    # Damiao 1. Unit scale only: the measured sign/zero layer (joint_calib.py) is not
-    # wired into the service yet (HANDOFF §2).
+    # ── units: joint rad <-> the motor's raw native reading ──
     def to_native(self, rad: float) -> float:
-        return rad / real2sim.rad_per_native(self.name)
+        return self.cal.to_raw(rad)
 
     def to_rad(self, native: float) -> float:
-        return native * real2sim.rad_per_native(self.name)
+        return self.cal.to_sim(native)
 
-    def clamp_native(self, q: float) -> float:
-        if self.pos_lo is not None:
-            q = max(q, self.pos_lo)
-        if self.pos_hi is not None:
-            q = min(q, self.pos_hi)
-        return q
+    def clamp_rad(self, q: float) -> float:
+        lo, hi = self.band
+        return min(max(q, lo), hi)
+
+    def calibrate_at(self, raw: float, q_ref: float) -> None:
+        """The joint is physically at q_ref [rad] while its motor reads raw."""
+        self.cal = self.cal.zeroed_at(raw, q_ref)
+        self.calibrated = True
+
+    def apply_gains(self, scale: float) -> Tuple[float, float]:
+        """Set this joint's PD to (kp x scale, kd x sqrt(scale)); returns them. Damiao:
+        the gains of its own config copy, sent in every MIT frame. ODrive: over CAN
+        (applies at once, also in closed loop)."""
+        kp, kd = self.kp * scale, self.kd * math.sqrt(scale)
+        if self.is_odrive:
+            self.joint.set_gains(*real2sim.odrive_gains(self.name, kp, kd))
+        else:
+            self.joint.cfg.kp, self.joint.cfg.kd = kp, kd
+        return kp, kd
 
     # ── normalized state read ─────────────────────────────────────
     def read_state(self) -> dict:
         st = self.joint.get_state() or {}
         pos_native = float(st.get("pos", 0.0))
         vel_native = float(st.get("vel", 0.0))
-        torque = float(st.get("torque", st.get("torq", 0.0)))
+        torque_native = float(st.get("torque", st.get("torq", 0.0)))
 
         # FRESH feedback only. "Has ever reported" (what this used to check) stays
         # true forever after the first frame, which turned a dead joint, bus or
@@ -193,10 +230,10 @@ class _JointAdapter:
 
         return {
             "pos_rad": self.to_rad(pos_native),
-            "vel_rad": self.to_rad(vel_native),
+            "vel_rad": self.cal.vel_to_sim(vel_native),
             "pos_native": pos_native,
             "vel_native": vel_native,
-            "torque": torque,
+            "torque": torque_native * self.torque_scale,     # joint Nm
             "fault": fault,
             "has_feedback": has_fb,
             "fb_age": fb_age,
@@ -212,8 +249,13 @@ class MotorService:
                  bustype: str = BUSTYPE,
                  rate_hz: float = 200.0,
                  move_duration: float = 0.0,
-                 only: Optional[List[str]] = None):
+                 only: Optional[List[str]] = None,
+                 calib_path=real2sim.CALIB_PATH,
+                 gain_scale: float = 1.0):
         self.rate_hz = rate_hz
+        if not 0.0 < gain_scale <= MAX_GAIN_SCALE:
+            raise ValueError(f"gain_scale {gain_scale}: must be in (0, {MAX_GAIN_SCALE}]")
+        self.gain_scale = gain_scale
         # 0.0 = track streamed targets directly (policy @ 50 Hz); nonzero adds a
         # smooth ramp per command (useful for hand-typed bench moves).
         self.move_duration = move_duration
@@ -243,7 +285,10 @@ class MotorService:
         self.dm_joints: List[DamiaoJoint] = []
         if dm_cfgs:
             self.dm_controller = DaMiaoController(channel=dm_channel, bustype=bustype)
-            self.dm_joints = [DamiaoJoint(self.dm_controller, c) for c in dm_cfgs]
+            # Own config copies: apply_gains() changes kp/kd, and DM_JOINTS are the
+            # shared fleet_config objects.
+            self.dm_joints = [DamiaoJoint(self.dm_controller, dataclasses.replace(c))
+                              for c in dm_cfgs]
 
         # ── ODrive: a second (filtered) socket + reader thread ─────
         self.od_bus: Optional[can.BusABC] = None
@@ -268,13 +313,28 @@ class MotorService:
             self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
             self._reader_thread.start()
 
-        # Unified joint list + adapters (wire slots come from dodo_ipc.JOINT_ORDER).
+        # Unified joint list + adapters (wire slots come from dodo_ipc.JOINT_ORDER),
+        # each through its measured calibration.
         self.joints: List[AnyJoint] = [*self.dm_joints, *self.od_joints]
-        self.adapters: Dict[str, _JointAdapter] = {
-            j.cfg.name: _JointAdapter(j) for j in self.joints}
-        for name in self.adapters:
+        cals, warnings = real2sim.load(calib_path)
+        for w in warnings:
+            if "zeroes its encoder at power-up" not in w:    # ODrive zeros: not used
+                log.warning("calibration: %s", w)
+        self.adapters: Dict[str, _JointAdapter] = {}
+        for j in self.joints:
+            name = j.cfg.name
             if name not in ipc.JOINT_INDEX:
                 raise ValueError(f"joint '{name}' not in dodo_ipc.JOINT_ORDER")
+            cal = cals[name]
+            if cal.motor != name:
+                raise ValueError(f"joint_calib.py: {name} is driven by motor "
+                                 f"'{cal.motor}', but fleet_config names that motor "
+                                 f"'{name}'. Fix the names in fleet_config.py.")
+            if real2sim.is_odrive(name):
+                cal = dataclasses.replace(cal, zero=0.0)    # set by ctl `calibrate`
+            self.adapters[name] = _JointAdapter(
+                j, cal, real2sim.stops(calib_path).get(name),
+                real2sim.command_band(name, calib_path))
 
         # ── ZMQ endpoints (service side binds; see dodo_ipc docstring) ──
         self.state_pub = ipc.Publisher(ipc.TOPIC_MOTOR_STATES)
@@ -284,21 +344,26 @@ class MotorService:
             "status": self._ctl_status,
             "enable": self._ctl_enable,
             "disable": self._ctl_disable,
-            "calibrate": self._ctl_calibrate,   # normal startup (boot pose)
-            "set_zero": self._ctl_set_zero,     # jig/bench only (pose = URDF zero)
+            "calibrate": self._ctl_calibrate,   # every session: pose=<reference pose>
+            "set_zero": self._ctl_set_zero,     # = calibrate pose=straight
+            "gains": self._ctl_gains,
+            "odrive_calibrate": self._ctl_odrive_calibrate,
             "estop_reset": self._ctl_estop_reset,
         }
 
-        log.info("motor_service up: %d Damiao (%s) + %d ODrive (%s), loop %.0f Hz. "
-                 "Motors DISABLED — run tools/dodo_ctl.py enable.",
-                 len(self.dm_joints), dm_channel, len(self.od_joints), od_channel, rate_hz)
+        log.info("motor_service up: %d Damiao (%s) + %d ODrive (%s), loop %.0f Hz, "
+                 "gain scale %.2f. Motors DISABLED — calibrate, then enable.",
+                 len(self.dm_joints), dm_channel, len(self.od_joints), od_channel,
+                 rate_hz, gain_scale)
         for name, a in self.adapters.items():
-            lo = f"{a.pos_lo:+.2f}" if a.pos_lo is not None else "-inf"
-            hi = f"{a.pos_hi:+.2f}" if a.pos_hi is not None else "+inf"
-            unit = "turns" if a.is_odrive else "rad"
-            log.info("  %s: pos[%s,%s] %s, |vel|<=%.1f, torque->IDLE @%.1f Nm (0.8 x %.0f)%s",
-                     name, lo, hi, unit, a.vel_limit, a.torque_idle_limit,
-                     a.rated_torque, "" if a.calibrated else "  [NEEDS calibrate]")
+            band = (f"[{a.band[0]:+.2f},{a.band[1]:+.2f}] rad" if a.band
+                    else "NO MEASURED STOPS (enable refused)")
+            log.info("  %-15s sign %+d, commands %s, |vel|<=%.1f rad/s, kp %.0f kd %.2f, "
+                     "torque->IDLE @%.1f Nm%s", name, a.cal.sign, band, a.vel_limit_rad,
+                     a.kp * gain_scale, a.kd * math.sqrt(gain_scale), a.torque_idle_limit,
+                     "" if a.measured else "  [NOT CALIBRATED: joint_calib.py]")
+            if a.measured and not a.calibrated:
+                log.info("  %-15s needs ctl `calibrate` (ODrive zero is per session)", "")
 
     # ── ODrive reader thread ──────────────────────────────────────
     def _reader_loop(self):
@@ -335,13 +400,20 @@ class MotorService:
         joints = {}
         for name, a in self.adapters.items():
             st = a.read_state()
+            target = (None if a.target_rad is None or not self._enabled or a.idled
+                      else a.target_rad)
             joints[name] = {
                 "type": "odrive" if a.is_odrive else "damiao",
                 "pos_rad": round(st["pos_rad"], 4),
-                "target_rad": (None if a.target_rad is None or not self._enabled
-                               or a.idled else round(a.target_rad, 4)),
+                "target_rad": None if target is None else round(target, 4),
+                # target - pos: with torque_nm, the stiffness actually acting (~kp)
+                "err_rad": None if target is None else round(target - st["pos_rad"], 4),
                 "vel_rad": round(st["vel_rad"], 4),
                 "torque_nm": round(st["torque"], 3),
+                "kp": round(a.kp * self.gain_scale, 2),
+                "kd": round(a.kd * math.sqrt(self.gain_scale), 3),
+                "band_rad": a.band and [round(v, 3) for v in a.band],
+                **({"drive": a.joint.drive_report()} if a.is_odrive else {}),
                 "has_feedback": st["has_feedback"],
                 "feedback_age_s": (None if st["fb_age"] is None
                                    else round(st["fb_age"], 3)),
@@ -354,6 +426,8 @@ class MotorService:
             "estopped": self._estopped,
             "estop_reason": self._estop_reason,
             "all_calibrated": all(a.calibrated for a in self.adapters.values()),
+            "gain_scale": self.gain_scale,
+            "reference_poses": sorted(REFERENCE_POSES),
             "move_duration": self.move_duration,
             "loop": self.loop.stats() if hasattr(self, "loop") else None,
             "joints": joints,
@@ -362,21 +436,31 @@ class MotorService:
     def _ctl_enable(self, _args: dict) -> dict:
         """Bumpless, fail-closed enable.
 
+        0. Every joint must be calibrated (measured sign; ODrive: `calibrate` this
+           session) and have measured stops: otherwise its angles, clamps and
+           commands mean nothing.
         1. ODrives must already be chatting (cyclic encoder feedback) — refuse
-           a blind enable. Preset each ODrive input_pos to the MEASURED shaft
-           position while still idle, so closed-loop entry holds in place
-           (otherwise the axis would jump to a stale/zero setpoint).
+           a blind enable. Set their PD gains over CAN, then preset each input_pos
+           to the MEASURED shaft position while still idle, so closed-loop entry
+           holds in place (otherwise the axis would jump to a stale/zero setpoint).
         2. Enable the fleet, then probe the Damiaos with a zero-gain limp frame
            (they only report state once enabled). Silent joint -> disable all,
            refuse. Then hold each Damiao at its measured position.
-        3. Joints resting OUTSIDE the safety band (boot pose = folded at the
-           stops) are slowly "unparked" to the band edge so the first streamed
-           command never causes a step jump.
+        3. Joints resting OUTSIDE the command band (e.g. at a stop) are slowly
+           "unparked" to the band edge so the first streamed command never causes
+           a step jump.
         """
         if self._estopped:
             raise RuntimeError(f"e-stopped ({self._estop_reason}) — estop_reset first")
         if self._enabled:
             return {"enabled": True, "unparking": {}}
+        not_ready = {n: ("sign/zero not measured (joint_calib.py)" if not a.measured
+                         else "no ctl `calibrate` this session" if not a.calibrated
+                         else "no measured stops (calibrate_joints.py --limits)")
+                     for n, a in self.adapters.items()
+                     if not (a.measured and a.calibrated and a.band)}
+        if not_ready:
+            raise RuntimeError(f"refusing to enable: {not_ready}")
 
         states = {n: a.read_state() for n, a in self.adapters.items()}
         silent_od = [n for n, a in self.adapters.items()
@@ -392,10 +476,33 @@ class MotorService:
         # sits outside the safety band, and holding it exactly where it is beats
         # yanking it to the band edge.
         for n, a in self.adapters.items():
+            a.apply_gains(self.gain_scale)
             if a.is_odrive:
                 a.joint.send_position(states[n]["pos_native"])
 
         self._enable_all()
+
+        # ODrive: closed loop is a REQUEST the drive may refuse (NOT_CALIBRATED after
+        # a power cycle) without any error bit. Wait for every heartbeat to say so.
+        deadline = time.monotonic() + CLOSED_LOOP_TIMEOUT_S
+        while True:
+            refused = [a for a in self.adapters.values()
+                       if a.is_odrive and a.joint.axis_state != AXIS_STATE_CLOSED_LOOP_CONTROL]
+            if not refused or time.monotonic() > deadline:
+                break
+            time.sleep(0.02)
+        if refused:
+            self._disable_all()
+            why = {a.name: f"{axis_state_name(a.joint.axis_state)}, "
+                           f"{procedure_result_name(a.joint.procedure_result)}"
+                   for a in refused}
+            hint = ""
+            if any(a.joint.procedure_result == PROCEDURE_NOT_CALIBRATED for a in refused):
+                hint = (" NOT_CALIBRATED = the drive's motor/encoder calibration is lost "
+                        "at every power-up: legs hanging free, ctl `odrive_calibrate`, "
+                        "then `calibrate pose=straight` again.")
+            raise RuntimeError(f"ODrive(s) didn't enter closed loop: {why}. Fleet "
+                               f"disabled again (fail closed).{hint}")
 
         # Damiao: limp probe (zero torque) so they start reporting, then re-read.
         if self.dm_joints:
@@ -414,19 +521,18 @@ class MotorService:
                     f"no feedback from Damiao {silent_dm} after limp probe — "
                     f"check power/CAN ids. Fleet disabled again (fail closed).")
 
-        # Hold in place / unpark toward the safety band.
+        # Hold in place / unpark toward the command band.
         unparking = {}
         for n, a in self.adapters.items():
-            pos = states[n]["pos_native"]
-            tgt = a.clamp_native(pos)
-            if abs(tgt - pos) > 1e-6:
-                a.joint.start_move(tgt, duration=UNPARK_DURATION_S)
-                unparking[n] = {"from_rad": round(a.to_rad(pos), 4),
-                                "to_rad": round(a.to_rad(tgt), 4),
+            q = states[n]["pos_rad"]
+            tgt = a.clamp_rad(q)
+            if abs(tgt - q) > 1e-6:
+                a.joint.start_move(a.to_native(tgt), duration=UNPARK_DURATION_S)
+                unparking[n] = {"from_rad": round(q, 4), "to_rad": round(tgt, 4),
                                 "duration_s": UNPARK_DURATION_S}
             else:
-                a.joint.send_position(pos)
-            a.target_rad = a.to_rad(tgt)
+                a.joint.send_position(states[n]["pos_native"])
+            a.target_rad = tgt
         self._enabled = True
         self._enabled_at = time.monotonic()   # Damiao silence is counted from here
         # Re-arm the command watchdog for the new session.
@@ -448,61 +554,90 @@ class MotorService:
         return {"enabled": False}
 
     def _ctl_calibrate(self, args: dict) -> dict:
-        """Boot-pose calibration — THE normal startup step (replaces homing).
-
-        Precondition: the robot was POWERED ON with the ODrive joints folded
-        against their mechanical stops (BOOT_POSE_RAD). Maps each ODrive's
-        turns-since-boot onto that known angle. Damiao zeros are hardware-
-        persistent and are not touched.
-        """
-        pose = args.get("pose", "boot")
-        if pose != "boot":
-            raise RuntimeError(f"unknown pose '{pose}' — use 'boot' "
-                               f"(or set_zero for the jig pose)")
+        """Per-session calibration of the ODrive joints (knees, ankles): they are
+        physically in reference pose `pose` (fleet_config.REFERENCE_POSES) right now,
+        so each one's current reading becomes that angle. The Damiaos keep their
+        measured zeros (joint_calib.py). Only while DISABLED; no default pose, so
+        nobody calibrates against a pose the robot isn't in."""
+        pose = args.get("pose")
+        if pose not in REFERENCE_POSES:
+            raise RuntimeError(f"say which pose the knees and ankles are in: "
+                               f"pose={'|'.join(sorted(REFERENCE_POSES))} (got {pose!r})")
         if self._enabled:
             raise RuntimeError("refusing calibrate while enabled — disable first")
-        assumed = {}
-        for n, a in self.adapters.items():
-            if not a.is_odrive:
-                continue
-            if n not in BOOT_POSE_RAD:
-                raise RuntimeError(f"no BOOT_POSE_RAD entry for '{n}' — add it")
-            if not a.read_state()["has_feedback"]:
-                raise RuntimeError(f"{n}: no encoder feedback — check power/CAN "
-                                   f"(cannot calibrate a silent joint)")
-            a.joint.set_zero(current=a.to_native(BOOT_POSE_RAD[n]))
-            a.calibrated = True
-            assumed[n] = BOOT_POSE_RAD[n]
-        log.info("calibrate(boot): mapped %s onto the boot pose %s — VERIFY with "
-                 "status before enabling!", sorted(assumed), assumed)
-        return {"pose": "boot", "assumed_rad": assumed,
-                "note": "assumes the legs were folded at the stops at power-on; "
-                        "Damiao zeros untouched (hardware). Verify with status."}
+        ref = REFERENCE_POSES[pose]
+        todo = {n: a for n, a in self.adapters.items() if a.is_odrive}
+        missing = sorted(set(todo) - set(ref))
+        if missing:
+            raise RuntimeError(f"reference pose '{pose}' has no angle for {missing}")
+        unmeasured = sorted(n for n, a in todo.items() if not a.measured)
+        if unmeasured:
+            raise RuntimeError(f"{unmeasured}: sign not measured (joint_calib.py); "
+                               f"calibrate_joints.py first")
+        states = {n: a.read_state() for n, a in todo.items()}
+        silent = sorted(n for n, st in states.items() if not st["has_feedback"])
+        if silent:
+            raise RuntimeError(f"{silent}: no encoder feedback — check power/CAN "
+                               f"(cannot calibrate a silent joint)")
+        for n, a in todo.items():
+            a.calibrate_at(states[n]["pos_native"], ref[n])
+        log.info("calibrate(%s): %s now read %s rad — VERIFY (visualize_hardware.py "
+                 "before, `status` after) before enabling!", pose, sorted(todo),
+                 {n: ref[n] for n in sorted(todo)})
+        return {"pose": pose, "assumed_rad": {n: ref[n] for n in sorted(todo)},
+                "note": "the knees/ankles must BE in this pose now. Damiao zeros "
+                        "untouched (measured, persistent)."}
 
     def _ctl_set_zero(self, _args: dict) -> dict:
-        """Jig calibration (bench only): the robot is physically posed at the
-        URDF zero, and the CURRENT position becomes 0 for every joint that is
-        reporting. Normal startup uses `calibrate` (boot pose) instead."""
+        """Kept for old scripts: = calibrate pose=straight (legs hanging straight).
+        It used to zero every joint, Damiaos included, at whatever pose the robot was
+        in; their measured zeros are better than a by-eye pose."""
+        return self._ctl_calibrate({"pose": "straight"})
+
+    def _ctl_gains(self, args: dict) -> dict:
+        """scale=<s>: the PD at s x fleet_config's kp (kd x sqrt s, same damping
+        ratio), 0 < s <= MAX_GAIN_SCALE. Applies at once (also while enabled) and at
+        every later enable."""
+        if "scale" in args:
+            s = float(args["scale"])
+            if not 0.0 < s <= MAX_GAIN_SCALE:
+                raise RuntimeError(f"scale {s}: must be in (0, {MAX_GAIN_SCALE}]")
+            self.gain_scale = s
+            if self._enabled:
+                for a in self.adapters.values():
+                    if not a.idled:
+                        a.apply_gains(s)
+            log.info("gain scale %.2f%s", s, " (applied)" if self._enabled
+                     else " (applies at enable)")
+        return {"gain_scale": self.gain_scale,
+                "gains": {n: {"kp": round(a.kp * self.gain_scale, 2),
+                              "kd": round(a.kd * math.sqrt(self.gain_scale), 3)}
+                          for n, a in self.adapters.items()}}
+
+    def _ctl_odrive_calibrate(self, args: dict) -> dict:
+        """Run each ODrive's FULL_CALIBRATION_SEQUENCE (joints=[...], default all):
+        once per power-up, legs hanging free, while DISABLED. THE MOTORS MOVE: a beep,
+        then each knee/ankle turns ~10-15 deg and back. Non-blocking: `status` shows
+        each drive's state (back to IDLE when done) and procedure_result (SUCCESS).
+        Voids those joints' calibration: `calibrate pose=...` again afterwards."""
         if self._enabled:
-            raise RuntimeError("refusing set_zero while enabled — disable first, "
-                               "pose the robot in the jig (URDF zero), then set_zero")
-        zeroed, skipped = [], []
-        for n, a in self.adapters.items():
-            st = a.read_state()
-            if not st["has_feedback"]:
-                if a.is_odrive:
-                    raise RuntimeError(f"{n}: no encoder feedback — check power/CAN "
-                                       f"(cannot zero a silent joint)")
-                # Damiao only reports while enabled; its zero is hardware-
-                # persistent anyway — keep it.
-                skipped.append(n)
-                continue
-            a.joint.set_zero()
-            a.calibrated = True
-            zeroed.append(n)
-        log.info("set_zero: current pose is now 0 rad for %s%s", sorted(zeroed),
-                 f" (kept hardware zero for silent {sorted(skipped)})" if skipped else "")
-        return {"calibrated": sorted(zeroed), "hardware_zero_kept": sorted(skipped)}
+            raise RuntimeError("refusing odrive_calibrate while enabled — disable first")
+        names = args.get("joints") or [n for n, a in self.adapters.items() if a.is_odrive]
+        bad = [n for n in names if n not in self.adapters or not self.adapters[n].is_odrive]
+        if bad:
+            raise RuntimeError(f"not ODrive joints of this fleet: {bad}")
+        silent = [n for n in names if not self.adapters[n].read_state()["has_feedback"]]
+        if silent:
+            raise RuntimeError(f"{silent}: no feedback — check power/CAN")
+        for n in names:
+            a = self.adapters[n]
+            a.joint.request_calibration()
+            a.calibrated = False          # the rotor moves; the joint zero is redone after
+        log.warning("odrive_calibrate: %s — the knee/ankle motors MOVE now (beep, then "
+                    "~10-15 deg and back); then calibrate pose=straight again", names)
+        return {"started": names,
+                "note": "watch status joints.<name>.drive: state back to IDLE and "
+                        "procedure_result SUCCESS; then calibrate pose=straight"}
 
     def _ctl_estop_reset(self, _args: dict) -> dict:
         if not self._estopped:
@@ -538,12 +673,12 @@ class MotorService:
             target_rad = cmd.target_pos[ipc.JOINT_INDEX[name]]
             if ipc.no_command(target_rad):
                 continue
-            native = a.clamp_native(a.to_native(float(target_rad)))
-            if abs(a.to_rad(native) - float(target_rad)) > 1e-6:
-                log.warning("%s: target %+.3f rad clamped to %+.3f rad (safety limit)",
-                            a.name, float(target_rad), a.to_rad(native))
-            a.joint.start_move(native, duration=self.move_duration)
-            a.target_rad = a.to_rad(native)
+            q = a.clamp_rad(float(target_rad))
+            if abs(q - float(target_rad)) > 1e-6:
+                log.warning("%s: target %+.3f rad clamped to %+.3f rad (measured stops "
+                            "- margin)", a.name, float(target_rad), q)
+            a.joint.start_move(a.to_native(q), duration=self.move_duration)
+            a.target_rad = q
 
     # ── state publishing ──────────────────────────────────────────
     def _publish_states(self, states: Dict[str, dict]):
@@ -589,16 +724,23 @@ class MotorService:
             if st["fault"]:
                 self._estop(f"{name} reported fault: {st['fault']}")
                 return
-            if a.vel_limit is not None and abs(st["vel_native"]) > a.vel_limit:
-                self._estop(f"{name} velocity {abs(st['vel_native']):.2f} > "
-                            f"{a.vel_limit:.2f} ({'turns/s' if a.is_odrive else 'rad/s'})")
+            if (self._enabled and a.is_odrive
+                    and a.joint.axis_state != AXIS_STATE_CLOSED_LOOP_CONTROL):
+                r = a.joint.drive_report()
+                self._estop(f"{name} left closed loop ({r['state']}, "
+                            f"{r['procedure_result']}, disarm_reason {r['disarm_reason']})")
                 return
-            if a.pos_hard_lo_rad is not None:
+            if abs(st["vel_rad"]) > a.vel_limit_rad:
+                self._estop(f"{name} velocity {abs(st['vel_rad']):.2f} > "
+                            f"{a.vel_limit_rad:.2f} rad/s")
+                return
+            # An uncalibrated ODrive's angle means nothing yet: not judged.
+            if a.stops is not None and a.calibrated:
                 p = st["pos_rad"]
-                if (p < a.pos_hard_lo_rad - POS_OVERTRAVEL_MARGIN or
-                        p > a.pos_hard_hi_rad + POS_OVERTRAVEL_MARGIN):
-                    self._estop(f"{name} position {p:+.3f} rad past mechanical limit "
-                                f"[{a.pos_hard_lo_rad:+.3f},{a.pos_hard_hi_rad:+.3f}]")
+                lo, hi = a.stops
+                if p < lo - POS_OVERTRAVEL_MARGIN or p > hi + POS_OVERTRAVEL_MARGIN:
+                    self._estop(f"{name} position {p:+.3f} rad past its measured stops "
+                                f"[{lo:+.3f},{hi:+.3f}] (+{POS_OVERTRAVEL_MARGIN} rad)")
                     return
             if abs(st["torque"]) > a.torque_idle_limit:
                 self._idle_joint(name, f"torque {abs(st['torque']):.2f} > "
@@ -643,7 +785,7 @@ class MotorService:
                 # re-zeroes its encoder: the boot-pose mapping is void either way.
                 a.calibrated = False
                 note = (" — its calibration is void (a rebooted ODrive re-zeroes its "
-                        "encoder): fold it to its stop and ctl `calibrate` again")
+                        "encoder): reference pose, then ctl `calibrate` again")
             self._estop(f"{name} feedback silent for {silent:.2f}s "
                         f"(> {FB_WATCHDOG_S}s watchdog){note}")
             return
@@ -740,6 +882,9 @@ def main():
     ap.add_argument("--rate", type=float, default=200.0, help="control loop Hz")
     ap.add_argument("--move-duration", type=float, default=0.0,
                     help="ramp time per received command; 0 = track directly (policy)")
+    ap.add_argument("--gain-scale", type=float, default=1.0,
+                    help="PD at this fraction of fleet_config's kp (kd x sqrt), "
+                         f"(0, {MAX_GAIN_SCALE}]; ctl `gains` changes it live")
     ap.add_argument("--only", default=None,
                     help="comma-separated joint names for a bench subset, "
                          "e.g. hip_left,lower_leg_left")
@@ -751,7 +896,8 @@ def main():
     only = [s.strip() for s in args.only.split(",")] if args.only else None
     svc = MotorService(dm_channel=args.dm_channel, od_channel=args.od_channel,
                        bustype=args.bustype, rate_hz=args.rate,
-                       move_duration=args.move_duration, only=only)
+                       move_duration=args.move_duration, only=only,
+                       gain_scale=args.gain_scale)
     svc.run()
 
 

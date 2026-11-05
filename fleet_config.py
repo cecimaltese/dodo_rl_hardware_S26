@@ -39,22 +39,40 @@ OD_CHANNEL = "can_od"
 BUSTYPE = "socketcan"
 BITRATE = 1_000_000   # set at OS level: sudo ip link set canX up type can bitrate 1000000
 
+# --- Joint-space PD gains -------------------------------------------------------
+# The PD stand's gains, per joint group: dodo_assets' mjcf/scene.xml (Shafeef), which
+# sim_service --scene runs. Joint-side units: kp [Nm/rad], kd [Nm s/rad].
+#   * Damiao: MIT mode is the same law at the output shaft (tau = kp*(q*-q) +
+#     kd*(qd*-qd)), so these go into every MIT frame as they are (damiao_motor:
+#     kp 0-500, kd 0-5).
+#   * ODrive: a cascaded P-PI on the MOTOR side. motor_service sets it over CAN at
+#     enable (real2sim.odrive_gains): vel_integrator_gain 0 makes it a PD, and with
+#     N = GEAR_RATIO, K = N^2 pos_gain vel_gain / 2pi, D = N^2 vel_gain / 2pi.
+# motor_service --gain-scale / ctl `gains` scales kp by s and kd by sqrt(s) (same
+# damping ratio) for soft first tests.
+JOINT_KP = {"hip": 150.0, "upper_leg": 150.0, "lower_leg": 50.0, "foot": 50.0}
+JOINT_KD = {"hip": 1.5, "upper_leg": 1.5, "lower_leg": 0.8, "foot": 0.8}
+
+
+def joint_group(joint: str) -> str:
+    """'hip', 'upper_leg', 'lower_leg' or 'foot' for a joint name."""
+    return joint.rsplit("_", 1)[0]
+
+
 # --- Damiao hips (roll + pitch) -------------------------------------------------
 # ids are already set on the physical motors. motor_type MUST be "4340P": the
 # DamiaoJointConfig default is "4310", a much weaker motor (+/-10 Nm vs +/-28 Nm), and
 # the preset drives the MIT-mode P/V/T encoding — a wrong one mis-scales every command.
-# TODO(bench): kp/kd 30/0.5 are the legacy values; the trained policy expects the
-# behavior of IsaacLab stiffness 32 / damping 3.0 — calibrate on the bench
-# (Damiao MIT units are NOT IsaacLab units; match step response, don't copy).
+# kp/kd: the PD stand's (JOINT_KP/JOINT_KD above). They were 30/0.5 until 2026-11-05.
 DM_JOINTS = [
     DamiaoJointConfig(name="hip_left",        motor_id=0x01, feedback_id=0x11,
-                      motor_type="4340P", kp=30.0, kd=0.5),  # left hip roll
+                      motor_type="4340P", kp=JOINT_KP["hip"], kd=JOINT_KD["hip"]),  # left hip roll
     DamiaoJointConfig(name="upper_leg_left",  motor_id=0x02, feedback_id=0x12,
-                      motor_type="4340P", kp=30.0, kd=0.5),  # left hip pitch
+                      motor_type="4340P", kp=JOINT_KP["upper_leg"], kd=JOINT_KD["upper_leg"]),  # left hip pitch
     DamiaoJointConfig(name="hip_right",       motor_id=0x05, feedback_id=0x15,
-                      motor_type="4340P", kp=30.0, kd=0.5),  # right hip roll
+                      motor_type="4340P", kp=JOINT_KP["hip"], kd=JOINT_KD["hip"]),  # right hip roll
     DamiaoJointConfig(name="upper_leg_right", motor_id=0x06, feedback_id=0x16,
-                      motor_type="4340P", kp=30.0, kd=0.5),  # right hip pitch
+                      motor_type="4340P", kp=JOINT_KP["upper_leg"], kd=JOINT_KD["upper_leg"]),  # right hip pitch
 ]
 
 # --- ODrive knees (lower_leg_*) + ankles (foot_*) -------------------------------
@@ -74,16 +92,13 @@ DM_JOINTS = [
 # 0x7FF), so there is no reason to renumber them. Node 0 would NOT be safe — its
 # window 0x000-0x01F swallows every Damiao command and feedback id.
 #
-# !! THE NODE -> JOINT ASSIGNMENT BELOW IS A GUESS !!
-# The scan proves WHICH nodes exist, not which leg each one drives. WS25 never
-# recorded a mapping either — it used the raw "can1:3" as the joint name throughout.
-# Ordering here is ascending-id = left-knee/left-ankle/right-knee/right-ankle purely
-# as a placeholder. VERIFY PHYSICALLY (command one node a few degrees on the gantry,
-# see which joint moves) before commanding motion — a swapped knee/ankle is exactly
-# as destructive as the L/R sign mirroring.
+# The node -> joint assignment below was a placeholder (ascending id = left knee, left
+# ankle, right knee, right ankle) until 2026-11-05: the calibration's main pass, which
+# picks the motor that MOVED, measured exactly this mapping for all four (joint_calib's
+# `motor` fields), and --ratio re-checked the knees and ankles.
 #
-# TODO(user): set soft pos_min/pos_max (TURNS) per joint. ODrive position is otherwise
-# unclamped except by JOINT_LIMITS_RAD below, which assumes direct drive (see NOTE).
+# Position limits: motor_service clamps in joint radians against the measured stops
+# (STOP_MARGIN_RAD, real2sim.command_band); pos_min/pos_max (turns) stay unset.
 OD_JOINTS = [
     OdriveCanJointConfig(name="lower_leg_left",  node_id=3, vel_limit=10.0, rated_torque=9.0),
     OdriveCanJointConfig(name="foot_left",       node_id=4, vel_limit=10.0, rated_torque=9.0),
@@ -92,45 +107,34 @@ OD_JOINTS = [
 ]
 
 # --- Physical constraints of the legs/body --------------------------------------
-# Mechanical range of each joint, in RADIANS — the single source of truth for position
-# safety. _JointAdapter converts to each motor's native units (Damiao=rad, ODrive=turns).
-#
-# The Damiao rows are REAL MEASURED ranges (2026-07-06), NOT the URDF's (which gives
-# both sides identical symmetric limits, hip +/-0.35 and upper_leg +/-1.57, on the same
-# axis). They are asymmetric and left/right mirrored, which means different things for
-# the two pairs (2026-11-04):
-#   * hip roll: mirrored is EXPECTED. Both hips share the +x axis, so +roll swings
-#     EITHER foot toward the robot's left: outward for the left leg, inward for the
-#     right. Symmetric stops therefore read (-in, +out) on the left and (-out, +in) on
-#     the right. Consistent with July's calibration, which found sign +1 on both.
-#   * hip pitch: mirrored is NOT expected (it is the same motion on both legs), so
-#     (-0.32, 2.38) vs (-2.30, 0.29) points to ONE upper_leg motor reading inverted
-#     vs the URDF. July's calibration never measured this pair.
-# Either way there is NO per-joint sign/zero layer in the control path yet: calibrate
-# (calibrate_joints.py) before commanding motion. The ODrive rows are still the URDF
-# values = UNMEASURED.
-JOINT_LIMITS_RAD = {
-    # Damiao — measured on the robot
-    "hip_left":        (-0.966,  0.641),  "hip_right":       (-0.544, 1.104),   # hip roll
-    "upper_leg_left":  (-0.324,  2.379),  "upper_leg_right": (-2.303, 0.293),   # hip pitch
-    # ODrive — URDF values, NOT yet measured
-    "lower_leg_left":  (-3.1416, 1.3963), "lower_leg_right": (-3.1416, 1.3963), # knee
-    "foot_left":       (-1.05,   1.57),   "foot_right":      (-1.05,   1.57),   # ankle
+# The MECHANICAL STOPS are measured, not configured: joint_calib.py's sim_lo/sim_hi
+# (calibrate_joints.py --limits, 2026-11-05), in sim radians, read through
+# real2sim.stops(). motor_service e-stops a joint measured past them (+ its
+# POS_OVERTRAVEL_MARGIN) and clamps commands STOP_MARGIN_RAD inside them
+# (real2sim.command_band). The July JOINT_LIMITS_RAD table that used to be here was in
+# the raw motor frame (no sign/zero) and went with the calibration wiring.
+
+# Reference poses for motor_service's ctl `calibrate`: where the ODrive joints (knees,
+# ankles) physically ARE when it runs, in sim radians. An ODrive zeroes its encoder at
+# power-up, so this is how its angle is re-established every session (no homing drive:
+# it could overload the 3D-printed parts and belts). The Damiaos keep their measured
+# zero (joint_calib.py) across power cycles and aren't touched.
+#   straight  legs hanging straight down on the gantry: thigh and shank as in the
+#             calibration's zero pose (the URDF's q = 0: the knee housing jogs forward,
+#             the soles level). Set by eye, so good to a few degrees.
+# TODO: the bird SITTING pose (HANDOFF §3), with the knees/ankles against measured
+# stops, once it's measured on the robot.
+REFERENCE_POSES = {
+    "straight": {"lower_leg_left": 0.0, "lower_leg_right": 0.0,
+                 "foot_left": 0.0, "foot_right": 0.0},
 }
 
-# Boot pose: where the ODrive joints physically ARE at power-on. The startup convention
-# (no homing drive — it could overload the 3D-printed structure/belts): switch the robot
-# on with the knees and ankles folded ALL THE WAY BACK against their mechanical stops;
-# motor_service's ctl `calibrate` then maps each joint's turns-since-boot onto these
-# angles. These are the URDF limits = PLACEHOLDERS. `calibrate_joints.py --limits`
-# measures the real stops (its sim_lo/sim_hi) — put those here once measured. Verify
-# after `calibrate`: `dodo_ctl status` must show these values, and nudging each joint by
-# hand must change it with the expected sign. The e-stop over-travel margin covers ±0.10
-# rad of error.
-BOOT_POSE_RAD = {
-    "lower_leg_left": -3.1416, "lower_leg_right": -3.1416,  # knee folded back (min limit)
-    "foot_left": 1.57,         "foot_right": 1.57,          # foot folded against shank (max limit)
-}
+# Joint torque the ODrives report: Get_Torques' estimate is Iq x
+# motor.config.torque_constant, i.e. MOTOR-side Nm when torque_constant is 8.27/KV
+# (0.0276 Nm/A for the KV300 MN4004), as configured by WS25 (assumed, not read back).
+# motor_service multiplies by GEAR_RATIO for joint Nm (gearbox losses ignored). If a
+# drive's torque_constant was set to include the gearing, this must become False.
+ODRIVE_TORQUE_IS_MOTOR_SIDE = True
 
 # Rated torque per joint (URDF effort limits, Nm): hips/upper 27, knee/ankle 9.
 # Matches the damiao_motor "4340P" preset (+/-28 Nm) for the hips.
@@ -143,9 +147,8 @@ JOINT_VEL_LIMIT_RAD = 6.0    # URDF velocity limit (rad/s), same for all joints.
 
 # Position commands are clamped this far INSIDE each joint's measured hard stops
 # (joint_calib.py's sim_lo/sim_hi, in sim radians: real2sim.command_band). A fixed
-# margin, unlike JOINT_LIMITS_RAD x SAFETY_FACTOR, which shrinks toward 0 rad and gives
-# lopsided margins. sim_service clamps this way since 2026-11-05; motor_service follows
-# with the calibration wiring (HANDOFF §2 step 5).
+# margin, unlike the old 0.9 x limit, which shrank toward 0 rad and gave lopsided
+# margins. motor_service and sim_service both clamp this way (2026-11-05).
 STOP_MARGIN_RAD = 0.10
 
 # Feedback older than this is not "current". Both drivers cache their last frame

@@ -178,9 +178,9 @@ class ZmqEnv(Env):
                             "bench only!")
             else:
                 raise RuntimeError(
-                    "joints not calibrated (ODrive zeros unset). Power on with "
-                    "the legs folded at the stops, then tools/dodo_ctl.py "
-                    "calibrate (or set_zero in the jig), then enable. "
+                    "joints not calibrated (ODrive zeros unset). Put the knees and "
+                    "ankles in a reference pose (legs hanging straight), then "
+                    "tools/dodo_ctl.py calibrate --pose straight, then enable. "
                     "(allow_uncalibrated=True to override on the bench.)")
         if "base_lin_vel" in self.obs_cfg.terms and not self._imu.lin_vel_valid:
             raise RuntimeError(

@@ -196,6 +196,10 @@ class SimService:
             adr, dim = m.sensor_adr[sid], m.sensor_dim[sid]
             self._sens[name] = slice(adr, adr + dim)
         self._body_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "body")
+        # Scene mode: the actuators' own gains, for ctl `gains` (motor_service's rule).
+        self._kp0 = m.actuator_gainprm[:, 0].copy()
+        self._kd0 = -m.actuator_biasprm[:, 2].copy()
+        self.gain_scale = 1.0
         self._ropes = [t for t in range(m.ntendon)
                        if m.tendon(t).name.startswith("gantry_rope")]
 
@@ -218,10 +222,12 @@ class SimService:
             "enable": self._ctl_enable,
             "disable": self._ctl_disable,
             "calibrate": lambda a: {"note": "sim is always calibrated"},
+            "odrive_calibrate": lambda a: {"note": "sim drives are always calibrated"},
             "set_zero": lambda a: {"note": "sim is always calibrated"},
             "estop_reset": lambda a: {"note": "sim has no e-stop"},
             "reset": self._ctl_reset,
             "gantry": self._ctl_gantry,
+            "gains": self._ctl_gains,
         }
 
         self.viewer = None
@@ -282,9 +288,15 @@ class SimService:
                "while_enabled": dict(self.track)}
         if self._ropes:
             sim["gantry"] = self._gantry_state()
+        m = self.model
+        gains = ({j: {"kp": round(float(m.actuator_gainprm[a, 0]), 3),
+                      "kd": round(float(-m.actuator_biasprm[a, 2]), 4)}
+                  for j, a in zip(ipc.JOINT_ORDER, self._act_id)} if self.scene
+                 else {j: {"kp": KP, "kd": KD} for j in ipc.JOINT_ORDER})
         return {
             "backend": "sim",
             "enabled": self._enabled,
+            "gain_scale": self.gain_scale,
             "estopped": False,
             "all_calibrated": True,
             "sim_time_s": round(self.data.time, 3),
@@ -293,6 +305,7 @@ class SimService:
             "joints": {
                 j: {"type": "sim", "pos_rad": round(float(self.data.qpos[qa]), 4),
                     "target_rad": round(float(t), 4) if self._enabled else None,
+                    **gains[j],
                     "has_feedback": True, "calibrated": True, "idled": False,
                     "fault": None}
                 for j, qa, t in zip(ipc.JOINT_ORDER, self._qpos_adr, self._targets)},
@@ -322,6 +335,26 @@ class SimService:
         self._reset_pose()
         log.info("sim reset to the start pose")
         return {"reset": True}
+
+    def _ctl_gains(self, a: dict) -> dict:
+        """scale=<s>: like motor_service, kp x s and kd x sqrt(s) of the scene's
+        actuators, 0 < s <= 1 (--scene only)."""
+        if not self.scene:
+            raise RuntimeError("gains: --scene only (the stand-policy model's PD is fixed)")
+        if "scale" in a:
+            s = float(a["scale"])
+            if not 0.0 < s <= 1.0:
+                raise RuntimeError(f"scale {s}: must be in (0, 1]")
+            self.set_gain_scale(s)
+        return {"gain_scale": self.gain_scale}
+
+    def set_gain_scale(self, s: float) -> None:
+        m = self.model
+        kp, kd = self._kp0 * s, self._kd0 * math.sqrt(s)
+        m.actuator_gainprm[:, 0], m.actuator_biasprm[:, 1] = kp, -kp
+        m.actuator_biasprm[:, 2] = -kd
+        self.gain_scale = s
+        log.info("gain scale %.2f", s)
 
     def _gantry_state(self) -> dict:
         r = self.model.tendon_range[self._ropes, 1]
@@ -546,6 +579,9 @@ def main():
                     help="--scene: stiffness per joint group [Nm/rad] (default scene.xml)")
     ap.add_argument("--kd", type=float, nargs=4, metavar=GROUPS,
                     help="--scene: damping per joint group [Nm s/rad] (default scene.xml)")
+    ap.add_argument("--gain-scale", type=float, default=1.0,
+                    help="--scene: start at this fraction of the gains (kp x s, kd x "
+                         "sqrt s), like motor_service; ctl `gains` changes it")
     ap.add_argument("--render", action="store_true")
     ap.add_argument("--require-enable", action="store_true",
                     help="start disabled, like the real motor_service "
@@ -575,6 +611,10 @@ def main():
             svc = SimService(urdf_path=str(assets.require(args.urdf)), **common)
     except FileNotFoundError as e:
         raise SystemExit(str(e))
+    if args.gain_scale != 1.0:
+        if not args.scene or not 0.0 < args.gain_scale <= 1.0:
+            raise SystemExit("--gain-scale needs --scene and a value in (0, 1]")
+        svc.set_gain_scale(args.gain_scale)
     svc.run()
 
 

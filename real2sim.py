@@ -136,6 +136,24 @@ def command_band(joint: str, path=CALIB_PATH,
     return (s[0] + m, s[1] - m)
 
 
+def odrive_gains(joint: str, kp: float, kd: float) -> Tuple[float, float, float]:
+    """A joint-space PD (kp [Nm/rad], kd [Nm s/rad]) as an ODrive's cascaded gains:
+    (pos_gain [(turns/s)/turn], vel_gain [Nm/(turns/s)], vel_integrator_gain = 0).
+
+    The ODrive runs vel* = pos_gain * (pos* - pos), torque = vel_gain * (vel* - vel)
+    (+ an integrator, off here: with one, it isn't a PD) on the MOTOR shaft, in turns
+    and motor Nm. Through N motor turns per joint turn and N times the torque:
+        kp = N^2 pos_gain vel_gain / 2pi,    kd = N^2 vel_gain / 2pi.
+    Assumes the drive's torque_constant is the motor's own (fleet_config.
+    ODRIVE_TORQUE_IS_MOTOR_SIDE) and ignores gearbox losses."""
+    n = gear_ratio(joint)
+    if kd <= 0:
+        raise ValueError(f"{joint}: kd must be > 0 for an ODrive PD (vel_gain = 0 is no "
+                         f"control at all), got {kd}")
+    vel_gain = kd * TWO_PI / (n * n)
+    return kp / kd, vel_gain, 0.0
+
+
 def load(path=CALIB_PATH) -> Tuple[Dict[str, JointCal], List[str]]:
     """Every fleet joint's map, and warnings. A joint with no usable joint_calib entry
     gets the identity placeholder (measured=False), never a guess."""
