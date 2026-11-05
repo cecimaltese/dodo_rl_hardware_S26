@@ -14,6 +14,8 @@ dodo_ctl.py — send ctl commands to the motor service (real or sim).
     python3 tools/dodo_ctl.py estop_reset     # clears the latch; motors stay
                                               # disabled until you 'enable'
     python3 tools/dodo_ctl.py reset           # sim_service only: re-pose robot
+    python3 tools/dodo_ctl.py gantry --arg lower=0.03   # sim_service --gantry only:
+    python3 tools/dodo_ctl.py gantry --arg release=true #   pay out rope / let go
 
 Bring-up order on the real robot:
     power on folded → status → calibrate → status (VERIFY the boot angles!)
@@ -31,7 +33,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import dodo_ipc as ipc  # noqa: E402
 
 KNOWN = ["status", "calibrate", "enable", "disable", "set_zero",
-         "estop_reset", "reset"]
+         "estop_reset", "reset", "gantry"]
+
+
+def parse_arg(text: str):
+    """key=value; the value as JSON if it parses (0.03, true), else a string."""
+    key, sep, value = text.partition("=")
+    if not sep or not key:
+        raise argparse.ArgumentTypeError(f"expected key=value, got {text!r}")
+    try:
+        return key, json.loads(value)
+    except json.JSONDecodeError:
+        return key, value
 
 
 def main():
@@ -40,10 +53,12 @@ def main():
     ap.add_argument("cmd", help=f"one of {KNOWN} (or any cmd the service knows)")
     ap.add_argument("--pose", default=None,
                     help="calibrate only: assumed power-on pose (default 'boot')")
+    ap.add_argument("--arg", type=parse_arg, action="append", default=[],
+                    metavar="KEY=VALUE", help="extra argument for the command (repeatable)")
     ap.add_argument("--timeout", type=float, default=3.0)
     args = ap.parse_args()
 
-    kwargs = {}
+    kwargs = dict(args.arg)
     if args.pose is not None:
         kwargs["pose"] = args.pose
 

@@ -14,6 +14,7 @@ without the checkout. Whatever loads a file calls require() for a clear message.
 from __future__ import annotations
 
 import os
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
@@ -36,3 +37,20 @@ def require(path=URDF_PATH) -> Path:
                 if path.is_relative_to(ASSETS_DIR) else "")
         raise FileNotFoundError(f"{path} not found. {hint}".rstrip())
     return path
+
+
+def scene_pose(name: str, scene_path=SCENE_PATH) -> dict:
+    """{joint: rad} of a keyframe in scene.xml ("home", "straight"), read from its
+    `ctrl` (the joint targets, in actuator order) without MuJoCo, so ZMQ clients such
+    as tools/dodo_startup.py can use the poses Shafeef's scene defines."""
+    root = ET.parse(require(scene_path)).getroot()
+    joints = [a.get("joint") for a in root.find("actuator")]
+    for key in root.iter("key"):
+        if key.get("name") == name:
+            ctrl = [float(v) for v in key.get("ctrl").split()]
+            if len(ctrl) != len(joints):
+                raise ValueError(f"{scene_path}: key '{name}' has {len(ctrl)} ctrl values "
+                                 f"for {len(joints)} actuators")
+            return dict(zip(joints, ctrl))
+    names = [k.get("name") for k in root.iter("key")]
+    raise KeyError(f"no keyframe '{name}' in {scene_path} (has {names})")

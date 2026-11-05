@@ -141,6 +141,13 @@ RATED_TORQUE_NM = {
 
 JOINT_VEL_LIMIT_RAD = 6.0    # URDF velocity limit (rad/s), same for all joints.
 
+# Position commands are clamped this far INSIDE each joint's measured hard stops
+# (joint_calib.py's sim_lo/sim_hi, in sim radians: real2sim.command_band). A fixed
+# margin, unlike JOINT_LIMITS_RAD x SAFETY_FACTOR, which shrinks toward 0 rad and gives
+# lopsided margins. sim_service clamps this way since 2026-11-05; motor_service follows
+# with the calibration wiring (HANDOFF §2 step 5).
+STOP_MARGIN_RAD = 0.10
+
 # Feedback older than this is not "current". Both drivers cache their last frame
 # forever, so every consumer must check feedback_age() against this instead of
 # trusting the cached numbers. Healthy rates: ODrive cyclic encoder frames every 10 ms

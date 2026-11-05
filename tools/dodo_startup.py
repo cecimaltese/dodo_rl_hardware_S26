@@ -10,7 +10,9 @@ folded all the way back against their mechanical stops. This tool then:
                    (skipped if already calibrated)
     3. enable      bumpless; the service slowly unparks joints into the
                    safety band
-    4. ramp        smoothstep all joints to the DEFAULT (policy home) pose
+    4. ramp        smoothstep all joints to the stand pose (--pose: a dodo_assets
+                   scene.xml keyframe, `home` by default, or `default` = the
+                   vendored stand policy's rl_env.DEFAULT_JOINT_POS)
     5. hold        stand there, printing state, until Ctrl-C / --hold-secs
     6. park        ramp gently BACK toward the boot pose, then disable —
                    the legs fold instead of collapsing (skip: --no-park)
@@ -20,6 +22,7 @@ become the policy); rehearse here first. Works against sim_service too.
 
     python3 tools/dodo_startup.py                 # full ritual, asks first
     python3 tools/dodo_startup.py --ramp 8 --yes  # slower, no questions
+    python3 tools/dodo_startup.py --pose straight # any scene.xml keyframe
 """
 from __future__ import annotations
 
@@ -31,8 +34,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import assets  # noqa: E402
 import dodo_ipc as ipc  # noqa: E402
 from rl_env import DEFAULT_JOINT_POS  # noqa: E402
+
+
+def stand_pose(name: str) -> dict:
+    """{joint: rad} for --pose: `default` = the vendored stand policy's default pose,
+    anything else a keyframe of dodo_assets' scene.xml (Shafeef's `home`, `straight`)."""
+    return dict(DEFAULT_JOINT_POS) if name == "default" else assets.scene_pose(name)
 
 
 def smoothstep(s: float) -> float:
@@ -48,6 +58,23 @@ def fresh_states(sub: ipc.Subscriber, timeout_s: float = 2.0):
             return m
         time.sleep(0.02)
     raise SystemExit("no motor_states — is motor_service (or sim_service) running?")
+
+
+def start_targets(ctl: ipc.CtlClient, states: ipc.MotorStates, present) -> list:
+    """Where the first ramp starts: each joint's held TARGET (status `target_rad`), else
+    its measured angle. Not the measured angles alone: under load a PD-held joint sags
+    below its target, and commanding the sagged angle drops the preload that holds the
+    robot up (in sim, 0.7 deg at the ankles tips the PD stand over). Right after a
+    bumpless enable the two agree anyway."""
+    joints = ctl.request("status").get("joints", {})
+    out = []
+    for i, name in enumerate(ipc.JOINT_ORDER):
+        if name not in present:
+            out.append(ipc.NO_COMMAND)
+            continue
+        t = joints.get(name, {}).get("target_rad")
+        out.append(states.pos[i] if t is None else float(t))
+    return out
 
 
 def ramp_to(pub: ipc.Publisher, sub: ipc.Subscriber, loop: ipc.RateLoop,
@@ -70,8 +97,11 @@ def ramp_to(pub: ipc.Publisher, sub: ipc.Subscriber, loop: ipc.RateLoop,
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--pose", default="home",
+                    help="stand pose: a scene.xml keyframe (home, straight) or 'default' "
+                         "(the vendored stand policy's). Default: home")
     ap.add_argument("--ramp", type=float, default=5.0,
-                    help="seconds for the boot->default (and park) ramp")
+                    help="seconds for the start->stand pose (and park) ramp")
     ap.add_argument("--hold-secs", type=float, default=0.0,
                     help="hold this long, then park (0 = hold until Ctrl-C)")
     ap.add_argument("--rate", type=float, default=50.0, help="command rate [Hz]")
@@ -80,6 +110,12 @@ def main():
                          "folding back to the start pose first")
     ap.add_argument("--yes", action="store_true", help="don't ask before enabling")
     args = ap.parse_args()
+    try:
+        pose = stand_pose(args.pose)
+    except (KeyError, FileNotFoundError) as e:
+        raise SystemExit(str(e))
+    print(f"stand pose '{args.pose}': " + ", ".join(
+        f"{j} {pose[j]:+.2f}" for j in ipc.JOINT_ORDER if j in pose))
 
     ctl = ipc.CtlClient()
 
@@ -112,7 +148,7 @@ def main():
 
     # 3) enable -----------------------------------------------------------------
     if not args.yes:
-        ans = input("\nEnable motors and ramp to the default pose? [y/N] ")
+        ans = input(f"\nEnable motors and ramp to '{args.pose}'? [y/N] ")
         if ans.strip().lower() not in ("y", "yes"):
             raise SystemExit("aborted (nothing enabled).")
     rep = ctl.request("enable")
@@ -132,17 +168,15 @@ def main():
 
     states = fresh_states(sub)
     present = set(joints)
-    q_start = [states.pos[i] if ipc.JOINT_ORDER[i] in present else ipc.NO_COMMAND
-               for i in range(ipc.N_JOINTS)]
-    q_home = [DEFAULT_JOINT_POS.get(ipc.JOINT_ORDER[i], 0.0)
-              if ipc.JOINT_ORDER[i] in present else ipc.NO_COMMAND
+    q_start = start_targets(ctl, states, present)
+    q_home = [pose[ipc.JOINT_ORDER[i]] if ipc.JOINT_ORDER[i] in present else ipc.NO_COMMAND
               for i in range(ipc.N_JOINTS)]
 
     try:
-        ramp_to(pub, sub, loop, q_start, q_home, args.ramp, "ramp to default pose")
+        ramp_to(pub, sub, loop, q_start, q_home, args.ramp, f"ramp to '{args.pose}'")
 
         # 5) hold ---------------------------------------------------------------
-        print("[hold] at the default pose — Ctrl-C to fold back down." if
+        print(f"[hold] at '{args.pose}' — Ctrl-C to fold back down." if
               not args.hold_secs else f"[hold] {args.hold_secs:.0f}s ...")
         t0 = time.monotonic()
         last_print = 0.0
@@ -166,9 +200,8 @@ def main():
     finally:
         try:
             if not args.no_park:
-                states = fresh_states(sub)
-                q_now = [states.pos[i] if ipc.JOINT_ORDER[i] in present else ipc.NO_COMMAND
-                         for i in range(ipc.N_JOINTS)]
+                # From the targets being held now, not the measured (sagged) angles.
+                q_now = start_targets(ctl, fresh_states(sub), present)
                 ramp_to(pub, sub, loop, q_now, q_start, args.ramp,
                         "park (folding back)")
         except KeyboardInterrupt:

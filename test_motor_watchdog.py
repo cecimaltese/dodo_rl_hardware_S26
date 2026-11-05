@@ -237,6 +237,38 @@ def test_silent_damiao_while_enabled_estops(service, fleet):
     assert not st["enabled"]
 
 
+def test_status_reports_the_held_targets(service, fleet):
+    """`target_rad`: None while disabled; after the bumpless enable each joint's held
+    setpoint (its measured angle, or the band edge it unparks to); after a command,
+    that command (clamped). tools/dodo_startup.py ramps from these, not from the
+    measured angles, which sag below the targets under load."""
+    _, ctl = service
+    time.sleep(ms.STARTUP_GRACE_S)
+    assert ctl.request("calibrate")["ok"]
+    assert all(j["target_rad"] is None for j in status(ctl)["joints"].values())
+    rep = ctl.request("enable")
+    assert rep["ok"], rep
+    st = status(ctl)
+    for name, j in st["joints"].items():
+        want = rep["unparking"][name]["to_rad"] if name in rep["unparking"] else j["pos_rad"]
+        assert j["target_rad"] == pytest.approx(want, abs=2e-3), (name, j)
+
+    pub = ipc.Publisher(ipc.TOPIC_MOTOR_COMMANDS)
+    try:
+        time.sleep(0.3)                              # let the SUB connect
+        cmd = [ipc.NO_COMMAND] * ipc.N_JOINTS
+        cmd[ipc.JOINT_INDEX["hip_left"]] = 0.01
+        for _ in range(5):
+            pub.send(ipc.MotorCommands(target_pos=cmd))
+            time.sleep(0.02)
+        st = wait_for(lambda: (s := status(ctl))["joints"]["hip_left"]["target_rad"]
+                      == pytest.approx(0.01, abs=1e-4) and s, 1.0, "the commanded target")
+    finally:
+        pub.close()
+    assert ctl.request("disable")["ok"]
+    assert all(j["target_rad"] is None for j in status(ctl)["joints"].values())
+
+
 def test_published_flag_is_fresh_feedback(service, fleet):
     """JF_HAS_FEEDBACK on the wire means 'reporting now', not 'reported once'."""
     _, ctl = service

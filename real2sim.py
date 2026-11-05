@@ -113,6 +113,29 @@ def entry_ratio_problem(joint: str, entry: dict) -> Optional[str]:
     return None
 
 
+def stops(path=CALIB_PATH) -> Dict[str, Tuple[float, float]]:
+    """Each joint's measured hard stops in sim radians, (sim_lo, sim_hi): the durable
+    half of joint_calib.py. A joint without both, or whose entry today's gear ratio
+    refuses, is left out, never guessed."""
+    out = {}
+    for j, e in read_calib(path).items():
+        if (e.get("sim_lo") is not None and e.get("sim_hi") is not None
+                and entry_ratio_problem(j, e) is None):
+            out[j] = (float(e["sim_lo"]), float(e["sim_hi"]))
+    return out
+
+
+def command_band(joint: str, path=CALIB_PATH,
+                 margin: float = None) -> Optional[Tuple[float, float]]:
+    """Where a position command for `joint` may go, in sim radians: the measured stops
+    pulled in by fleet_config.STOP_MARGIN_RAD. None if the stops aren't measured."""
+    s = stops(path).get(joint)
+    if s is None:
+        return None
+    m = fleet_config.STOP_MARGIN_RAD if margin is None else margin
+    return (s[0] + m, s[1] - m)
+
+
 def load(path=CALIB_PATH) -> Tuple[Dict[str, JointCal], List[str]]:
     """Every fleet joint's map, and warnings. A joint with no usable joint_calib entry
     gets the identity placeholder (measured=False), never a guess."""

@@ -92,10 +92,15 @@ the robot yet.
    Clamp in joint radians against the measured stops (a fixed margin, not today's 0.9 ×
    limit, which shrinks toward 0 and gives lopsided margins). ODrive torque into joint
    Nm (2026-11-05 log) before the IDLE check means anything.
-6. **PD standing controller** (roadmap 3), on the gantry: bring-up steps 5–6 first (one
-   joint, a few degrees; then `tools/dodo_startup.py`, which already enables, ramps to the
-   default crouch and holds it — that IS a joint-space PD stand). Then the gains toward the
-   trained kp 32 / kd 3 behavior (MIT units ≠ Isaac Lab units: match the step response).
+6. **PD standing controller** (roadmap 3). *In sim: done 2026-11-05* (`sim_service.py
+   --scene --gantry`, README *Rehearse the PD stand in sim first*; log 11-05 (e)). On the
+   robot, on the gantry: bring-up steps 5–6 (one joint, a few degrees; then
+   `tools/dodo_startup.py --pose home` in the air, lower, let the ropes go slack). Gains
+   = `scene.xml`'s: the Damiao MIT kp/kd take 150/1.5 as they are; the ODrives need
+   `vel_integrator_gain` 0 and the pos/vel gains from log 11-05 (c). The stand has little
+   margin forward (log 11-05 (e)): keep the gantry close to taut, and watch which way
+   it wants to tip. Re-take the weight before ending `dodo_startup` (its park ends limp).
+   Prerequisite: step 5.
 7. **Shafeef's standing policy** (roadmap 4): adapt `rl_env.py` to its contract, add the
    run to `policies/`, rehearse on `sim_service`, then the gantry. Before it runs on the
    robot, settle the IMU's pitch (below).
@@ -159,6 +164,52 @@ if it still reads ~3°. Optional: weigh the robot (the CAD says 4.72 kg).
 ---
 
 ## 4. Log (newest first)
+
+### 2026-11-05 (e) — the PD stand in sim, through the robot's own stack
+Roadmap step 3 in sim (the user's plan: sim, then the robot, then a policy).
+- **`sim_service.py --scene`:** `dodo_assets`' `scene.xml` as the virtual robot. Its
+  MuJoCo position actuators (an implicit PD, like the drives' own loops) run at
+  kp 150/150/50/50 and kd 1.5/1.5/0.8/0.8 (`--kp/--kd` per group). Physics is 1 ms × 5
+  per 5 ms tick, so states stay at motor_service's 200 Hz; scene.xml says 2 ms. The IMU
+  is the MJCF's chip-frame sensors through `imu_protocol`'s AXIS_REMAP (new public
+  `board_to_base`, `board_quat_to_base`), so the deployment remap is exercised too.
+  Keyframe start (`--start home|straight`); disabled = actuation off = limp. The
+  default (stand-policy) model is unchanged apart from the two fixes below.
+- **`--gantry`:** four ropes (limited spatial tendons) from fixed anchors to the
+  body's top face, hanging the robot 3 cm above the floor with straight legs. ctl
+  `gantry` lowers (`lower=<m>`), sets (`length=`) or `release`s them (`dodo_ctl.py
+  --arg key=value`, new). `status` has a `sim` section: base height, tilt, gantry, and
+  the worst height/tilt since enable.
+- **Rehearsed with the real CLI processes:** hang limp (0.476 m, 4 ropes taut) →
+  `dodo_startup.py --pose home` → `home` in the air (0.002 rad error) → lower 12 cm
+  (ropes slack) → release → stands at 0.412 m, 3.6° forward lean (5.8° at most on
+  landing), up to 0.05 rad knee sag under load. That is `pd_stand.py`'s result.
+  The park after release ends limp on the floor (base 0.18 m): on the robot, re-take
+  the weight first. `test_sim_scene.py` covers both rehearsals (floor and gantry).
+- **Found: re-targeting a standing robot at its MEASURED angles tips it over.** Under
+  load the joints sag below their PD targets (0.2–0.7°; ankles most). Commanding the
+  sagged angles drops that preload, and the robot falls forward with no ramp at all.
+  `dodo_startup` did exactly that (its ramp started from `states.pos`), and so did the
+  sim's `enable` when already enabled. Fixed: both services report each joint's held
+  setpoint as `target_rad` in `status` (motor_service: status-only, set where it
+  already sets the setpoints, None while disabled/idled; tested on the virtual bus),
+  `dodo_startup` ramps and parks from those, and a second `enable` is a no-op in the
+  sim too (as in motor_service). On the gantry in the air the two agree, which is why
+  the gantry procedure never showed it.
+- **Found: the PD stand has little forward margin.** Settled, the whole-robot COM sits
+  22 mm behind the toe edge in `straight` (foot 95 mm), and 38 mm from the toe / 57 mm
+  from the heel in `home`. `home` survives a 0.1 s push of 6 N forward and 10 N back.
+  +0.03 rad more toe-down at the ankles moves it to 56/39 mm (10 N forward, 6 N back);
+  about +0.015 would center it. The real COM is CAD's (no cables; never weighed), so
+  the real margin is unknown: `home` rather than `straight` for the first ground
+  test, and watch which way it wants to tip.
+- **Clamps (both models):** position commands now stop `fleet_config.STOP_MARGIN_RAD`
+  (0.10) inside the measured stops, in sim radians (`real2sim.stops/command_band`). The
+  old `JOINT_LIMITS_RAD × 0.9` was July's raw frame and clamped `home`'s
+  upper_leg_right 0.45 to 0.26. motor_service still clamps the old way until step 5.
+- `dodo_startup.py --pose <scene keyframe | default>` (default `home`, read from
+  scene.xml by `assets.scene_pose`, no MuJoCo needed). Suite: 189 passed, 1 known
+  failure, 1 skip.
 
 ### 2026-11-05 (d) — the robot model lives only in `dodo_assets`; `description/` deleted
 Decided by the user: one robot model, in `Atarilab/dodo_assets`, as a step toward one

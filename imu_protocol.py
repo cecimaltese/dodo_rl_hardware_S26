@@ -171,6 +171,18 @@ _Q_REMAP_CONJ = (_Q_REMAP_CONJ[0], -_Q_REMAP_CONJ[1],
                  -_Q_REMAP_CONJ[2], -_Q_REMAP_CONJ[3])
 
 
+def board_to_base(v) -> Tuple[float, float, float]:
+    """A board-frame vector (accel, gyro, velocity) in the robot base frame."""
+    return _remap(float(v[0]), float(v[1]), float(v[2]))
+
+
+def board_quat_to_base(q) -> Tuple[float, float, float, float]:
+    """A board->world orientation (w, x, y, z) as the base's orientation. The same
+    remap for the real chip's fused quaternion and for a simulated sensor that reads
+    in the chip frame (dodo_assets' MJCF `imu` site, used by sim_service --scene)."""
+    return _quat_mul(tuple(float(x) for x in q), _Q_REMAP_CONJ)
+
+
 def parse_raw_line(line: str) -> Optional[list]:
     """Parse an 'ALL' line into RAW SENSOR COUNTS — unscaled AND unremapped.
 
@@ -232,7 +244,7 @@ def parse_imu_line(line: str,
         if abs(qw) + abs(qx) + abs(qy) + abs(qz) > 1e-6:
             # Rotate board-frame orientation into the base frame (see _Q_REMAP_CONJ).
             # No-op while AXIS_REMAP is identity.
-            out["quat"] = _quat_mul((qw, qx, qy, qz), _Q_REMAP_CONJ)
+            out["quat"] = board_quat_to_base((qw, qx, qy, qz))
     return out
 
 

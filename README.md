@@ -177,13 +177,37 @@ python3 tools/dodo_ctl.py status                 # VERIFY the stop angles match 
 # 5) One joint, a few degrees: prove direction, clamps and the e-stop
 python3 demo_combined.py --joints hip_left --amp 0.05
 
-# 6) The default pose without a policy: enable, ramp to the crouch, hold, fold back on exit
-python3 tools/dodo_startup.py
+# 6) The PD stand without a policy: enable, ramp to `home`, hold, fold back on exit.
+#    Rehearse it in sim first (below). Before ending it on the floor, take the
+#    weight on the gantry again: the park ends in `disable`, and the legs go limp.
+python3 tools/dodo_startup.py --pose home
 
 # 7) Only then, a policy
 python3 run_policy.py --backend zmq --task stand \
     --policy policies/dodo_stand/2026-06-30_18-44-06/exported/policy.onnx
 ```
+
+### Rehearse the PD stand in sim first
+
+`sim_service.py --scene` is `dodo_assets`' `scene.xml` (Shafeef's PD position actuators,
+kp 150/150/50/50, kd 1.5/1.5/0.8/0.8; `--kp`/`--kd` to try others) on the same ZMQ
+topics as the robot. `--gantry` hangs it from four ropes, feet 3 cm off the floor, so
+the hardware procedure runs exactly as on the robot:
+
+```bash
+python3 sim_service.py --scene --gantry --require-enable --render
+python3 tools/dodo_startup.py --pose home        # enable, ramp to `home` in the air, hold
+python3 tools/dodo_ctl.py gantry --arg lower=0.03   # repeat until the ropes go slack
+python3 tools/dodo_ctl.py gantry --arg release=true
+python3 tools/dodo_ctl.py status                 # "sim": base height, tilt, gantry
+```
+
+Expect `home` to settle at 0.412 m with a 3–4° forward lean (5.8° at most on landing)
+and up to 0.05 rad of knee sag under load. Without `--gantry` it starts standing in
+`--start home|straight`, already enabled. `test_sim_scene.py` runs both rehearsals.
+`dodo_startup` ramps from the targets the service holds (`status` `target_rad`), not
+from the measured angles: under load those sag below the targets, and commanding them
+drops the PD's preload. In sim, 0.7° at the ankles tips the standing robot over.
 
 ### Calibration: how the pieces fit
 
@@ -244,7 +268,7 @@ the robot.
 | `dodo_ipc.py` | The ZMQ contract: endpoints, binary schemas, joint order, latest-value subscriber, ctl client/server, rate loop. |
 | `motor_service.py` | The motor fleet as a service: safety layer, bumpless fail-closed `enable`, boot-pose `calibrate`. |
 | `imu_service.py` | IMU serial → `imu` topic. |
-| `sim_service.py` | MuJoCo as a real-time virtual robot on the same topics, with optional latency/drop injection. |
+| `sim_service.py` | MuJoCo as a real-time virtual robot on the same topics, with optional latency/drop injection. `--scene [--gantry]`: `dodo_assets`' scene.xml with its PD actuators, optionally hanging from a gantry. |
 | `zmq_env.py` | `ZmqEnv`, the deployment backend. Refuses to run on stale, e-stopped, disabled or uncalibrated streams. |
 | `rl_env.py` | The policy contract (`Env` base, joint order, default pose, observation layout) and `OnnxPolicy`. |
 | `sim_env.py` | `SimEnv`: in-process MuJoCo. Also re-exports `URDF_PATH`. |

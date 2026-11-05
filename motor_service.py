@@ -123,6 +123,11 @@ class _JointAdapter:
         self.name = joint.cfg.name
         self.is_odrive = isinstance(joint, OdriveCanJoint)
         self.idled = False              # set True once this joint is IDLEd by safety
+        # The setpoint this joint is being held at / moving to, joint rad (None while
+        # disabled). Reported by `status` so a client can continue from the targets
+        # instead of the measured angles: under load those sag below the targets, and
+        # re-targeting there drops the preload (a standing robot tips over).
+        self.target_rad: Optional[float] = None
         # Damiao has a persistent hardware zero -> calibrated from boot.
         # ODrive reports turns-since-boot -> needs ctl `calibrate` (powered on
         # in the boot pose, legs at the stops) or `set_zero` (jig).
@@ -333,6 +338,8 @@ class MotorService:
             joints[name] = {
                 "type": "odrive" if a.is_odrive else "damiao",
                 "pos_rad": round(st["pos_rad"], 4),
+                "target_rad": (None if a.target_rad is None or not self._enabled
+                               or a.idled else round(a.target_rad, 4)),
                 "vel_rad": round(st["vel_rad"], 4),
                 "torque_nm": round(st["torque"], 3),
                 "has_feedback": st["has_feedback"],
@@ -419,6 +426,7 @@ class MotorService:
                                 "duration_s": UNPARK_DURATION_S}
             else:
                 a.joint.send_position(pos)
+            a.target_rad = a.to_rad(tgt)
         self._enabled = True
         self._enabled_at = time.monotonic()   # Damiao silence is counted from here
         # Re-arm the command watchdog for the new session.
@@ -433,6 +441,8 @@ class MotorService:
     def _ctl_disable(self, _args: dict) -> dict:
         self._disable_all()
         self._enabled = False
+        for a in self.adapters.values():
+            a.target_rad = None
         self._got_cmd = False
         log.info("fleet DISABLED")
         return {"enabled": False}
@@ -533,6 +543,7 @@ class MotorService:
                 log.warning("%s: target %+.3f rad clamped to %+.3f rad (safety limit)",
                             a.name, float(target_rad), a.to_rad(native))
             a.joint.start_move(native, duration=self.move_duration)
+            a.target_rad = a.to_rad(native)
 
     # ── state publishing ──────────────────────────────────────────
     def _publish_states(self, states: Dict[str, dict]):
