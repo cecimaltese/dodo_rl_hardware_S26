@@ -1,10 +1,11 @@
 """
 imu_locate.py — measure where the IMU sits on the robot and write it everywhere it's needed.
 
-The Nicla Sense ME is bolted to `body`. Training needs its pose in the URDF (`imu_link` +
-fixed `imu_joint`); deployment needs the same rotation as `AXIS_REMAP` in
-imu_protocol.py. Both are generated from ONE record, `description/imu_mount.json`, so
-they can't drift apart.
+The Nicla Sense ME is bolted to `body`. Training needs its pose in the robot model
+(`imu_link` + fixed `imu_joint` in the URDF, the `imu_link` body in the MJCF); deployment
+needs the same rotation as `AXIS_REMAP` in imu_protocol.py. All of them are generated
+from ONE record, `imu_mount.json` in the dodo_assets repo next to this one (assets.py),
+so they can't drift apart. Writing into dodo_assets means a commit/PR there too.
 
   ORIENTATION  measured by the IMU itself. At rest the accelerometer reads +1 g along
                whichever board axis points up, so three poses of the robot (level,
@@ -24,7 +25,7 @@ Step by step: docs/imu_locate.md.
     python3 imu_locate.py measure --skip-position    # redo only the orientation
     python3 imu_locate.py measure --skip-orientation # redo only the position
     python3 imu_locate.py measure --xyz-mm 12 0 110  # position already known (body frame)
-    python3 imu_locate.py apply                      # record -> URDF, AXIS_REMAP, README
+    python3 imu_locate.py apply                      # record -> URDF, MJCF, AXIS_REMAP, README
     python3 imu_locate.py refit --exact              # re-solve from the recorded poses (no IMU)
     python3 imu_locate.py check                      # do all of them agree, MuJoCo too?
     python3 imu_locate.py check --live               # + tilt the robot, watch the policy's view
@@ -49,12 +50,14 @@ from pathlib import Path
 
 import numpy as np
 
+import assets
 import imu_protocol as proto
 from sim_env import URDF_PATH, _build_model
 
 REPO = Path(__file__).resolve().parent
-RECORD_PATH = REPO / "description" / "imu_mount.json"
-README_PATH = REPO / "description" / "README.md"
+RECORD_PATH = assets.IMU_RECORD_PATH       # in dodo_assets, like the two models
+MJCF_PATH = assets.MJCF_PATH
+README_PATH = assets.README_PATH
 PROTOCOL_PATH = REPO / "imu_protocol.py"
 
 # Where world-up points in the BODY frame (x forward, y left, z up) in each pose.
@@ -90,6 +93,10 @@ IMU_BOX_M = (0.023, 0.023, 0.005)
 URDF_BEGIN = "  <!-- BEGIN imu_locate.py"
 URDF_END = "  <!-- END imu_locate.py -->\n"
 _URDF_BLOCK_RE = re.compile(re.escape(URDF_BEGIN) + r".*?" + re.escape(URDF_END), re.S)
+# The MJCF's block sits inside <body name="body">, so it is indented one level deeper.
+MJCF_BEGIN = "      <!-- BEGIN imu_locate.py"
+MJCF_END = "      <!-- END imu_locate.py -->\n"
+_MJCF_BLOCK_RE = re.compile(re.escape(MJCF_BEGIN) + r".*?" + re.escape(MJCF_END), re.S)
 _REMAP_RE = re.compile(r"^AXIS_REMAP = (\(\(.*?\)\))\n", re.S | re.M)
 _README_POS_RE = re.compile(r"^\| Position in `body` frame \|.*$", re.M)
 _README_ROT_RE = re.compile(r"^\| Orientation \(`imu_joint` rpy\) \|.*$", re.M)
@@ -443,7 +450,7 @@ def _num(v: float, nd: int) -> str:
 
 
 def load_record(path=RECORD_PATH) -> dict:
-    with open(path) as f:
+    with open(assets.require(path)) as f:
         rec = json.load(f)
     if not is_proper_rotation(rec["axis_remap"]):
         raise ValueError(f"{path}: axis_remap is not a proper rotation")
@@ -464,8 +471,9 @@ def make_record(r, orientation: dict, xyz, position: dict, note: str = "",
     remap = ([[int(round(v)) for v in row] for row in r] if np.allclose(r, np.round(r))
              else [[round(float(v), 9) for v in row] for row in r])
     return {
-        "_comment": "IMU mount on `body`. Written by imu_locate.py measure; "
-                    "imu_locate.py apply turns it into the URDF, AXIS_REMAP and README.",
+        "_comment": "IMU mount on `body`. Written by imu_locate.py measure "
+                    "(dodo_rl_hardware_S26); imu_locate.py apply turns it into the URDF, "
+                    "the MJCF, AXIS_REMAP and the README.",
         "axis_remap": remap,
         "xyz_m": [round(float(v), 4) for v in xyz],
         "mass_kg": mass_kg,
@@ -476,17 +484,27 @@ def make_record(r, orientation: dict, xyz, position: dict, note: str = "",
     }
 
 
-def urdf_block(rec: dict) -> str:
-    r = np.asarray(rec["axis_remap"], dtype=float)
-    rpy = " ".join(_num(a, 9) for a in rpy_from_matrix(r))
-    xyz = " ".join(_num(v, 4) for v in rec["xyz_m"])
+def _box_inertia(rec: dict) -> tuple:
+    """Diagonal inertia of the record's box, as the strings both models write, so the
+    URDF and the MJCF carry the identical numbers."""
     m = rec["mass_kg"]
     a, b, c = rec["box_m"]
-    ixx, iyy, izz = (m * (b * b + c * c) / 12, m * (a * a + c * c) / 12,
-                     m * (a * a + b * b) / 12)
+    return tuple(f"{v:.4g}" for v in (m * (b * b + c * c) / 12, m * (a * a + c * c) / 12,
+                                      m * (a * a + b * b) / 12))
+
+
+def _rpy_text(rec: dict) -> str:
+    return " ".join(_num(a, 9) for a in rpy_from_matrix(np.asarray(rec["axis_remap"], float)))
+
+
+def urdf_block(rec: dict) -> str:
+    rpy = _rpy_text(rec)
+    xyz = " ".join(_num(v, 4) for v in rec["xyz_m"])
+    m = rec["mass_kg"]
+    ixx, iyy, izz = _box_inertia(rec)
     return (
         f"{URDF_BEGIN}: generated from ../imu_mount.json. Edit the record and run\n"
-        f"       `python3 imu_locate.py apply`, not this block. -->\n"
+        f"       `python3 imu_locate.py apply` (dodo_rl_hardware_S26), not this block. -->\n"
         f"  <!-- IMU: Arduino Nicla Sense ME (Bosch BHI260AP). imu_link's axes are the\n"
         f"       chip's own axes; the joint rotation equals imu_protocol.AXIS_REMAP\n"
         f"       (v_body = R v_imu). Its inertial is board + mount, a few grams. -->\n"
@@ -494,8 +512,8 @@ def urdf_block(rec: dict) -> str:
         f"    <inertial>\n"
         f"      <origin xyz=\"0 0 0\" rpy=\"0 0 0\" />\n"
         f"      <mass value=\"{m:g}\" />\n"
-        f"      <inertia ixx=\"{ixx:.4g}\" ixy=\"0\" ixz=\"0\" iyy=\"{iyy:.4g}\" iyz=\"0\" "
-        f"izz=\"{izz:.4g}\" />\n"
+        f"      <inertia ixx=\"{ixx}\" ixy=\"0\" ixz=\"0\" iyy=\"{iyy}\" iyz=\"0\" "
+        f"izz=\"{izz}\" />\n"
         f"    </inertial>\n"
         f"  </link>\n"
         f"\n"
@@ -519,6 +537,49 @@ def write_urdf(rec: dict, urdf_path=URDF_PATH):
     else:
         text = text.replace("</robot>", block + "\n</robot>", 1)
     Path(urdf_path).write_text(text)
+
+
+def mjcf_quat(rec: dict) -> np.ndarray:
+    """imu_link's quat (w x y z) for the MJCF: from the URDF's rounded rpy, the way
+    MuJoCo reads the URDF, so both models compile to the same rotation to float noise
+    (dodo_assets' check_models.py compares them at 1e-9)."""
+    import mujoco
+    q = np.zeros(4)
+    mujoco.mju_euler2Quat(q, np.array([float(v) for v in _rpy_text(rec).split()]), "XYZ")
+    return q
+
+
+def mjcf_block(rec: dict) -> str:
+    r = np.asarray(rec["axis_remap"], dtype=float)
+    xyz = " ".join(_num(v, 4) for v in rec["xyz_m"])
+    quat = " ".join(repr(float(v)) for v in mjcf_quat(rec))
+    ixx, iyy, izz = _box_inertia(rec)
+    size = " ".join(_num(v / 2, 6) for v in rec["box_m"])
+    return (
+        f"{MJCF_BEGIN}: generated from ../imu_mount.json. Edit the record and run\n"
+        f"           `python3 imu_locate.py apply` (dodo_rl_hardware_S26), not this block.\n"
+        f"           IMU: Arduino Nicla Sense ME (Bosch BHI260AP). imu_link carries the\n"
+        f"           chip's own axes; its rotation in body is the record's axis_remap\n"
+        f"           ({describe_axes(r)}). -->\n"
+        f"      <body name=\"imu_link\" pos=\"{xyz}\" quat=\"{quat}\">\n"
+        f"        <inertial pos=\"0 0 0\" mass=\"{rec['mass_kg']:g}\" "
+        f"diaginertia=\"{ixx} {iyy} {izz}\"/>\n"
+        f"        <site name=\"imu\" type=\"box\" size=\"{size}\"/>\n"
+        f"      </body>\n"
+        f"{MJCF_END}"
+    )
+
+
+def write_mjcf(rec: dict, mjcf_path=MJCF_PATH):
+    """Replace the MJCF's generated imu_link block. The block must already be there
+    (it sits inside <body name="body">, next to the sensors that use its site)."""
+    text = Path(assets.require(mjcf_path)).read_text()
+    if not _MJCF_BLOCK_RE.search(text):
+        raise ValueError(f"{mjcf_path} has no `BEGIN/END imu_locate.py` block inside "
+                         f"<body name=\"body\">; put the markers around its imu_link body.")
+    if re.search(r"<body name=\"imu_link\"", _MJCF_BLOCK_RE.sub("", text)):
+        raise ValueError(f"{mjcf_path} has an imu_link outside the generated block.")
+    Path(mjcf_path).write_text(_MJCF_BLOCK_RE.sub(lambda _: mjcf_block(rec), text, count=1))
 
 
 def read_axis_remap(protocol_path=PROTOCOL_PATH) -> np.ndarray:
@@ -554,10 +615,22 @@ def write_readme(rec: dict, readme_path=README_PATH) -> bool:
     return True
 
 
+def _beside(urdf_path, *parts) -> Path:
+    """A file of the same model checkout as `urdf_path` (dodo_assets' layout: urdf/,
+    mjcf/, README.md side by side). Defaults are derived this way so that writing a
+    copy of the URDF can never write into another checkout's MJCF or README."""
+    return Path(urdf_path).resolve().parent.parent.joinpath(*parts)
+
+
 def apply_record(rec: dict, urdf_path=URDF_PATH, protocol_path=PROTOCOL_PATH,
-                 readme_path=README_PATH):
+                 readme_path=None, mjcf_path=None):
+    """readme_path / mjcf_path default to the ones next to urdf_path."""
+    readme_path = readme_path or _beside(urdf_path, "README.md")
+    mjcf_path = mjcf_path or _beside(urdf_path, "mjcf", "dodo_daimao.xml")
     write_urdf(rec, urdf_path)
     print(f"  wrote imu_link + imu_joint   -> {urdf_path}")
+    write_mjcf(rec, mjcf_path)
+    print(f"  wrote the imu_link body      -> {mjcf_path}")
     write_axis_remap(rec, protocol_path)
     print(f"  wrote AXIS_REMAP             -> {protocol_path}")
     if write_readme(rec, readme_path):
@@ -569,11 +642,13 @@ def apply_record(rec: dict, urdf_path=URDF_PATH, protocol_path=PROTOCOL_PATH,
 # --- checks -------------------------------------------------------------------------
 
 def run_checks(record_path=RECORD_PATH, urdf_path=URDF_PATH,
-               protocol_path=PROTOCOL_PATH) -> list:
-    """Record, URDF, AXIS_REMAP and MuJoCo's reading of the URDF all agree.
-    Prints one line per check; returns the names of the failed ones."""
+               protocol_path=PROTOCOL_PATH, mjcf_path=None) -> list:
+    """Record, URDF, MJCF, AXIS_REMAP and MuJoCo's reading of the URDF all agree.
+    Prints one line per check; returns the names of the failed ones. (dodo_assets'
+    scripts/check_models.py checks the rest of the two models against each other.)"""
     import mujoco
 
+    mjcf_path = mjcf_path or _beside(urdf_path, "mjcf", "dodo_daimao.xml")
     fails = []
 
     def check(name, ok, detail):
@@ -623,6 +698,20 @@ def run_checks(record_path=RECORD_PATH, urdf_path=URDF_PATH,
         check("MUJOCO", ok, "imu_link pos/quat = record" if ok else
               f"parent {parent}, pos {model.body_pos[bid]}, quat {model.body_quat[bid]}"
               f" (want {xyz}, ±{q})")
+    try:
+        mj = mujoco.MjModel.from_xml_path(str(assets.require(mjcf_path)))
+        bid = mujoco.mj_name2id(mj, mujoco.mjtObj.mjOBJ_BODY, "imu_link")
+        rm = np.zeros(9)
+        if bid >= 0:
+            mujoco.mju_quat2Mat(rm, mj.body_quat[bid])
+        ok = (bid >= 0 and mujoco.mj_id2name(mj, mujoco.mjtObj.mjOBJ_BODY,
+                                             mj.body_parentid[bid]) == "body"
+              and np.allclose(mj.body_pos[bid], xyz, atol=1e-6)
+              and np.allclose(rm.reshape(3, 3), r, atol=1e-6))
+        check("MJCF", ok, "imu_link body: child of body, pose = record" if ok else
+              "imu_link missing or differs from the record (run `imu_locate.py apply`)")
+    except Exception as e:  # noqa: BLE001
+        check("MJCF", False, f"{type(e).__name__}: {e}")
     try:
         _build_model(str(urdf_path))
         check("SIM", True, "sim_env builds its floating-base model from this URDF")
@@ -812,15 +901,15 @@ def cmd_measure(args) -> int:
     rec = make_record(r, orientation, xyz, position, note=args.note or "",
                       mass_kg=old["mass_kg"] if old else IMU_MASS_KG,
                       box_m=old["box_m"] if old else IMU_BOX_M)
-    if input(f"\n  Write {args.record.name}, the URDF, AXIS_REMAP and the README? [Y/n] "
+    if input(f"\n  Write {args.record.name}, the URDF, the MJCF, AXIS_REMAP and the README? [Y/n] "
              ).strip().lower().startswith("n"):
         return 1
     save_record(rec, args.record)
     print(f"  wrote the record             -> {args.record}")
-    apply_record(rec, args.urdf)
+    apply_record(rec, args.urdf, mjcf_path=args.mjcf)
 
     print("\n=== STATIC CHECK ===")
-    fails = run_checks(args.record, args.urdf)
+    fails = run_checks(args.record, args.urdf, mjcf_path=args.mjcf)
     if fails or args.no_live:
         return 1 if fails else 0
     if ser is None:
@@ -868,14 +957,14 @@ def cmd_refit(args) -> int:
     print(f"\n  was: {old['orientation'].get('mode', '?')}, now: "
           f"{rec['orientation']['mode']} "
           f"({rotation_deg(old['axis_remap'], rec['axis_remap']):.2f} deg apart)")
-    if not args.yes and input(f"\n  Write {args.record.name}, the URDF, AXIS_REMAP and the "
-                              f"README? [Y/n] ").strip().lower().startswith("n"):
+    if not args.yes and input(f"\n  Write {args.record.name}, the URDF, the MJCF, AXIS_REMAP "
+                              f"and the README? [Y/n] ").strip().lower().startswith("n"):
         return 1
     save_record(rec, args.record)
     print(f"  wrote the record             -> {args.record}")
-    apply_record(rec, args.urdf)
+    apply_record(rec, args.urdf, mjcf_path=args.mjcf)
     print("\n=== STATIC CHECK ===")
-    fails = run_checks(args.record, args.urdf)
+    fails = run_checks(args.record, args.urdf, mjcf_path=args.mjcf)
     if not fails:
         print("\n  Verify on the robot: python3 imu_locate.py check --live")
     return 1 if fails else 0
@@ -886,6 +975,8 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--record", type=Path, default=RECORD_PATH, help="default: %(default)s")
     ap.add_argument("--urdf", type=Path, default=URDF_PATH, help="default: %(default)s")
+    ap.add_argument("--mjcf", type=Path, default=None,
+                    help="default: the MJCF next to --urdf (%s)" % MJCF_PATH)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def serial_args(p):
@@ -904,7 +995,8 @@ def main() -> int:
     m.add_argument("--note", help="free text stored in the record (e.g. how it was measured)")
     m.add_argument("--no-live", action="store_true", help="skip the live tilt check")
 
-    sub.add_parser("apply", help="regenerate URDF, AXIS_REMAP and README from the record")
+    sub.add_parser("apply", help="regenerate URDF, MJCF, AXIS_REMAP and README from the "
+                                 "record")
 
     f = sub.add_parser("refit", help="re-solve the orientation from the recorded poses "
                                      "(no IMU), e.g. snapped -> --exact")
@@ -912,7 +1004,7 @@ def main() -> int:
                    help="keep the fitted rotation instead of snapping to a square mount")
     f.add_argument("--yes", action="store_true", help="write without asking")
 
-    c = sub.add_parser("check", help="verify record, URDF, AXIS_REMAP and MuJoCo agree")
+    c = sub.add_parser("check", help="verify record, URDF, MJCF, AXIS_REMAP and MuJoCo agree")
     serial_args(c)
     c.add_argument("--live", action="store_true", help="also tilt the robot and watch")
 
@@ -931,9 +1023,9 @@ def main() -> int:
         if args.cmd == "level":
             return cmd_level(args)
         if args.cmd == "apply":
-            apply_record(load_record(args.record), args.urdf)
-            return 1 if run_checks(args.record, args.urdf) else 0
-        fails = run_checks(args.record, args.urdf)
+            apply_record(load_record(args.record), args.urdf, mjcf_path=args.mjcf)
+            return 1 if run_checks(args.record, args.urdf, mjcf_path=args.mjcf) else 0
+        fails = run_checks(args.record, args.urdf, mjcf_path=args.mjcf)
         if args.live and not fails:
             ser, ver = _open(args)
             return 0 if live_check(ser, ver) else 1

@@ -16,12 +16,12 @@ and joint mapping are correct and ZmqEnv is a drop-in swap.
 from __future__ import annotations
 
 import time
-from pathlib import Path
 from typing import Dict, List, Optional
 
 import mujoco
 import numpy as np
 
+import assets
 from rl_env import (Env, ObsCfg, OBS_FLAT, POLICY_JOINT_ORDER,
                     DEFAULT_JOINT_POS, projected_gravity_from_quat)
 
@@ -39,8 +39,9 @@ SIM_DT = 0.005
 DECIMATION = 4
 SPAWN_HEIGHT = 0.50  # m, from init_state.pos
 
-# The robot model (URDF + meshes) lives in this repo; see description/README.md.
-URDF_PATH = Path(__file__).resolve().parent / "description" / "urdf" / "dodo_daimao.urdf"
+# The robot model (URDF + meshes) lives in the dodo_assets repo next to this one
+# (assets.py). Re-exported here because most tools import it from sim_env.
+URDF_PATH = assets.URDF_PATH
 
 
 def _effort_for(joint: str) -> float:
@@ -52,7 +53,7 @@ def _effort_for(joint: str) -> float:
 
 def _build_model(urdf_path: str) -> mujoco.MjModel:
     """Load the URDF and augment it into a floating-base, actuated, sensed model."""
-    spec = mujoco.MjSpec.from_file(str(urdf_path))
+    spec = mujoco.MjSpec.from_file(str(assets.require(urdf_path)))
     spec.option.timestep = SIM_DT
     spec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
 

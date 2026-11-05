@@ -2,14 +2,16 @@
 
 The Nicla Sense ME is mounted on `body`, and two places need its pose:
 
-- **training:** the URDF's `imu_link` + fixed `imu_joint` (Shafeef is waiting for it);
+- **training:** the model's `imu_link`: in `dodo_assets`, the URDF's `imu_link` + fixed
+  `imu_joint` and the MJCF's `imu_link` body;
 - **deployment:** `AXIS_REMAP` in `imu_protocol.py`, which rotates every reading into the
   body frame before the policy sees it.
 
-`imu_locate.py` measures the pose once, stores it in one record,
-`description/imu_mount.json`, and writes it into both places, plus the IMU table in
-`description/README.md`. Then it checks that they agree and that the policy sees the
-right thing when you tilt the robot.
+`imu_locate.py` measures the pose once, stores it in one record, `imu_mount.json` in the
+`dodo_assets` checkout next to this repo (`assets.py`), and writes it into all of them,
+plus the IMU rows of `dodo_assets`' README. Then it checks that they agree and that the
+policy sees the right thing when you tilt the robot. Since 2026-11-05 the model files
+live only in `dodo_assets`; before that they were in this repo's `description/`.
 
 | | How | Why this way |
 |---|---|---|
@@ -179,10 +181,11 @@ Answer `Y` and it writes:
 
 | File | What changes |
 |---|---|
-| `description/imu_mount.json` | the record: rotation, position, mass, and the raw readings behind them |
-| `description/urdf/dodo_daimao.urdf` | an `imu_link` (5 g) + fixed `imu_joint`, between `BEGIN/END imu_locate.py` markers |
-| `imu_protocol.py` | `AXIS_REMAP` |
-| `description/README.md` | the two "pending" rows of the IMU table |
+| `dodo_assets/imu_mount.json` | the record: rotation, position, mass, and the raw readings behind them |
+| `dodo_assets/urdf/dodo_daimao.urdf` | an `imu_link` (5 g) + fixed `imu_joint`, between `BEGIN/END imu_locate.py` markers |
+| `dodo_assets/mjcf/dodo_daimao.xml` | the `imu_link` body (site `imu`, which the MJCF's IMU sensors use), between the same markers |
+| `imu_protocol.py` (this repo) | `AXIS_REMAP` |
+| `dodo_assets/README.md` | the two rows of the IMU table |
 
 #### 1d. Static check (automatic)
 ```
@@ -190,10 +193,12 @@ Answer `Y` and it writes:
   [PASS] URDF       imu_joint: fixed, body -> imu_link, pose = record
   [PASS] AXIS_REMAP imu_protocol.py = record
   [PASS] MUJOCO     imu_link pos/quat = record
+  [PASS] MJCF       imu_link body: child of body, pose = record
   [PASS] SIM        sim_env builds its floating-base model from this URDF
 ```
 MUJOCO loads the URDF the way a trainer would and compares what MuJoCo makes of
-`imu_joint` with the record. SIM builds the floating-base model `sim_env` and
+`imu_joint` with the record; MJCF does the same for the MJCF. `dodo_assets`'
+`scripts/check_models.py` then compares the two models with each other in full. SIM builds the floating-base model `sim_env` and
 `sim_service` use.
 
 #### 1e. Live check (automatic, the real acceptance test)
@@ -217,13 +222,14 @@ python3 -m pytest -q               # 140 passed, 1 known failure, 1 skip (as bef
 ```
 
 ### 3. Commit, push, hand over
+Two repos: the model files go to `dodo_assets` (a PR to Atarilab), `AXIS_REMAP` here.
 ```bash
-git add description/imu_mount.json description/urdf/dodo_daimao.urdf description/README.md imu_protocol.py
-git commit -m "IMU pose measured on the robot"
-git push
+(cd ../dodo_assets && python3 scripts/check_models.py && git switch -c imu-remeasure \
+  && git commit -am "IMU pose re-measured on the robot" && git push -u origin HEAD)
+git add imu_protocol.py && git commit -m "IMU pose re-measured on the robot" && git push
 ```
-- Shafeef needs `description/` (URDF + meshes; its README's IMU section says how to use
-  `imu_link`).
+- Training uses `dodo_assets` directly, so Shafeef gets it with the PR (its README's
+  IMU section says how to use `imu_link`).
 - Per the working agreement, update `HANDOFF.md`: tick off §2 step 1 and add a log line
   with the three quality numbers and anything odd.
 

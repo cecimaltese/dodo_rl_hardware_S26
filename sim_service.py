@@ -33,7 +33,8 @@ timing noise is unlikely to be what kills it.
                                                     #   dodo_ctl enable first
     python3 sim_service.py --imu-no-quat            # rehearse accel-only IMUs
 
-Loads the robot from description/urdf/dodo_daimao.urdf (override with --urdf).
+Loads the robot from dodo_assets/urdf/dodo_daimao.urdf, the dodo_assets repo next to
+this one (assets.py; override with --urdf).
 """
 
 from __future__ import annotations

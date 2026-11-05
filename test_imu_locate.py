@@ -19,6 +19,7 @@ import mujoco
 import numpy as np
 import pytest
 
+import assets
 import imu_locate as loc
 import imu_protocol as proto
 from rl_env import projected_gravity_from_quat
@@ -108,18 +109,33 @@ def use_remap(monkeypatch, r):
 
 
 def files(tmp_path):
-    """Copies of everything apply writes, laid out so the URDF finds its meshes. The
-    URDF starts without an IMU block, whether or not the repo's has one by now."""
+    """Copies of everything apply writes, laid out like dodo_assets so both models find
+    their meshes. The URDF starts without an IMU block, whether or not the real one has
+    one by now; the MJCF keeps its generated block, which apply replaces. Every call
+    below passes these paths: a default would write into the real dodo_assets."""
     (tmp_path / "urdf").mkdir()
     (tmp_path / "urdf" / "dodo_daimao.urdf").write_text(
         loc._URDF_BLOCK_RE.sub("", loc.URDF_PATH.read_text()))
-    (tmp_path / "meshes").symlink_to(REPO / "description" / "meshes")
+    (tmp_path / "mjcf").mkdir()
+    shutil.copy(loc.MJCF_PATH, tmp_path / "mjcf" / "dodo_daimao.xml")
+    (tmp_path / "meshes").symlink_to(assets.ASSETS_DIR / "meshes")
     shutil.copy(loc.PROTOCOL_PATH, tmp_path / "imu_protocol.py")
     shutil.copy(loc.README_PATH, tmp_path / "README.md")
     return dict(record_path=tmp_path / "imu_mount.json",
                 urdf_path=tmp_path / "urdf" / "dodo_daimao.urdf",
                 protocol_path=tmp_path / "imu_protocol.py",
-                readme_path=tmp_path / "README.md")
+                readme_path=tmp_path / "README.md",
+                mjcf_path=tmp_path / "mjcf" / "dodo_daimao.xml")
+
+
+def apply(rec, f):
+    loc.apply_record(rec, f["urdf_path"], f["protocol_path"], f["readme_path"],
+                     f["mjcf_path"])
+
+
+def checks(f):
+    return loc.run_checks(f["record_path"], f["urdf_path"], f["protocol_path"],
+                          f["mjcf_path"])
 
 
 def record_for(mount, xyz=(0.012, -0.003, 0.11)):
@@ -239,21 +255,65 @@ class TestApply:
         f = files(tmp_path)
         rec = record_for(PERMS[11])
         loc.save_record(rec, f["record_path"])
-        loc.apply_record(rec, f["urdf_path"], f["protocol_path"], f["readme_path"])
+        apply(rec, f)
         first = {k: p.read_text() for k, p in f.items()}
-        loc.apply_record(rec, f["urdf_path"], f["protocol_path"], f["readme_path"])
+        apply(rec, f)
         assert {k: p.read_text() for k, p in f.items()} == first
         assert first["urdf_path"].count('<link name="imu_link">') == 1
         assert "_pending" not in first["readme_path"].split("## IMU")[1].split("##")[0]
-        assert loc.run_checks(f["record_path"], f["urdf_path"], f["protocol_path"]) == []
+        assert checks(f) == []
 
     def test_check_catches_a_stale_axis_remap(self, tmp_path):
         f = files(tmp_path)
         rec = record_for(PERMS[11])
         loc.save_record(rec, f["record_path"])
-        loc.write_urdf(rec, f["urdf_path"])      # URDF updated, imu_protocol.py not
-        assert loc.run_checks(f["record_path"], f["urdf_path"],
-                              f["protocol_path"]) == ["AXIS_REMAP"]
+        loc.write_urdf(rec, f["urdf_path"])      # both models updated, imu_protocol.py not
+        loc.write_mjcf(rec, f["mjcf_path"])
+        assert checks(f) == ["AXIS_REMAP"]
+
+    def test_check_catches_a_stale_mjcf(self, tmp_path):
+        f = files(tmp_path)
+        rec = record_for(PERMS[11])
+        loc.save_record(rec, f["record_path"])
+        loc.write_urdf(rec, f["urdf_path"])      # the MJCF still has the old mount
+        loc.write_axis_remap(rec, f["protocol_path"])
+        assert checks(f) == ["MJCF"]
+
+    @pytest.mark.parametrize("i", [0, 7, 13, 21])
+    def test_mjcf_and_urdf_compile_to_the_same_imu_frame(self, tmp_path, i):
+        """What dodo_assets' check_models.py compares, at its 1e-9: an exact mount
+        makes both models' imu_link quats agree to float noise, not to rounding."""
+        f = files(tmp_path)
+        rec = record_for(PERMS[i] @ rot_z(11) @ rot_x(-3))
+        loc.write_urdf(rec, f["urdf_path"])
+        loc.write_mjcf(rec, f["mjcf_path"])
+        u = mujoco.MjModel.from_xml_path(str(f["urdf_path"]))
+        m = mujoco.MjModel.from_xml_path(str(f["mjcf_path"]))
+        qu, qm = u.body("imu_link").quat, m.body("imu_link").quat
+        assert min(np.abs(qu - qm).max(), np.abs(qu + qm).max()) < 1e-9
+        assert u.body("imu_link").pos == pytest.approx(m.body("imu_link").pos, abs=1e-12)
+        # principal inertias: the importers list them in different orders
+        assert np.sort(u.body("imu_link").inertia) == pytest.approx(
+            np.sort(m.body("imu_link").inertia), rel=1e-12)
+
+    def test_defaults_stay_in_the_urdfs_checkout(self, tmp_path):
+        """Writing a copy of the URDF must never reach another checkout's MJCF or
+        README: their defaults come from next to the URDF given."""
+        f = files(tmp_path)
+        real = {p: p.read_bytes() for p in (loc.MJCF_PATH, loc.README_PATH)}
+        rec = record_for(PERMS[5])
+        loc.save_record(rec, f["record_path"])
+        loc.apply_record(rec, f["urdf_path"], f["protocol_path"])
+        assert {p: p.read_bytes() for p in real} == real
+        assert loc.run_checks(f["record_path"], f["urdf_path"], f["protocol_path"]) == []
+
+    def test_mjcf_needs_its_markers(self, tmp_path):
+        f = files(tmp_path)
+        text = loc._MJCF_BLOCK_RE.sub('      <body name="imu_link"/>\n',
+                                      f["mjcf_path"].read_text())
+        f["mjcf_path"].write_text(text)
+        with pytest.raises(ValueError, match="BEGIN/END"):
+            loc.write_mjcf(record_for(PERMS[0]), f["mjcf_path"])
 
     @pytest.mark.parametrize("generated_too", [False, True])
     def test_refuses_to_duplicate_a_hand_written_imu(self, tmp_path, generated_too):
@@ -296,9 +356,9 @@ class TestApply:
         mount = PERMS[4] @ rot_z(17) @ rot_x(-8)
         rec = record_for(mount)
         loc.save_record(rec, f["record_path"])
-        loc.apply_record(rec, f["urdf_path"], f["protocol_path"], f["readme_path"])
+        apply(rec, f)
         assert loc.read_axis_remap(f["protocol_path"]) == pytest.approx(mount, abs=1e-8)
-        assert loc.run_checks(f["record_path"], f["urdf_path"], f["protocol_path"]) == []
+        assert checks(f) == []
 
 
 class TestMuJoCo:
@@ -463,7 +523,7 @@ class TestRefit:
         f = files(tmp_path)
         rec, _ = loc.refit_record(self.snapped_record(), exact=True)
         loc.save_record(rec, f["record_path"])
-        loc.apply_record(rec, f["urdf_path"], f["protocol_path"], f["readme_path"])
+        apply(rec, f)
         assert loc.read_axis_remap(f["protocol_path"]) == pytest.approx(
             np.array(rec["axis_remap"]), abs=1e-8)
-        assert loc.run_checks(f["record_path"], f["urdf_path"], f["protocol_path"]) == []
+        assert checks(f) == []

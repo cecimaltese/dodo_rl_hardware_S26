@@ -7,10 +7,12 @@
 > *"The original dodo went extinct because it couldn't run. We're fixing that — and adding a backflip for good measure."*
 
 This repo runs trained policies on the physical Dodo, an 8-DOF biped from TUM MIRMI. It
-holds the motor and IMU services, a real-time MuJoCo stand-in for the robot, the robot
-description, a reference policy, and the bench and calibration tools. Policies are trained
-elsewhere: so far in the S26 Isaac Lab project
-[`dodo_rl`](https://github.com/cecimaltese/dodo_rl), next by Shafeef Omar.
+holds the motor and IMU services, a real-time MuJoCo stand-in for the robot, a reference
+policy, and the bench and calibration tools. The robot model (URDF, MJCF, meshes, IMU
+mount) lives in [`Atarilab/dodo_assets`](https://github.com/Atarilab/dodo_assets),
+checked out next to this repo (*Machine setup*). Policies are trained elsewhere: so far
+in the S26 Isaac Lab project [`dodo_rl`](https://github.com/cecimaltese/dodo_rl), next
+by Shafeef Omar.
 
 New here? Read **Status**, then **Bring-up**. `HANDOFF.md` has the history and the
 decisions behind it.
@@ -30,7 +32,7 @@ decisions behind it.
 | **Hardware** | ✅ Every motor driver powered, CAN daisy chain continuous (repaired 2026-10-30). |
 | **ZMQ stack** | ✅ Reconciled with main's July work 2026-10-30. In sim, the stand policy balances 10 s through `sim_service` + `ZmqEnv`. ⚠️ Never run against `motor_service` on the robot. |
 | **Sim → sim (MuJoCo)** | ✅ The `dodo_stand` policy stands 30 s+. |
-| **IMU** | ✅ Verified on hardware (firmware v2): scale 0.5 % off 1 g, gyro bias ~1 °/s, ~60 Hz. ✅ Pose measured on the robot 2026-11-02 (`description/imu_mount.json` → URDF `imu_link`, `AXIS_REMAP`). The board sits off square, so the record is the exact fit (2026-11-04). ⚠️ The first live check still read 3.8° nose-down on a phone-levelled robot: pitch unresolved (HANDOFF §2 step 1, `imu_locate.py level`). |
+| **IMU** | ✅ Verified on hardware (firmware v2): scale 0.5 % off 1 g, gyro bias ~1 °/s, ~60 Hz. ✅ Pose measured on the robot 2026-11-02 (`dodo_assets/imu_mount.json` → its URDF and MJCF `imu_link`, our `AXIS_REMAP`). The board sits off square, so the record is the exact fit (2026-11-04). ⚠️ The first live check still read 3.8° nose-down on a phone-levelled robot: pitch unresolved (HANDOFF §2 step 1, `imu_locate.py level`). |
 | **Safety layer** | ✅ In `motor_service`: position/velocity clamps, 0.8 × rated torque → that motor IDLE, e-stop, and a silent-joint watchdog that works (it couldn't fire before 2026-11-04). ⚠️ Never exercised on hardware. |
 | **Motor control** | ⚠️ Never run on a motor. |
 | **Sign / zero calibration** | ❌ **The blocker.** Tooling ready (`real2sim.py`, `calibrate_joints.py`, the meshed visualizer as the check); the calibration itself is still to do (July's run was deleted), and `motor_service` doesn't apply measured signs or stops yet. |
@@ -109,9 +111,10 @@ identity: a replug can silently swap them. A udev rule pins each adapter by seri
 gyro, accelerometer and an on-chip accel+gyro fusion quaternion (no magnetometer next to
 eight motors). It supplies 6 of the 30 policy inputs, so `ZmqEnv` refuses to run on a
 missing or stale IMU stream. `AXIS_REMAP` in `imu_protocol.py` rotates the board axes into
-the body frame and must match the URDF's IMU pose. `imu_locate.py` measures both on the
-robot and writes them from one record, `description/imu_mount.json`
-([docs/imu_locate.md](docs/imu_locate.md)); not measured yet. Flashing: `firmware/README.md`.
+the body frame and must match the model's IMU pose. `imu_locate.py` measures both on the
+robot and writes them from one record, `imu_mount.json` in `dodo_assets`
+([docs/imu_locate.md](docs/imu_locate.md)); measured 2026-11-02. Flashing:
+`firmware/README.md`.
 
 ## Machine setup
 
@@ -119,6 +122,10 @@ Once per robot machine (Ubuntu). Everything after this runs as your normal user.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # Python >= 3.10
+
+# The robot model: Atarilab/dodo_assets NEXT TO this repo (assets.py looks there; or set
+# DODO_ASSETS=/path/to/a/checkout). Sim, visualizer, imu_locate and the tests need it.
+git clone https://github.com/Atarilab/dodo_assets.git ../dodo_assets
 
 # CAN: stable names can_dm / can_od, up at 1 Mbit whenever the adapters are plugged in
 sudo cp setup/99-dodo-can.rules /etc/udev/rules.d/
@@ -240,7 +247,8 @@ the robot.
 | `sim_service.py` | MuJoCo as a real-time virtual robot on the same topics, with optional latency/drop injection. |
 | `zmq_env.py` | `ZmqEnv`, the deployment backend. Refuses to run on stale, e-stopped, disabled or uncalibrated streams. |
 | `rl_env.py` | The policy contract (`Env` base, joint order, default pose, observation layout) and `OnnxPolicy`. |
-| `sim_env.py` | `SimEnv`: in-process MuJoCo. Also `URDF_PATH`. |
+| `sim_env.py` | `SimEnv`: in-process MuJoCo. Also re-exports `URDF_PATH`. |
+| `assets.py` | Where the robot model is: the `dodo_assets` checkout next to this repo (or `DODO_ASSETS`). Every model path is spelled there. |
 | `run_policy.py` | The policy runner, for either backend. |
 | `fleet_config.py` | **The** robot config: motors, ids, buses, joint limits, torques, boot pose. Edit it here only. |
 | `damiao_joint.py`, `odrive_can_joint.py` | One joint each, behind an identical interface. |
@@ -251,11 +259,10 @@ the robot.
 | `read_motor_state.py`, `visualize_motor_state.py` | Read-only fleet diagnostics: a live table, or the meshed MuJoCo model following the robot (+ reached ranges). |
 | `odrive_can_scan.py`, `odrive_can_setup.py`, `odrive_position_control.py` | ODrive: find nodes on a bus; put a drive on CAN (USB, once per drive); tune gains (USB). |
 | `imu_check.py`, `imu_sniff.py` | IMU acceptance test; raw dump, range cross-check, `--axes`. |
-| `imu_locate.py` | Measures the IMU mount (three poses + a ruler) and writes the URDF's `imu_link`, `AXIS_REMAP` and the IMU table from `description/imu_mount.json`; `refit [--exact]` re-solves from the stored poses; `check --live` verifies on the robot. |
+| `imu_locate.py` | Measures the IMU mount (three poses + a ruler) and writes, from `dodo_assets/imu_mount.json`, the IMU blocks of its URDF and MJCF, its README rows and our `AXIS_REMAP`; `refit [--exact]` re-solves from the stored poses; `check --live` verifies on the robot. |
 | `setup/99-dodo-can.rules` | udev rule: the two USB-CAN adapters → `can_dm` / `can_od` by serial, up at 1 Mbit. |
 | `tools/` | `dodo_ctl.py` (ctl CLI), `dodo_startup.py` (power-on ritual without a policy), `zmq_echo.py` and `zmq_hz.py` (topic echo and rate). |
 | `demo_combined.py` | Sine-drive any joints through the full service stack. |
-| `description/` | URDF + meshes of the robot as built, with a README for whoever trains on it. |
 | `policies/` | The reference `dodo_stand` run the tests use. |
 | `docs/zmq.md` | ZMQ topic and schema spec. |
 | `docs/imu_locate.md` | Bench procedure for measuring the IMU pose. |
@@ -266,10 +273,11 @@ the robot.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # any OS, Python >= 3.10
+git clone https://github.com/Atarilab/dodo_assets.git ../dodo_assets  # the robot model
 .venv/bin/python -m pytest
 ```
 
-Everything runs on any machine without hardware: the message layer (`test_ipc.py`), the
+Everything runs on any machine without hardware (with `dodo_assets` next to the repo): the message layer (`test_ipc.py`), the
 service stack against a synthetic robot plus the stand policy through it
 (`test_e2e_zmq.py`), `motor_service`'s silent-joint watchdog with the real drivers on
 python-can's virtual bus against a fake fleet (`test_motor_watchdog.py`),

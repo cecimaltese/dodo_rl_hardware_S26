@@ -52,7 +52,7 @@ def main():
                          "to preview the home stance. Implies --backend sim --render.")
     ap.add_argument("--urdf", default=None,
                     help="robot URDF for --backend sim "
-                         "(default: description/urdf/dodo_daimao.urdf)")
+                         "(default: dodo_assets/urdf/dodo_daimao.urdf next to this repo)")
     args = ap.parse_args()
 
     obs_cfg = OBS_FLAT if args.task == "flat" else OBS_STAND

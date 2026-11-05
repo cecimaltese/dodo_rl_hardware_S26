@@ -99,8 +99,9 @@ ACCEL_LSB_TO_M_S2 = (ACCEL_RANGE_G / 32768.0) * 9.80665
 # the same character as the L/R motor mirroring: the policy gets plausible-looking
 # numbers that mean the wrong thing. Rows = base axes in IMU terms, so
 # v_base = AXIS_REMAP @ v_board; the URDF's imu_joint carries the same rotation.
-# WRITTEN BY `imu_locate.py` from description/imu_mount.json, together with the
-# URDF: measure with `imu_locate.py measure`, don't edit by hand (`check` would flag it).
+# WRITTEN BY `imu_locate.py` from imu_mount.json in dodo_assets, together with the
+# URDF and MJCF there: measure with `imu_locate.py measure`, don't edit by hand (`check`
+# would flag it, as it flags a dodo_assets checkout whose record differs).
 AXIS_REMAP = ((-0.027217111, +0.997561889, -0.064261231),
               (+0.998620652, +0.030020879, +0.043075980),
               (+0.044900134, -0.063000189, -0.997002986))

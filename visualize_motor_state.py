@@ -51,6 +51,7 @@ import mujoco
 import real2sim
 from fleet_config import (DM_JOINTS, OD_JOINTS, DM_CHANNEL, OD_CHANNEL, BUSTYPE,
                           FEEDBACK_FRESH_S, JOINT_LIMITS_RAD)
+import assets
 from sim_env import URDF_PATH
 
 HIDDEN_GROUP = 3   # the viewer shows geom groups 0-2 by default
@@ -68,15 +69,15 @@ def build_view_model(urdf_path=URDF_PATH, boxes: bool = False) -> mujoco.MjModel
     discardvisual="false" and the meshes passed as assets; the file itself (and the
     physics models sim_env/sim_service build from it) are untouched. The collision
     boxes move to a hidden geom group unless `boxes` (toggle in the viewer: 3)."""
-    urdf_path = Path(urdf_path)
+    urdf_path = assets.require(urdf_path)
     text = urdf_path.read_text()
     tag = '<compiler fusestatic="false" />'
     if tag not in text:
         raise ValueError(f"{urdf_path}: expected the {tag} line of the <mujoco> block")
     text = text.replace(tag, '<compiler fusestatic="false" discardvisual="false" />', 1)
     mesh_dir = urdf_path.parent.parent / "meshes"
-    assets = {f"../meshes/{p.name}": p.read_bytes() for p in mesh_dir.glob("*.STL")}
-    model = mujoco.MjSpec.from_string(text, assets=assets).compile()
+    mesh_files = {f"../meshes/{p.name}": p.read_bytes() for p in mesh_dir.glob("*.STL")}
+    model = mujoco.MjSpec.from_string(text, assets=mesh_files).compile()
     if not boxes:
         for g in range(model.ngeom):
             if model.geom_type[g] != mujoco.mjtGeom.mjGEOM_MESH:

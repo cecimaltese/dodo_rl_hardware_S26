@@ -25,8 +25,9 @@ pre-merge ROS2 stack and its old docs, so work from the branch:
 ```bash
 git clone git@github.com:cecimaltese/dodo_rl_hardware_S26.git && cd dodo_rl_hardware_S26
 git switch merge-zmq-dev
+git clone https://github.com/Atarilab/dodo_assets.git ../dodo_assets   # the robot model
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # Python >= 3.10
-.venv/bin/python -m pytest   # 153 passed, 1 known failure, 1 skip (2026-11-04)
+.venv/bin/python -m pytest   # 181 passed, 1 known failure, 1 skip (2026-11-05)
                              # (3 more skips without dodo_rl next to the repo)
 ```
 Then read §2. A Claude session's local memory doesn't travel between machines; this file
@@ -39,7 +40,7 @@ Run a trained policy on the physical Dodo through the same `step(action) → obs
 contract it was trained with. `motor_service` + `imu_service` are the robot,
 `sim_service` is a real-time MuJoCo stand-in on the same ZMQ topics, and `ZmqEnv` +
 `run_policy.py` drive either one. The policies so far come from the S26 Isaac Lab project
-`dodo_rl`. The next one is trained by Shafeef Omar from `description/`.
+`dodo_rl`. The next one is trained by Shafeef Omar from `Atarilab/dodo_assets`.
 
 **Roadmap (agreed with Shafeef, 2026-11-04):**
 1. Joints real → sim, accurately: mapping, sign, zero, gear ratio (`real2sim.py`; the
@@ -101,7 +102,10 @@ the robot yet.
 8. **Merge `merge-zmq-dev` into `main`** once the team has looked at it (on origin; a
    fast-forward). Until then, fresh clones land on the old docs.
 
-**IMU, for step 7:** `description/` (exact-fit `imu_joint`) went to Shafeef 2026-11-04.
+**IMU, for step 7:** the exact-fit record is in `dodo_assets` once the PR from
+`victor-hucklenbroich/dodo_assets` branch `imu-exact-fit` is merged (2026-11-05); until
+then Atarilab's `main` still has the snapped one, and `imu_locate.py check` fails on
+AXIS_REMAP against it.
 Two phone-levelled placements still disagree by ~3° in pitch (11-02 reads 0°, today's
 3.2°/3.9° nose-down; the phone lay on its edge, so not the camera bump). It doesn't touch
 training (the policy observes the body frame, so the mount rotation cancels in sim) and
@@ -139,18 +143,53 @@ if it still reads ~3°. Optional: weigh the robot (the CAD says 4.72 kg).
   never flashed.
 - `fleet_config.py` is the single source of truth for the robot; never copy it
   (`test_fleet_config.py` enforces this).
-- The repo is self-contained (2026-10-30): robot description in `description/`, reference
-  policy in `policies/`. It is meant to move to an ATARI lab repo.
+- **Robot model → `Atarilab/dodo_assets` only** (2026-11-05, user; replaces the
+  2026-10-30 "self-contained" decision). Checked out next to this repo; `assets.py`
+  spells every path (or `DODO_ASSETS`). `description/` is deleted. Changes to the model
+  go to `dodo_assets` by PR (the user's fork: `victor-hucklenbroich/dodo_assets`).
+  The reference policy stays in `policies/`. Everything is meant to move to Atarilab.
 - Policy training → **Shafeef trains it** (2026-10-30). This repo owns sim2real + hardware.
-- IMU pose → **one record, `description/imu_mount.json`** (2026-11-01). `imu_locate.py`
-  generates the URDF's `imu_link`/`imu_joint`, `AXIS_REMAP` and the README's IMU table
-  from it; never edit those by hand. Orientation is snapped to the nearest square
+- IMU pose → **one record, `imu_mount.json` in `dodo_assets`** (2026-11-01; moved
+  2026-11-05). `imu_locate.py` generates the URDF's `imu_link`/`imu_joint`, the MJCF's
+  `imu_link` body, `AXIS_REMAP` and the README's IMU rows from it; never edit those by
+  hand. Orientation is snapped to the nearest square
   mounting unless `--exact`. Position is measured by hand, since it only affects raw
   accelerometer readings, which the policy doesn't observe.
 
 ---
 
 ## 4. Log (newest first)
+
+### 2026-11-05 (d) — the robot model lives only in `dodo_assets`; `description/` deleted
+Decided by the user: one robot model, in `Atarilab/dodo_assets`, as a step toward one
+Atarilab repo.
+- **`dodo_assets` (the user's fork, branch `imu-exact-fit`, commit `40033e4`; PR to
+  Atarilab pending):** `imu_mount.json` is our 11-04 exact refit (it had the 11-02
+  snapped record). The MJCF's `imu_link` body is now generated between `BEGIN/END
+  imu_locate.py` markers like the URDF block, so one `imu_locate.py apply` writes the
+  record's pose into both models, the README's two IMU rows (the hand-written
+  square-mount matrix is gone) and our `AXIS_REMAP` (unchanged). Its
+  `scripts/check_models.py`: OK. `pd_stand.py`: unchanged (the body-frame IMU readings
+  are identical; only the chip-frame ones moved).
+- **This repo:** `assets.py` holds every model path (sibling `../dodo_assets`, or
+  `DODO_ASSETS`), with a clear error if it's missing. Nothing checks it at import, so
+  `motor_service` and the bench tools don't need the checkout. `sim_env.URDF_PATH`
+  re-exports it. `imu_locate.py` writes and checks the MJCF too (new `MJCF` check). Its
+  MJCF/README defaults come from next to the URDF it's given, so a copy of the URDF
+  can't write into another checkout's files. That nearly happened in this session: a
+  stale test run wrote a fake mount into the real MJCF before the commit was checked;
+  restored from the commit, and a test now guards it. `description/` deleted (git rm);
+  its README had nothing `dodo_assets`' README lacks, except a "not verified on hardware"
+  list that was out of date. Docs: README (*Machine setup*, *Tests*, Files),
+  `docs/imu_locate.md`.
+- Tests: `test_imu_locate.py` works on copies of `dodo_assets`' layout and passes every
+  path. New: a stale MJCF is caught, the URDF and MJCF compile to the same IMU frame
+  (to 1e-9, as `check_models.py` demands), the defaults stay in the URDF's checkout,
+  and missing markers are refused. Suite: 181 passed, 1 known failure, 1 skip.
+  `dodo_assets` stays clean through the full suite.
+- The sim still builds its model from the URDF with the old stand policy's actuators
+  (KP 32/KD 3, 5 ms). Loading `scene.xml`'s PD actuators for the stand is the next step
+  (log 11-05 (c)).
 
 ### 2026-11-05 (c) — Shafeef's `dodo_assets`; PD stand in sim; plan to the robot
 - **`Atarilab/dodo_assets`** (Shafeef), cloned next to this repo: the same URDF and
