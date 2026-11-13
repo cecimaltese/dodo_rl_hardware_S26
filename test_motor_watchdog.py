@@ -180,7 +180,7 @@ class FakeFleet:
                         want = struct.unpack("<I", d[:4])[0]
                         if want == AXIS_STATE_CLOSED_LOOP_CONTROL and not self.od_drive_cal[node]:
                             self.od_state[node], self.od_proc[node] = AXIS_STATE_IDLE, 14
-                        elif want == 3:                       # FULL_CALIBRATION_SEQUENCE
+                        elif want in (3, 4):                  # FULL / MOTOR calibration
                             self.od_state[node] = 4           # MOTOR_CALIBRATION first
                             self.od_cal_until[node] = time.monotonic() + 0.3
                         elif not (want == AXIS_STATE_IDLE

@@ -95,20 +95,16 @@ the robot yet.
    The stand has little margin forward (log 11-05 (e)): keep the gantry close to taut,
    and watch which way it wants to tip. Re-take the weight before ending `dodo_startup`
    (its park ends limp).
-   **Open before step 7 (standing): the ODrives' `vel_limit` caps the knee torque.** In
-   position control the drive's velocity setpoint saturates at `vel_limit`, so the most
-   torque it holds at standstill is vel_gain × vel_limit. kd 0.8 fixes vel_gain at
-   0.0077 Nm/(turn/s) (knee), so at the 10 turns/s fleet_config lists that's 0.077 Nm at
-   the motor, 2.0 Nm at the knee; `home` needs 2.9 Nm (sim). The drives' real
-   `vel_limit`, current limit and `torque_constant` were set by WS25 and are unknown (CAN
-   Simple can't read them; the `odrive` USB package isn't installed). **Plan (user,
-   2026-11-05: no USB, the ports sit badly in the body): the push test** in step 6
-   (`tools/pd_push_test.py`, log 11-05 (h)) measures the cap on each knee/ankle in the
-   air. If the cap at full gains is under ~1.3 × the stand's need (knee 2.9, ankle 1.4
-   Nm), raise the ODrive kd in `fleet_config.JOINT_KD` (cap = kd · 2π · vel_limit / N):
-   kd 2 gives 4.9 Nm at vel_limit 10, and the sim stand is unchanged by it (3.8° lean,
-   5.3° max vs 5.8°). If the plateau doesn't scale with the gains, it's the current
-   limit instead, which only USB (or Set_Limits with a guessed current) can raise.
+   **Open before step 7: the RIGHT KNEE's current limit.** Read over CAN 2026-11-13
+   (`tools/odrive_config.py`). Ankles and the new left knee: vel_limit 100 turns/s, so the
+   velocity cap (vel_gain × vel_limit) doesn't bind; the current does, inverter 7 A ×
+   0.0276 Nm/A = 0.19 Nm at the motor, **4.9 Nm at a knee (×25.6), 5.5 Nm at an ankle
+   (×28.5)**, vs 2.9 / 1.4 Nm for `home`. **The right knee (396A347A3331) is set to motor
+   current 3 A (hard 4.4 A) → 2.1 Nm**, under 2.9. Its vel_limit is 18 (cap 3.5 Nm at
+   kd 0.8), DC current +2.5 A, bus trips 20–25 V (a 24 V supply plus regen can pass 25 V).
+   Proposal (not done; who set these, and why?): give it the others' current (10 / 18 A),
+   DC (±2000) and trip (6–30 V) settings over CAN, keeping its index search. The push test
+   (`tools/pd_push_test.py`, step 6) then confirms gains, torque units and the plateau.
 7. **Shafeef's standing policy** (roadmap 4): adapt `rl_env.py` to its contract, add the
    run to `policies/`, rehearse on `sim_service`, then the gantry. Before it runs on the
    robot, settle the IMU's pitch (below).
@@ -183,6 +179,92 @@ if it still reads ~3°. Optional: weigh the robot (the CAD says 4.72 kg).
 ---
 
 ## 4. Log (newest first)
+
+### 2026-11-13 — left knee: new ODrive board came with node id 7, and its encoder counts nothing
+- **User:** the old board's phase connector couldn't be saved, so they replaced the left
+  knee's ODrive Micro (its USB port is easy to reach, unlike the others'). Phases work.
+  In odrivetool its calibration ends `NO_RESPONSE` ("the procedure component did not
+  respond as expected"), and nothing that controls over CAN works.
+- **Found on can_od:** bus clean (ERROR-ACTIVE, 0 errors), no node 3, and node 7 sent
+  **two** heartbeat streams: **the new board came with node id 7**, the right knee's.
+  Two drives on one id both obey every command, and node 7's position alternated between
+  two encoders. That, plus node 3 missing, is why nothing runs.
+- **odrivetool over CAN** (`--can can_od`, odrive 0.6.11) discovers drives by serial and
+  reads/writes any setting, with no USB. When I connected to one of the two node-7 drives,
+  its claim logic moved that drive to node 0, **until its next power-up** (RAM only,
+  nothing saved).
+- **Identification. I got it wrong first, and the user's `watch` test corrected it.** I
+  guessed that the drive I had moved (396A347A3331, fw 0.6.12, the odd settings) was the
+  new board. Moving the joints by hand showed node 0 = **right knee**, 4 = left ankle,
+  8 = right ankle; the left knee moved no node's numbers. So:
+  - right knee **396A347A3331**, fw 0.6.12, now node 0 (saved id presumably 7). Set up by
+    `odrive_can_setup.py` (rates, gains), with encoder index search on (gpio4; the 11-05
+    calibration's index search). Motor current 3 A soft / 4.4 A hard, DC +2.5 A, bus trips
+    20–25 V, vel_limit 18.
+  - **new left knee 336437783432**, fw 0.6.11, node 7. Its settings are the ankles' (10 A,
+    no index, vel_limit 100); only pos_gain 60 and a few rates differ. Only the node id is
+    wrong.
+  - ankles 394434793331 (4) and 394534793331 (8), fw 0.6.11. All four hw 6.2 (Micro),
+    INC_ENCODER0 cpr 20000, 12 pole pairs, torque_constant 0.0276 Nm/A.
+- **The new board's encoder counts nothing:** `inc_encoder0.raw` = 0 since power-up (the
+  ankle 44726, the right knee 43042 from being moved), no errors, config like the ankles.
+  No encoder edge ever reached it: the encoder plug/cable/power on the new board. That is
+  also the `NO_RESPONSE`: the encoder step turns the motor and sees no counts.
+- **Torque limits, read from the drives:** ankles and new left knee: current 7 A
+  (inverter) → **4.9 Nm at the knee, 5.5 Nm at the ankle**; vel_limit 100 → no binding
+  velocity cap. **The right knee: 3 A → 2.1 Nm, under the 2.9 Nm `home` needs** (its
+  vel_limit 18 → velocity cap 3.5 Nm). §2 updated.
+- **New: `tools/odrive_config.py`:**
+  - `list`: discovery only, no connections; flags duplicate and missing ids.
+  - `watch`: encoder position per node, to identify a board by moving its joint.
+  - `backup` → `setup/odrive_config/` (for now only the ankles: the knees' ids are wrong).
+  - `set-node --serial S --node-id N`: the node id only.
+  - `clone --from <node|serial|file> --to S --node-id N`: copies every setting except the
+    target's calibration results.
+  - Dry run by default. With `--write`: refuses an id another drive has, writes the id
+    last (it takes effect at once), saves via CAN Reboot action 1, and checks the drive
+    comes back on the new id.
+  - Verified on the robot: list, watch, backup, dry runs, and the duplicate refusal.
+    `--write` not run yet. `test_odrive_config.py`.
+  - README *Replacing an ODrive board*. `odrive_can_joint.PROCEDURE_RESULTS[5]` →
+    POLE_PAIR_CPR_MISMATCH (odrive.enums 0.6.11). fleet_config vel_limit: 100, right
+    knee 18 (informational).
+- **Re-plugging the encoder didn't help** (user): still 0 counts. New `pins --drive D`:
+  samples the drive's pin levels over CAN (~2 kHz, get_gpio_states) while the joint is
+  turned, and reports toggles and the count. Idle baseline: the right knee's board has
+  gpio2/gpio3 high (levels changed between earlier reads, so probably encoder A/B); the new
+  board has them low in every read so far (unpowered or unconnected encoder?). Still to run
+  with the joints actually turning.
+- **Later the same day:** after a power cycle, both knee boards (saved id 7 each)
+  showed up at **node 63 (unaddressed)**, and `pins --drive 7/0` found nothing (use
+  serials). RAM only, nothing was saved on any drive. The encoder wiring is hard to reach.
+  **User's plan:** test the left knee's encoder on the OLD board (its encoder input worked
+  on 11-05; phase connector not needed for this; saved id 3, no conflict), and try another
+  board. Old board counts → cable/encoder OK → the new board's encoder input is bad. While
+  the old board is on the bus: `odrive_config.py backup` = the original left-knee config.
+- **Next (user at the robot):**
+  1. Fix the new board's encoder connection; `watch` must show node 7 move with the left
+     knee.
+  2. `odrive_config.py set-node --serial 336437783432 --node-id 3 --write`.
+  3. Power-cycle; `list` must show 3, 4, 7, 8, no duplicates.
+  4. `odrive_check.py --joint lower_leg_left --repeat 3` with the leg closed.
+  5. `backup` (the knees too).
+  6. Decide on the right knee's 3 A limit before standing.
+
+### 2026-11-12 — left knee: the motor phase contact is intermittent
+- **User:** narrowed it to the left knee's motor phases. Re-seating the phase wires in
+  the connector made it work (checked on the board with odrivetool), then it failed
+  again once the leg was closed; opened again, `odrive_check.py` passed once and failed
+  after wiggling the connector. A contact that fails on wiggling / closing: a worn or
+  spread terminal, a poor crimp, a cracked joint, or cable strain from the cover.
+- `odrive_check.py --motor-only [--no-wait]`: loops only MOTOR_CALIBRATION (the phase
+  R/L measurement at calibration current, no rotation, ~4 s a run) to find the spot
+  by wiggling one place at a time. Tested against the fake drives (state 4 handled
+  like the full sequence there).
+- Recommendation given (not done): locate first; then replace the terminal(s) or,
+  better, take the small connector out of the phase path (solder, or a power motor
+  connector such as MR30), with strain relief so closing the leg can't pull on it;
+  verify with the leg CLOSED (`--repeat`), then the in-air bring-up steps.
 
 ### 2026-11-05 (k) — `tools/odrive_check.py`: testing a repaired motor connection
 The user asked how to test the left knee's wiring after the repair (continuity alone

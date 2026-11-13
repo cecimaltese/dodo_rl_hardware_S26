@@ -68,3 +68,18 @@ def test_node_lookup():
     assert oc.node_of("lower_leg_left") == 3
     with pytest.raises(SystemExit):
         oc.node_of("hip_left")
+
+
+def test_motor_only_runs_just_the_motor_step(fleet):
+    node = fleet.od_id["lower_leg_left"]
+    bus = can.Bus(interface="virtual", channel=fleet.od_channel)
+    try:
+        r = oc.check_drive(bus, node, "lower_leg_left", timeout_s=5.0, out=lambda *_: None,
+                           state=oc.AXIS_STATE_MOTOR_CALIBRATION)
+        assert r["success"] and [s["state"] for s in r["steps"]] == ["MOTOR_CALIBRATION"]
+        fleet.od_phase_open[node] = True                 # the contact opens: next run fails
+        r = oc.check_drive(bus, node, "lower_leg_left", timeout_s=5.0, out=lambda *_: None,
+                           state=oc.AXIS_STATE_MOTOR_CALIBRATION)
+        assert not r["success"] and "phase wire" in r["verdict"]
+    finally:
+        bus.shutdown()

@@ -101,7 +101,13 @@ identity: a replug can silently swap them. A udev rule pins each adapter by seri
 - Both motor types can share one bus (pass the same channel twice). Nodes 3/4/7/8 stay
   clear of the Damiao ids; node 0 would not.
 - The ODrive web GUI can't use these adapters (the `gs_usb` driver owns them). Use
-  SocketCAN and `odrive_can_scan.py`.
+  SocketCAN and `odrive_can_scan.py`. `odrivetool` itself works over the bus
+  (`odrivetool --can can_od`), and so does `tools/odrive_config.py`, which reads and
+  copies the drives' settings without USB.
+- USB to the ODrives: the ports mostly sit badly in the body, so prefer CAN. The
+  exception is the left knee's board (since 2026-11-13, serial 396A347A3331), whose USB
+  port is easy to reach: use it for an odrivetool shell, liveplotter or a firmware update
+  when needed.
 
 **IMU.** Arduino Nicla Sense ME (BHI260AP) on USB serial running `firmware/imu_firmware_v2`:
 gyro, accelerometer and an on-chip accel+gyro fusion quaternion (no magnetometer next to
@@ -152,6 +158,7 @@ ip -details link show can_dm                     # and can_od: UP, bitrate 10000
 python3 odrive_can_scan.py                       # nodes 3/4/7/8 alive on can_od?
 candump can_od                                   # ODrive cyclic frames, ~100 Hz each
 # a drive not on CAN yet: python3 odrive_can_setup.py --node-id N   (USB, one drive at a time)
+# a REPLACED board: tools/odrive_config.py list / watch / set-node (Replacing an ODrive board)
 
 # 3) Measure, motors LIMP. These tools open the buses directly: stop motor_service first.
 python3 read_motor_state.py                      # all 8 ONLINE?
@@ -188,7 +195,7 @@ python3 demo_combined.py --joints hip_left --amp 0.05        # then each other j
 # 6) The PD stand in the air: enable, ramp to `home`, hold. While it holds (other
 #    terminal), push each knee and ankle by hand, slowly, a little harder each time:
 #    the push test checks the gains reached the drive, the torque units, and finds
-#    the most torque the ODrive holds (its vel_limit cap). Then raise the gains live,
+#    the most torque the ODrive holds (current limit: ~4.9 Nm; right knee 2.1, HANDOFF §2). Then raise the gains live,
 #    watching for buzz or oscillation, and push again at full gains.
 python3 tools/dodo_startup.py --pose home --ramp 5
 python3 tools/pd_push_test.py --joint lower_leg_left     # each knee + ankle, 30 s
@@ -225,11 +232,58 @@ python3 run_policy.py --backend zmq --task stand \
    the windings, and logs it. Healthy: the motor step takes ~4.2 s and draws ~0.1 A from
    the 24 V supply, then a ~9 s encoder scan, PASS. The open phase of 2026-11-05: 0.00 A,
    PHASE_RESISTANCE_OUT_OF_RANGE after 1.6 s. Wiggle the cable between runs.
+   To FIND an intermittent contact, loop only the motor step (real current, no
+   rotation, ~4 s a run) and wiggle one spot at a time; the spot that makes it fail
+   is the bad one: `--motor-only --repeat 30 --no-wait`. Afterwards the drive needs a
+   full calibration (`odrive_calibrate`) before closed loop.
 3. **Under load:** the in-air steps of *Bring-up* (5–6) on that joint: smooth motion,
    no drive errors, and a push-test stiffness like the other side's.
 
 If the resistances are fine but the drive still fails: suspect the drive itself (its
 output stage, or the motor connector on its board).
+
+### Replacing an ODrive board
+
+The drives' own settings (current limits, encoder, CAN id and message rates, ...) live
+on each board. A new board needs the old one's. `tools/odrive_config.py` reads and writes
+them over CAN, with no USB (odrivetool >= 0.6.9 talks to the drives through SocketCAN).
+Stop motor_service first. The ankles' settings as of 2026-11-13 are in
+`setup/odrive_config/` (`backup` the knees there once both have their ids).
+
+```bash
+python3 tools/odrive_config.py list      # serial, node, firmware; flags duplicate/missing ids
+python3 tools/odrive_config.py watch     # move ONE joint by hand: whose numbers change?
+python3 tools/odrive_config.py pins --drive 7   # turn that joint: encoder pins toggle? count?
+python3 tools/odrive_config.py set-node --serial <serial> --node-id 3          # dry run
+python3 tools/odrive_config.py set-node --serial <serial> --node-id 3 --write  # saves, reboots
+python3 tools/odrive_check.py --joint lower_leg_left --repeat 3   # leg closed; MOTOR MOVES
+```
+
+- **`set-node`** when the board's settings are right but its id isn't; **`clone --from
+  <node|serial|file> --to <serial> --node-id N`** when its settings are wrong too. Clone
+  copies every setting that differs from a drive of the same kind or a file in
+  `setup/odrive_config/`, keeps the board's own calibration results (phase R/L, motor
+  direction), and sets the id. Both are dry runs without `--write`. With it they verify,
+  save over CAN, and check the board comes back on the new id.
+- **It refuses a node id another drive has.** Two drives on one id both obey every
+  command to it. On 2026-11-13 the new left-knee board had been given 7, like the right
+  knee: node 7's position jumped between two encoders, node 3 was missing, and the
+  service couldn't run.
+- **Identify first** (`watch`): the target must really be the joint whose id it gets.
+  Otherwise the service drives the wrong knee. Firmware version or serial batch are not
+  evidence: on 2026-11-13 they pointed at the wrong board, and `watch` caught it. A joint
+  that moves no node's numbers has a drive that isn't counting encoder edges (cable,
+  plug, encoder power). `pins` tells which: do the encoder's lines reach the board's pins
+  (on the right knee's board probably gpio2/gpio3) while you turn the joint?
+- **A factory-fresh board isn't on CAN at all** (CAN Simple off, node 63). Put it on CAN
+  once over USB with `python3 odrive_can_setup.py --node-id N`, using its joint's id
+  (that script doesn't check whether another drive already has the id). Then clone over CAN as above.
+- **Afterwards:** in `visualize_hardware.py`, move the joint by hand once. It must turn
+  the sim's way: `joint_calib.py`'s sign belongs to the motor and encoder, so it should
+  not change. The zero is redone every power-up (`calibrate pose=straight`).
+- **odrivetool side effect:** connecting to a drive whose id another drive also has
+  moves it to the lowest free id until its next power-up. The tool discovers all drives
+  first, so the move always lands on a free id.
 
 ### Rehearse the PD stand in sim first
 
@@ -293,10 +347,14 @@ odrive_calibrate` has run (found 2026-11-05: `procedure_result` NOT_CALIBRATED, 
 bit). `motor_service` checks each ODrive really reaches closed loop at `enable`
 (fail-closed otherwise) and e-stops if one leaves it while enabled.
 
-**Not verified on the robot yet:** the ODrives' response to the CAN gain commands, the
-torque units they report (assumed motor-side, `fleet_config.ODRIVE_TORQUE_IS_MOTOR_SIDE`;
-wrong the other way would only IDLE a joint too early), and how much torque their
-`vel_limit` lets the knees hold (HANDOFF §2).
+**Not verified on the robot yet:** the ODrives' response to the CAN gain commands, and
+the torque units they report (assumed motor-side, `fleet_config.ODRIVE_TORQUE_IS_MOTOR_SIDE`;
+wrong the other way would only IDLE a joint too early). **Read from the drives
+(2026-11-13):** ankles and the new left-knee board: vel_limit 100 turns/s, current
+limited at 7 A (inverter) × 0.0276 Nm/A = 0.19 Nm at the motor, so **4.9 Nm at a knee,
+5.5 Nm at an ankle**, against 2.9 / 1.4 Nm for `home`. **The right knee is set lower:**
+motor current 3 A, so **2.1 Nm**, under what `home` needs. It also has vel_limit 18 and
+a 25 V bus over-voltage trip (HANDOFF §2).
 
 ## The sim-to-real contract
 

@@ -99,11 +99,16 @@ DM_JOINTS = [
 #
 # Position limits: motor_service clamps in joint radians against the measured stops
 # (STOP_MARGIN_RAD, real2sim.command_band); pos_min/pos_max (turns) stay unset.
+#
+# vel_limit (motor turns/s) is the drives' own setting, informational here; read over CAN
+# 2026-11-13 (tools/odrive_config.py): 100, but 18 on the right knee. Their torque limit
+# is the current: min(motor current_soft_max, inverter 7 A) x 0.0276 Nm/A. The right
+# knee's motor limit is 3 A (HANDOFF section 2).
 OD_JOINTS = [
-    OdriveCanJointConfig(name="lower_leg_left",  node_id=3, vel_limit=10.0, rated_torque=9.0),
-    OdriveCanJointConfig(name="foot_left",       node_id=4, vel_limit=10.0, rated_torque=9.0),
-    OdriveCanJointConfig(name="lower_leg_right", node_id=7, vel_limit=10.0, rated_torque=9.0),
-    OdriveCanJointConfig(name="foot_right",      node_id=8, vel_limit=10.0, rated_torque=9.0),
+    OdriveCanJointConfig(name="lower_leg_left",  node_id=3, vel_limit=100.0, rated_torque=9.0),
+    OdriveCanJointConfig(name="foot_left",       node_id=4, vel_limit=100.0, rated_torque=9.0),
+    OdriveCanJointConfig(name="lower_leg_right", node_id=7, vel_limit=18.0, rated_torque=9.0),
+    OdriveCanJointConfig(name="foot_right",      node_id=8, vel_limit=100.0, rated_torque=9.0),
 ]
 
 # --- Physical constraints of the legs/body --------------------------------------

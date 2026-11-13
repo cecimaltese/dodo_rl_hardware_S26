@@ -52,6 +52,7 @@ CMD_GET_TORQUES = 0x1C
 # ── axis states / modes ───────────────────────────────────────────
 AXIS_STATE_IDLE = 1
 AXIS_STATE_FULL_CALIBRATION_SEQUENCE = 3
+AXIS_STATE_MOTOR_CALIBRATION = 4
 AXIS_STATE_CLOSED_LOOP_CONTROL = 8
 AXIS_STATES = {0: "UNDEFINED", 1: "IDLE", 2: "STARTUP_SEQUENCE",
                3: "FULL_CALIBRATION_SEQUENCE", 4: "MOTOR_CALIBRATION",
@@ -61,7 +62,7 @@ AXIS_STATES = {0: "UNDEFINED", 1: "IDLE", 2: "STARTUP_SEQUENCE",
                13: "ENCODER_HALL_PHASE_CALIBRATION"}
 # Heartbeat byte 5: the result of the last requested state/procedure (firmware 0.6).
 PROCEDURE_RESULTS = ("SUCCESS", "BUSY", "CANCELLED", "DISARMED", "NO_RESPONSE",
-                     "POLARITY_MISMATCH", "PHASE_RESISTANCE_OUT_OF_RANGE",
+                     "POLE_PAIR_CPR_MISMATCH", "PHASE_RESISTANCE_OUT_OF_RANGE",
                      "PHASE_INDUCTANCE_OUT_OF_RANGE", "UNBALANCED_PHASES",
                      "INVALID_MOTOR_TYPE", "ILLEGAL_HALL_STATE", "TIMEOUT",
                      "HOMING_WITHOUT_ENDSTOP", "INVALID_STATE", "NOT_CALIBRATED",
@@ -108,7 +109,7 @@ INPUT_MODE_PASSTHROUGH = 1
 class OdriveCanJointConfig:
     name: str
     node_id: int                        # CAN node id set in odrive_can_setup.py (e.g. 7)
-    vel_limit: Optional[float] = None   # informational only (set over USB)
+    vel_limit: Optional[float] = None   # informational: the drive's own (tools/odrive_config.py)
     pos_min: Optional[float] = None     # optional soft limit (turns)
     pos_max: Optional[float] = None     # optional soft limit (turns)
     rated_torque: Optional[float] = None  # Nm, for the later normalized safety layer

@@ -26,6 +26,16 @@ odrive_calibrate; afterwards straighten the legs and `calibrate --pose straight`
 
 --repeat runs it several times: wiggle the motor cable / connector between runs (or
 during the ~4 s motor step) to catch a contact that only works sometimes.
+
+--motor-only runs just the first step, MOTOR_CALIBRATION: the phase resistance and
+inductance measurement, with the drive's real calibration current through the windings
+but no rotation (a twitch well under 1 deg at the joint). ~4 s a run, so with
+--no-wait it loops back to back while you wiggle one spot at a time (the wire at the
+crimp, the housing, the header on the board, the motor leads): the spot that makes it
+FAIL is the bad one. A failed or motor-only run leaves the drive needing a full
+calibration (odrive_calibrate, or this tool without --motor-only) before closed loop.
+
+    python3 tools/odrive_check.py --joint lower_leg_left --motor-only --repeat 30 --no-wait
 """
 from __future__ import annotations
 
@@ -45,6 +55,7 @@ import dodo_ipc as ipc  # noqa: E402
 import fleet_config  # noqa: E402
 import real2sim  # noqa: E402
 from odrive_can_joint import (AXIS_STATE_FULL_CALIBRATION_SEQUENCE,  # noqa: E402
+                              AXIS_STATE_MOTOR_CALIBRATION,
                               AXIS_STATE_IDLE, CMD_CLEAR_ERRORS, CMD_GET_ERROR,
                               CMD_GET_ENCODER_ESTIMATES, CMD_HEARTBEAT,
                               CMD_SET_AXIS_STATE, PROCEDURE_PHASE_RESISTANCE_OUT_OF_RANGE,
@@ -66,8 +77,9 @@ def node_of(joint: str) -> int:
 
 
 def check_drive(bus: can.BusABC, node: int, joint: str, timeout_s: float = TIMEOUT_S,
-                out=print) -> Dict:
-    """Clear the drive's errors, run its full calibration, log it. Returns the facts."""
+                out=print, state: int = AXIS_STATE_FULL_CALIBRATION_SEQUENCE) -> Dict:
+    """Clear the drive's errors, run its full calibration (or just `state`, e.g.
+    MOTOR_CALIBRATION), log it. Returns the facts."""
     def send(cmd, data=b"", rtr=False):
         bus.send(can.Message(arbitration_id=(node << 5) | cmd, data=data,
                              is_remote_frame=rtr, dlc=8 if rtr else len(data),
@@ -109,7 +121,7 @@ def check_drive(bus: can.BusABC, node: int, joint: str, timeout_s: float = TIMEO
         pass
     p0 = st["pos"]
     lo = hi = p0
-    send(CMD_SET_AXIS_STATE, struct.pack("<I", AXIS_STATE_FULL_CALIBRATION_SEQUENCE))
+    send(CMD_SET_AXIS_STATE, struct.pack("<I", state))
     t0 = time.monotonic()
     steps = []                         # [state, t_start, t_end, ibus samples]
     left_idle = False
@@ -178,6 +190,11 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--joint", required=True)
     ap.add_argument("--repeat", type=int, default=1, help="runs (wiggle the cable between)")
+    ap.add_argument("--motor-only", action="store_true",
+                    help="only the motor step (phase R/L at calibration current, no "
+                         "rotation): ~4 s a run, for wiggle tests")
+    ap.add_argument("--no-wait", action="store_true",
+                    help="--repeat back to back, no Enter between runs")
     ap.add_argument("--compare", default=None,
                     help="first run a known-good drive the same way, as the baseline")
     ap.add_argument("--channel", default=fleet_config.OD_CHANNEL)
@@ -197,8 +214,14 @@ def main():
     finally:
         ctl.close()
 
-    print(f"Calibrating {', '.join(joints)}: each motor beeps, then turns 8-16 deg at "
-          f"the joint and back. Legs hanging FREE.\n  {HEALTHY}")
+    state = (AXIS_STATE_MOTOR_CALIBRATION if args.motor_only
+             else AXIS_STATE_FULL_CALIBRATION_SEQUENCE)
+    if args.motor_only:
+        print(f"Motor step only on {', '.join(joints)}: a beep per run, calibration current "
+              f"through the windings, no real rotation.\n  healthy: ~4.2 s at ~0.12 A, PASS")
+    else:
+        print(f"Calibrating {', '.join(joints)}: each motor beeps, then turns 8-16 deg at "
+              f"the joint and back. Legs hanging FREE.\n  {HEALTHY}")
     if not args.yes and input("go? [y/N] ").strip().lower() not in ("y", "yes"):
         sys.exit("aborted (nothing moved)")
     bus = can.Bus(channel=args.channel, interface=args.bustype,
@@ -207,11 +230,11 @@ def main():
     try:
         if args.compare:
             print("\nbaseline:")
-            check_drive(bus, nodes[args.compare], args.compare)
+            check_drive(bus, nodes[args.compare], args.compare, state=state)
         for k in range(args.repeat):
             print(f"\nrun {k + 1}/{args.repeat}:")
-            results.append(check_drive(bus, nodes[args.joint], args.joint))
-            if k + 1 < args.repeat:
+            results.append(check_drive(bus, nodes[args.joint], args.joint, state=state))
+            if k + 1 < args.repeat and not args.no_wait:
                 input("  wiggle the cable/connector if you like, then Enter for the "
                       "next run... ")
     except (RuntimeError, KeyboardInterrupt) as e:
@@ -225,7 +248,10 @@ def main():
         print(f"\n{args.joint}: {ok}/{len(results)} runs passed"
               + ("" if ok == len(results) else
                  " — an intermittent or bad contact if some passed") + ".")
-        if ok:
+        if args.motor_only or ok < len(results):
+            print("The drive needs a full calibration before closed loop: odrive_calibrate "
+                  "(or this tool without --motor-only).")
+        elif ok:
             print("Next: straighten the legs, then motor_service, calibrate --pose straight, "
                   "and the in-air tests (README Bring-up 5-6).")
 
