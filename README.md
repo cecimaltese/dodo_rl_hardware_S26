@@ -212,7 +212,7 @@ python3 tools/pd_push_test.py --joint lower_leg_left     # again: cap at full ga
 #    (2026-11-25, HANDOFF log). If it needs re-finding: --legs-back moves the COM
 #    forward over the feet, ~17 mm per 0.05 rad (body level, soles flat); --squat
 #    lowers the robot (~2 cm per 0.1 rad); --stance rolls the hips outward.
-python3 tools/dodo_startup.py --pose home --stance 0.1 --legs-back 0.2 --squat 0.175 --ramp 5
+python3 tools/dodo_startup.py --pose home --stance 0.1 --legs-back 0.25 --squat 0.2 --ramp 5
 
 # 8) Only then, a policy
 python3 run_policy.py --backend zmq --task stand \
