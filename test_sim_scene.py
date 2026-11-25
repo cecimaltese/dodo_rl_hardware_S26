@@ -7,10 +7,16 @@ The two rehearsals are the hardware plan (HANDOFF log 2026-11-05 (c)):
   * on the floor: straight legs -> ramp to `home` -> stand;
   * on the gantry: hang limp -> enable -> ramp to `home` in the air -> lower until the
     feet carry the weight -> release -> stand.
+
+Every topic runs on a free port (isolated_ports), and the subprocesses inherit them: on
+the default ports these tests would reach a motor_service running on the same machine,
+and dodo_startup would enable and move the REAL robot.
 """
 from __future__ import annotations
 
+import importlib.util
 import math
+import socket
 import subprocess
 import sys
 import threading
@@ -32,6 +38,25 @@ from sim_service import (GANTRY_CLEARANCE_M, GANTRY_ROPE_M, GROUPS, SCENE_DT,
 STARTUP = Path(__file__).resolve().parent / "tools" / "dodo_startup.py"
 HOME_Z = 0.412          # pd_stand.py's settled base height in `home` (0.4121 m)
 MAX_TILT_DEG = 8.0      # pd_stand.py: about 6 deg in `home`
+
+_spec = importlib.util.spec_from_file_location("dodo_startup", STARTUP)
+dodo_startup = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(dodo_startup)
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@pytest.fixture(autouse=True)
+def isolated_ports(monkeypatch):
+    """Every topic on a free port, for the services built here and (through the
+    environment) the dodo_startup / pd_push_test subprocesses."""
+    for topic in ipc.DEFAULT_PORTS:
+        monkeypatch.setenv(f"DODO_ZMQ_PORT_{topic.upper()}", str(_free_port()))
+    yield
 
 
 @contextmanager
@@ -194,6 +219,38 @@ class TestPdStand:
             t = svc.track
         assert t["base_z"] == pytest.approx(HOME_Z, abs=0.01), t
         assert t["max_tilt_deg"] < MAX_TILT_DEG, t
+
+    def test_pose_adjustments_reach_the_service(self):
+        """--legs-back / --squat / --stance on the command line: in the air, the service
+        holds adjust_pose(home). (Not on the floor: the model would tip over forwards
+        with these, since its COM is CAD's, not the robot's.)"""
+        with service(start="straight", gantry=True, auto_enable=False):
+            ctl = ipc.CtlClient()
+            try:
+                p = startup("--pose", "home", "--legs-back", "0.1", "--squat", "0.05",
+                            "--stance", "0.03", "--ramp", "1.0", "--hold-secs", "4")
+                time.sleep(3.0)                         # ramped, holding in the air
+                joints = ctl.request("status")["joints"]
+                out = finish(p)
+            finally:
+                ctl.close()
+        want = dodo_startup.adjust_pose(assets.scene_pose("home"), 0.1, 0.05, 0.03)
+        for j in ipc.JOINT_ORDER:
+            assert joints[j]["target_rad"] == pytest.approx(want[j], abs=1e-3), j
+        assert "ramp to 'home, legs-back +0.100, squat +0.050, stance +0.030'" in out
+
+    def test_pose_outside_the_band_is_refused_before_anything_moves(self):
+        with service(start="straight", gantry=True, auto_enable=False):
+            ctl = ipc.CtlClient()
+            try:
+                p = startup("--pose", "home", "--legs-back", "2.0")
+                out, _ = p.communicate(timeout=30)
+                enabled = ctl.request("status")["enabled"]
+            finally:
+                ctl.close()
+        assert p.returncode != 0, out
+        assert "leaves the command band" in out and "upper_leg_left: +2.450" in out, out
+        assert not enabled
 
 
 def test_pd_push_test_against_the_sim():

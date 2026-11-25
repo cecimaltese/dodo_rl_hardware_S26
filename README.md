@@ -37,7 +37,7 @@ decisions behind it.
 | **Motor control** | ✅ `motor_service` runs on the real buses (started disabled 2026-11-05: 200 Hz, 0 overruns; `enable` refused until calibrated). ⚠️ Never enabled on a motor. |
 | **Sign / zero calibration** | ✅ Measured 2026-11-05 (`joint_calib.py`: signs, zeros, stops; right hip roll fixed by hand-check) and wired into `motor_service`: Damiao zeros persistent, ODrive zeros per session from a reference pose (`calibrate pose=straight`). |
 | **ODrive gear ratio** | ✅ Measured 2026-11-05: knees 25.6, ankles 28.5 (`fleet_config.GEAR_RATIO`). |
-| **PD stand** | ✅ In sim through the robot's own stack, on a simulated gantry (`sim_service.py --scene --gantry`). ⚠️ Not yet on the robot: *Bring-up* steps 4–7. The drives' `vel_limit` may cap the knee torque below what standing needs (HANDOFF §2). |
+| **PD stand** | ✅ In sim through the robot's own stack, on a simulated gantry (`sim_service.py --scene --gantry`). ✅ On the robot, on the floor (2026-11-25): `dodo_startup.py --pose home --stance 0.1 --legs-back 0.2 --squat 0.175` (*Bring-up* step 7). ⚠️ `home` itself tips over backwards: the robot's COM sits ~5–9 cm further back over its feet than the CAD model's, cause not yet known (HANDOFF log 2026-11-25 (b)). |
 | **CAN udev rule** | ✅ `setup/99-dodo-can.rules` names the adapters `can_dm`/`can_od` by serial and brings them up at 1 Mbit (2026-11-04, *Machine setup*). |
 
 > ### ⛔ No policy on the robot yet
@@ -208,6 +208,11 @@ python3 tools/pd_push_test.py --joint lower_leg_left     # again: cap at full ga
 #    (HANDOFF §2: the ODrives' vel_limit). Before ending, take the weight on the gantry
 #    again: Ctrl-C parks back to the start pose, then disables (the legs go limp).
 #    Emergency: tools/dodo_ctl.py disable, or the power switch.
+#    On the floor `home` tips over BACKWARDS. The robot stands with the pose below
+#    (2026-11-25, HANDOFF log). If it needs re-finding: --legs-back moves the COM
+#    forward over the feet, ~17 mm per 0.05 rad (body level, soles flat); --squat
+#    lowers the robot (~2 cm per 0.1 rad); --stance rolls the hips outward.
+python3 tools/dodo_startup.py --pose home --stance 0.1 --legs-back 0.2 --squat 0.175 --ramp 5
 
 # 8) Only then, a policy
 python3 run_policy.py --backend zmq --task stand \
@@ -406,7 +411,7 @@ the robot.
 | `imu_check.py`, `imu_sniff.py` | IMU acceptance test; raw dump, range cross-check, `--axes`. |
 | `imu_locate.py` | Measures the IMU mount (three poses + a ruler) and writes, from `dodo_assets/imu_mount.json`, the IMU blocks of its URDF and MJCF, its README rows and our `AXIS_REMAP`; `refit [--exact]` re-solves from the stored poses; `check --live` verifies on the robot. |
 | `setup/99-dodo-can.rules` | udev rule: the two USB-CAN adapters → `can_dm` / `can_od` by serial, up at 1 Mbit. |
-| `tools/` | `dodo_ctl.py` (ctl CLI), `dodo_startup.py` (power-on ritual without a policy; the PD stand), `pd_push_test.py` (push a held joint by hand: real stiffness vs kp, torque units, the ODrive's torque cap), `odrive_check.py` (one drive's calibration, logged: is the motor connected?), `zmq_echo.py` and `zmq_hz.py` (topic echo and rate). |
+| `tools/` | `dodo_ctl.py` (ctl CLI), `dodo_startup.py` (power-on ritual without a policy; the PD stand, its pose adjusted with `--legs-back`/`--squat`/`--stance`), `pd_push_test.py` (push a held joint by hand: real stiffness vs kp, torque units, the ODrive's torque cap), `odrive_check.py` (one drive's calibration, logged: is the motor connected?), `zmq_echo.py` and `zmq_hz.py` (topic echo and rate). |
 | `demo_combined.py` | Sine-drive any joints through the full service stack. |
 | `policies/` | The reference `dodo_stand` run the tests use. |
 | `docs/zmq.md` | ZMQ topic and schema spec. |
@@ -428,9 +433,11 @@ service stack against a synthetic robot plus the stand policy through it
 python-can's virtual bus against a fake fleet (`test_motor_watchdog.py`),
 boot-calibration math, IMU parsing, the IMU mount measurement against a simulated IMU
 (`test_imu_locate.py`), the fleet config, and the Isaac Lab ↔ MuJoCo contract
-(`test_sim2sim_consistency.py`). There is one known failure:
-`test_behavior_wrong_order_falls`. The stand policy also stands with left and right swapped,
-so that guard can't detect a joint-order regression.
+(`test_sim2sim_consistency.py`). The PD stand runs through `sim_service --scene`
+(`test_sim_scene.py`), and `test_dodo_startup.py` covers its pose adjustments. The ZMQ
+tests use free ports, so they're safe on the robot machine with `motor_service` up.
+There is one known failure: `test_behavior_wrong_order_falls`. The stand policy also
+stands with left and right swapped, so that guard can't detect a joint-order regression.
 
 ## Next steps
 

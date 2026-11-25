@@ -95,6 +95,11 @@ the robot yet.
    The stand has little margin forward (log 11-05 (e)): keep the gantry close to taut,
    and watch which way it wants to tip. Re-take the weight before ending `dodo_startup`
    (its park ends limp).
+   **2026-11-25: the robot stands on the floor** with `dodo_startup.py --pose home
+   --stance 0.1 --legs-back 0.2 --squat 0.175 --ramp 5`. `home` itself tips over
+   backwards: the robot's COM sits ~50–90 mm further back over its feet than the CAD
+   model's. Next: the IMU pitch while it stands, to tell joint zeros from mass (log
+   2026-11-25 (b)).
    **Open before step 7: the RIGHT KNEE's current limit.** Read over CAN 2026-11-13
    (`tools/odrive_config.py`). Ankles and the new left knee: vel_limit 100 turns/s, so the
    velocity cap (vel_gain × vel_limit) doesn't bind; the current does, inverter 7 A ×
@@ -179,6 +184,105 @@ if it still reads ~3°. Optional: weigh the robot (the CAD says 4.72 kg).
 ---
 
 ## 4. Log (newest first)
+
+### 2026-11-25 (b) — the robot stands on the floor: `--stance 0.1 --legs-back 0.2 --squat 0.175`
+- **User:** stable on the floor with
+  `python3 tools/dodo_startup.py --pose home --stance 0.1 --legs-back 0.2 --squat 0.175 --ramp 5`
+  (the rest of the bring-up as in the entry below).
+- **Joint targets:**
+  - hip_left +0.100, hip_right −0.100
+  - upper_leg_* +0.825, lower_leg_* −1.350, foot_* +0.525
+  - All inside the command bands. The pitch sum is 0: soles parallel to the body, but
+    rolled 5.7° onto their inner edges by the stance.
+  - The base is ~4.5 cm lower than in `home` (model: 0.365 vs 0.412 m).
+- **What it says about the robot (model, as in the entry below):**
+  - In the CAD model this pose puts the COM 105 mm in front of the heel, past the
+    95 mm toe, so the sim tips forwards in it. Of that, the squat moves it −5.5 mm, the
+    stance 0.
+  - The model stands in this pose only with its COM moved back 50–90 mm (`home` tipping
+    over already said ≥ 35). **The robot's COM sits ~50–90 mm further back over its
+    feet than the CAD model's**, ~65–70 mm if this stand is centred.
+  - The model at that offset needs: knee 2.0–2.4 Nm (the right knee's 3 A cap is
+    2.1 Nm, if unchanged: §2), ankle < 0.7, hip roll 1.6 (the stance), hip pitch ≤ 1.
+- **Which cause: the body's pitch while it stands tells them apart.**
+  - Mass or a cable pull, joint angles right: the model stands in this pose 0–5°
+    nose-DOWN (~2° centred).
+  - Joint zeros: the ankles alone would have to sit 8–13° more toe-down than
+    commanded; the robot then stands 2–10° nose-UP (~7° centred). Knee errors (4 mm/°
+    against the ankle's 7) also lean it nose-up.
+  - Read it with `visualize_hardware.py` while it stands. It shows the IMU pitch, and
+    the model's soles lie flat on its floor only if the zeros are right. The IMU's ~3°
+    pitch question (§2) can't hide a 7–9° difference.
+  - It matters for the policy either way. A zero error is a joint-angle error the
+    policy observes; a mass error is a dynamics mismatch. Tell Shafeef the pose and the
+    offset.
+- Tests: `test_dodo_startup.py` checks this pose stays inside the command bands. Docs:
+  README (status, *Bring-up* step 7), `dodo_startup.py` help.
+
+### 2026-11-25 — first PD stand on the floor: `home` tips over backwards; `--legs-back`
+- **User, on the robot:** the full bring-up works: ODrive calibration, `calibrate
+  straight`, the push tests, gains to 1.0, `dodo_startup.py --pose home --ramp 5` (ramp,
+  hold, park back to `straight`). The left knee's sign was corrected after its encoder
+  wiring repair (`557587c`). Lowered onto the floor, the robot **immediately falls over
+  backwards**. The user suggested a deeper squat, the thighs further back, maybe the
+  hips rolled outward.
+- **Analysis (MuJoCo, scene.xml, full gains):** the load goes onto the feet over 2 s,
+  like the gantry, with the support acting at the whole-robot COM. COM positions are
+  measured along the 95 mm sole from the heel edge of `foot_*_collision`.
+  - The PD stand holds only while the **rigid** COM sits about 10–65 mm from the heel.
+    Rigid means joints at their targets, soles flat. Under load the sag (knees ~0.05 rad)
+    carries the COM ~10 mm further forward. Push margins peak at ~40 mm: ~9 N each way
+    for 0.1 s.
+  - In the model, `home` puts the COM 40 mm from the heel, so it stands: settled 57/38 mm
+    heel/toe, 7 N forward / 9 N back. Moved back 30 mm, it still stands with 9 mm to
+    spare. **So the real robot's COM sits ≥ ~35 mm further back over its feet than
+    the model's.**
+  - What moves the rigid COM over the flat feet:
+    - **Legs back** (thigh +x, ankle −x): **+3.5 mm per 0.01 rad**.
+    - **Squat** (thigh +x, knee −2x, ankle +x): ~0. The hips drop almost straight over
+      the ankles (~2 cm per 0.1), and the knees need +0.4 Nm per 0.1.
+    - **Hips rolled outward:** nothing fore-aft. Sideways push +1.5 N; the soles tilt
+      onto their inner edges (there is no ankle roll).
+    - The squat and roll ideas don't address the fall.
+  - With the COM X mm further back than the model's, the best legs-back is ≈ X/350 rad
+    (X = 30 → 0.075, 55 → 0.15, 80 → 0.225). It stands within ±0.075 rad of that, so
+    steps of 0.05 can't jump over the window. Knee torque is ≤ 2.5 Nm anywhere in it,
+    1.3–2 Nm at its centre (model `home`: 2.5–2.9).
+  - **Candidate causes, none checked yet:**
+    - The ODrive "straight" reference, set by eye. Each degree the ankles really sit
+      more toe-down than commanded moves the COM 7 mm back; a degree more knee
+      extension, 4 mm; hip pitch, 1 mm. ~5° at the ankles alone would do it.
+    - The real mass distribution vs CAD (electronics, cables; never weighed).
+    - A tether pulling back: ~5 N steady at the top of the body tips the model's `home`
+      (2.6 Nm about the heel).
+  - Whatever the cause, a policy trained on the CAD model will meet the same offset.
+- **Changed: `dodo_startup.py --legs-back / --squat / --stance RAD`.** `adjust_pose`
+  applies them on top of `--pose`. Each keeps the soles parallel to the body (per leg,
+  pitch sum unchanged), so the body stays level on the floor. The defaults are 0, so
+  `home` is unchanged.
+  - A target outside the service's command band is **refused before anything moves**
+    (`band_rad` from `status`, else `real2sim.command_band`): clamped, it would bend the
+    pose.
+  - The sim's COM is CAD's, so the sim tips forwards from legs-back ≈ +0.05. Don't
+    expect a sim rehearsal to stand with the robot's value.
+- **Fixed: `test_sim_scene.py` ran on the default ports.** Its `dodo_startup`
+  subprocesses would have reached a `motor_service` on the same machine and enabled the
+  real robot (`motor_service` was up while this was written). It now runs every topic
+  on a free port (autouse fixture, as in the other ZMQ tests).
+- Tests: `test_dodo_startup.py` covers the knobs, the band check, and the COM shifts
+  against the model. `test_sim_scene.py`: the knobs reach the service through the CLI
+  in the air, and an out-of-band pose is refused with nothing enabled. Suite: 277
+  passed, 1 known failure, 1 skip.
+- **Next (user at the robot):**
+  1. `dodo_startup.py --pose home --legs-back 0.1 --ramp 5`, then lower slowly with the
+     ropes just slack.
+  2. Still tips back: +0.05 per try. Tips forwards: −0.025.
+  3. Once it stands, nudge it gently both ways and centre it, then record the value and
+     tell Shafeef.
+  4. Meanwhile check the cause: in the air the soles should be parallel to the body.
+     Standing (gantry just holding), `visualize_hardware.py` should show the model's
+     soles flat on the floor and a 3–4° nose-down lean like the sim.
+  - The right knee's 3 A limit (§2 step 6) still stands unless it was changed.
 
 ### 2026-11-13 — left knee: new ODrive board came with node id 7, and its encoder counts nothing
 - **User:** the old board's phase connector couldn't be saved, so they replaced the left

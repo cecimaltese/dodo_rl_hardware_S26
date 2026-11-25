@@ -19,7 +19,8 @@ hanging straight). This tool then:
                    safety band
     4. ramp        smoothstep all joints to the stand pose (--pose: a dodo_assets
                    scene.xml keyframe, `home` by default, or `default` = the
-                   vendored stand policy's rl_env.DEFAULT_JOINT_POS)
+                   vendored stand policy's rl_env.DEFAULT_JOINT_POS), adjusted by
+                   --legs-back / --squat / --stance (adjust_pose)
     5. hold        stand there, printing state, until Ctrl-C / --hold-secs
     6. park        ramp gently BACK toward the boot pose, then disable —
                    the legs fold instead of collapsing (skip: --no-park)
@@ -30,6 +31,19 @@ become the policy); rehearse here first. Works against sim_service too.
     python3 tools/dodo_startup.py                 # full ritual, asks first
     python3 tools/dodo_startup.py --ramp 8 --yes  # slower, no questions
     python3 tools/dodo_startup.py --pose straight # any scene.xml keyframe
+    python3 tools/dodo_startup.py --legs-back 0.1 # `home`, legs swung back 0.1 rad:
+                                                  # COM ~35 mm forward over the feet
+
+On the floor the PD stand only holds with the COM over the middle of the feet: in
+dodo_assets' model, from ~10 to ~65 mm in front of the heel (feet 95 mm long). `home`
+tips over BACKWARDS on the robot (2026-11-25) although the model puts its COM there,
+so the real robot's sits further back. --legs-back moves it forward; steps of 0.05
+(~17 mm) can't jump over that window. HANDOFF log 2026-11-25.
+
+The robot's floor stand (2026-11-25; the sim, with the CAD model's COM, tips forwards
+in it):
+
+    python3 tools/dodo_startup.py --pose home --stance 0.1 --legs-back 0.2 --squat 0.175
 """
 from __future__ import annotations
 
@@ -43,6 +57,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import assets  # noqa: E402
 import dodo_ipc as ipc  # noqa: E402
+import real2sim  # noqa: E402
 from rl_env import DEFAULT_JOINT_POS  # noqa: E402
 
 
@@ -50,6 +65,51 @@ def stand_pose(name: str) -> dict:
     """{joint: rad} for --pose: `default` = the vendored stand policy's default pose,
     anything else a keyframe of dodo_assets' scene.xml (Shafeef's `home`, `straight`)."""
     return dict(DEFAULT_JOINT_POS) if name == "default" else assets.scene_pose(name)
+
+
+def adjust_pose(pose: dict, legs_back: float = 0.0, squat: float = 0.0,
+                stance: float = 0.0) -> dict:
+    """`pose` with three adjustments [rad] for standing on the floor. Each keeps the
+    soles parallel to the body (per leg, upper_leg + lower_leg + foot is unchanged),
+    so with the feet flat on the floor the body stays level. Effects from dodo_assets'
+    model (HANDOFF log 2026-11-25):
+
+      legs_back  both legs swing back about the hips: upper_leg +x, foot -x. The feet
+                 move back under the body, i.e. the COM moves FORWARD over the feet,
+                 ~3.5 mm per 0.01 rad. The fix for tipping over backwards (negative:
+                 forwards).
+      squat      a deeper crouch: upper_leg +x, lower_leg -2x, foot +x. The hips drop
+                 almost straight down over the ankles (~2 cm per 0.1 rad), so the COM
+                 hardly moves over the feet; the knees need ~0.4 Nm more per 0.1 rad.
+      stance     both hips roll outward: hip_left +x, hip_right -x (hip roll + moves
+                 the foot left). A wider stance; with no ankle roll, the soles tilt
+                 onto their inner edges by x. Adds nothing fore-aft.
+    """
+    out = dict(pose)
+    for side in ("left", "right"):
+        out[f"upper_leg_{side}"] += legs_back + squat
+        out[f"lower_leg_{side}"] -= 2.0 * squat
+        out[f"foot_{side}"] += squat - legs_back
+    out["hip_left"] += stance
+    out["hip_right"] -= stance
+    return out
+
+
+def outside_band(pose: dict, bands: dict) -> list:
+    """[(joint, target, (lo, hi))] for the targets outside their joint's command band
+    ({joint: (lo, hi) or None}; None = no band known). The service clamps such a
+    target to the band edge, which would quietly bend the pose: the feet would no
+    longer be parallel to the body."""
+    return [(j, q, tuple(bands[j])) for j, q in pose.items()
+            if bands.get(j) is not None and not bands[j][0] <= q <= bands[j][1]]
+
+
+def command_bands(joints: dict) -> dict:
+    """{joint: (lo, hi)} where the service will clamp commands: its own `band_rad` from
+    `status` (motor_service reports it), else real2sim.command_band (the same
+    measured stops minus STOP_MARGIN_RAD that sim_service clamps to)."""
+    return {j: (joints.get(j, {}).get("band_rad") or real2sim.command_band(j))
+            for j in ipc.JOINT_ORDER}
 
 
 def smoothstep(s: float) -> float:
@@ -145,6 +205,18 @@ def main():
     ap.add_argument("--pose", default="home",
                     help="stand pose: a scene.xml keyframe (home, straight) or 'default' "
                          "(the vendored stand policy's). Default: home")
+    ap.add_argument("--legs-back", type=float, default=0.0, metavar="RAD",
+                    help="swing both legs RAD back about the hips (thighs back, ankles "
+                         "less toe-down: soles flat, body level). Moves the COM forward "
+                         "over the feet, ~3.5 mm per 0.01 rad: for a robot that tips "
+                         "over backwards (negative: forwards). Steps of 0.05")
+    ap.add_argument("--squat", type=float, default=0.0, metavar="RAD",
+                    help="crouch RAD deeper (thigh +RAD, knee -2 RAD, ankle +RAD): "
+                         "lower, but the COM hardly moves over the feet; the knees "
+                         "need ~0.4 Nm more per 0.1 rad")
+    ap.add_argument("--stance", type=float, default=0.0, metavar="RAD",
+                    help="roll both hips RAD outward: wider feet, the soles tilted "
+                         "onto their inner edges (no ankle roll)")
     ap.add_argument("--ramp", type=float, default=5.0,
                     help="seconds for the start->stand pose (and park) ramp")
     ap.add_argument("--hold-secs", type=float, default=0.0,
@@ -159,8 +231,12 @@ def main():
         pose = stand_pose(args.pose)
     except (KeyError, FileNotFoundError) as e:
         raise SystemExit(str(e))
-    print(f"stand pose '{args.pose}': " + ", ".join(
-        f"{j} {pose[j]:+.2f}" for j in ipc.JOINT_ORDER if j in pose))
+    pose = adjust_pose(pose, args.legs_back, args.squat, args.stance)
+    pose_label = ", ".join([args.pose] + [
+        f"{k} {v:+.3f}" for k, v in (("legs-back", args.legs_back),
+                                     ("squat", args.squat), ("stance", args.stance)) if v])
+    print(f"stand pose '{pose_label}': " + ", ".join(
+        f"{j} {pose[j]:+.3f}" for j in ipc.JOINT_ORDER if j in pose))
 
     ctl = ipc.CtlClient()
 
@@ -177,6 +253,14 @@ def main():
     if st.get("estopped"):
         raise SystemExit("service is E-STOPPED — fix the cause, then "
                          "tools/dodo_ctl.py estop_reset")
+    bad = outside_band({j: q for j, q in pose.items() if j in joints},
+                       command_bands(joints))
+    if bad:
+        raise SystemExit(
+            f"stand pose '{pose_label}' leaves the command band (the service would "
+            f"clamp it, and the soles would no longer be parallel to the body); "
+            f"nothing moved:\n" + "\n".join(
+                f"  {j}: {q:+.3f} rad, band [{lo:+.3f}, {hi:+.3f}]" for j, q, (lo, hi) in bad))
 
     # 1b) the ODrives' own motor/encoder calibration (once per power-up) ---------
     if args.odrive_calibrate:
@@ -207,7 +291,7 @@ def main():
 
     # 3) enable -----------------------------------------------------------------
     if not args.yes:
-        ans = input(f"\nEnable motors and ramp to '{args.pose}'? [y/N] ")
+        ans = input(f"\nEnable motors and ramp to '{pose_label}'? [y/N] ")
         if ans.strip().lower() not in ("y", "yes"):
             raise SystemExit("aborted (nothing enabled).")
     rep = ctl.request("enable")
@@ -232,10 +316,10 @@ def main():
               for i in range(ipc.N_JOINTS)]
 
     try:
-        ramp_to(pub, sub, loop, q_start, q_home, args.ramp, f"ramp to '{args.pose}'")
+        ramp_to(pub, sub, loop, q_start, q_home, args.ramp, f"ramp to '{pose_label}'")
 
         # 5) hold ---------------------------------------------------------------
-        print(f"[hold] at '{args.pose}' — Ctrl-C to fold back down." if
+        print(f"[hold] at '{pose_label}' — Ctrl-C to fold back down." if
               not args.hold_secs else f"[hold] {args.hold_secs:.0f}s ...")
         t0 = time.monotonic()
         last_print = 0.0
