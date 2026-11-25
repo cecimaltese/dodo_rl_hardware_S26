@@ -37,7 +37,7 @@ decisions behind it.
 | **Motor control** | ✅ `motor_service` runs on the real buses (started disabled 2026-11-05: 200 Hz, 0 overruns; `enable` refused until calibrated). ⚠️ Never enabled on a motor. |
 | **Sign / zero calibration** | ✅ Measured 2026-11-05 (`joint_calib.py`: signs, zeros, stops; right hip roll fixed by hand-check) and wired into `motor_service`: Damiao zeros persistent, ODrive zeros per session from a reference pose (`calibrate pose=straight`). |
 | **ODrive gear ratio** | ✅ Measured 2026-11-05: knees 25.6, ankles 28.5 (`fleet_config.GEAR_RATIO`). |
-| **PD stand** | ✅ In sim through the robot's own stack, on a simulated gantry (`sim_service.py --scene --gantry`). ✅ On the robot, on the floor (2026-11-25): `dodo_startup.py --pose home --stance 0.1 --legs-back 0.2 --squat 0.175` (*Bring-up* step 7). ⚠️ `home` itself tips over backwards: the robot's COM sits ~5–9 cm further back over its feet than the CAD model's, cause not yet known (HANDOFF log 2026-11-25 (b)). |
+| **PD stand** | ✅ In sim through the robot's own stack, on a simulated gantry (`sim_service.py --scene --gantry`). ✅ On the robot, on the floor (2026-11-25): `dodo_startup.py --pose home --stance 0.1 --legs-back 0.2 --squat 0.175` (*Bring-up* step 7). ⚠️ `home` itself tips over backwards: the robot's COM sits ~5–9 cm further back over its feet than the CAD model's, most likely the cables pulling at the back of the body (HANDOFF log 2026-11-25 (b)). |
 | **CAN udev rule** | ✅ `setup/99-dodo-can.rules` names the adapters `can_dm`/`can_od` by serial and brings them up at 1 Mbit (2026-11-04, *Machine setup*). |
 
 > ### ⛔ No policy on the robot yet

@@ -98,8 +98,9 @@ the robot yet.
    **2026-11-25: the robot stands on the floor** with `dodo_startup.py --pose home
    --stance 0.1 --legs-back 0.2 --squat 0.175 --ramp 5`. `home` itself tips over
    backwards: the robot's COM sits ~50–90 mm further back over its feet than the CAD
-   model's. Next: the IMU pitch while it stands, to tell joint zeros from mass (log
-   2026-11-25 (b)).
+   model's, most likely the cables pulling at the back (log 2026-11-25 (b)). Next: lift
+   the cable bundle while it stands (tips forwards = cables), route the cables up to the
+   gantry, re-find the stand; the IMU pitch rules out joint zeros.
    **Open before step 7: the RIGHT KNEE's current limit.** Read over CAN 2026-11-13
    (`tools/odrive_config.py`). Ankles and the new left knee: vel_limit 100 turns/s, so the
    velocity cap (vel_gain × vel_limit) doesn't bind; the current does, inverter 7 A ×
@@ -216,6 +217,31 @@ if it still reads ~3°. Optional: weigh the robot (the CAD says 4.72 kg).
   - It matters for the policy either way. A zero error is a joint-angle error the
     policy observes; a mass error is a dynamics mismatch. Tell Shafeef the pose and the
     offset.
+- **Likely cause: the tether (user, with a photo).** Power and CAN cables, a CAN adapter
+  and the e-stop hang off the back of the body down to the table. That will change
+  once a battery and a Jetson (or similar) ride on the robot.
+  - Their **weight** can't explain it. 0.4 kg hanging just behind the body moves the
+    COM 14 mm, 1 kg 32 mm (model, this pose).
+  - A **pull** can. A steady 5–8 N backwards at the back-bottom edge of the body acts
+    like a 45–73 mm COM shift. A stiff bundle anchored to the table and the power
+    supply pulls like that, and the pull changes as the robot moves.
+  - **Check:** while it stands in this pose, lift the cable bundle (or hang it from the
+    gantry). If it then tips forwards, it's the cables. Also check the gantry ropes are
+    fully slack.
+- **For training (proposed to Shafeef, not decided):**
+  - Don't train for the tether, and don't put it in the URDF: it isn't part of the robot.
+    Route the cables up to the gantry (strain relief on top, near the hip axis, with a
+    slack loop) and mount the adapter and e-stop on the body or the gantry. Then
+    re-find the stand: what's left is the robot's own offset.
+  - Model what rides on the robot as explicit payload parts with weighed masses: CAN
+    adapter and e-stop now, battery and Jetson later. Don't edit the CAD body's
+    inertial.
+  - Randomize COM (±2–3 cm), payload mass and pushes around that nominal.
+  - Make sure the policy's default (zero-action) pose stands on the robot.
+  - Re-find the stand after every hardware change (~10 min, it's the COM check) and
+    record which configuration each policy was trained for.
+  - Place the battery and Jetson so the COM sits over the middle of the feet (try the
+    placement in sim first).
 - Tests: `test_dodo_startup.py` checks this pose stays inside the command bands. Docs:
   README (status, *Bring-up* step 7), `dodo_startup.py` help.
 
